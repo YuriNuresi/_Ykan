@@ -3,7 +3,7 @@
  * _Ykan - Minimal Kanban Board
  * Single-file PHP Kanban for Scrum/Agile projects
  *
- * @version 1.6.0
+ * @version 1.7.0
  * @license MIT
  * @requires PHP 8.2+
  *
@@ -66,7 +66,8 @@ const DEFAULT_DATA = [
         'github_token' => '',
         'github_repo' => '',
         'theme' => 'light',
-        'project_name' => 'My Project'
+        'project_name' => 'My Project',
+        'ai_language' => 'en'
     ],
     'columns' => [
         ['id' => 'col_1', 'name' => 'To Do', 'position' => 0],
@@ -462,7 +463,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['api'])) {
                     $summary .= "## {$col['name']} ({$count})\n";
 
                     if ($count === 0) {
-                        $summary .= "   (vuoto)\n";
+                        $summary .= "   (empty)\n";
                     } else {
                         foreach ($colCards as $card) {
                             $priority = strtoupper($card['priority'] ?? 'medium');
@@ -470,7 +471,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['api'])) {
                             $labelStr = $label ? " [{$label}]" : '';
                             $lane = $swimlanes[$card['swimlane_id']] ?? '';
                             $laneStr = ($lane && $lane !== 'Default') ? " @{$lane}" : '';
-                            $dueStr = $card['due_date'] ? " (scade: {$card['due_date']})" : '';
+                            $dueStr = $card['due_date'] ? " (due: {$card['due_date']})" : '';
 
                             $summary .= "   - [{$priority}]{$labelStr} {$card['title']}{$laneStr}{$dueStr}\n";
                             if (!empty($card['description'])) {
@@ -485,7 +486,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['api'])) {
                 // Archived count
                 $archivedCount = count(array_filter($data['cards'], fn($c) => $c['archived']));
                 if ($archivedCount > 0) {
-                    $summary .= "## Archiviate: {$archivedCount} task\n";
+                    $summary .= "## Archived: {$archivedCount} tasks\n";
                 }
 
                 return ['success' => true, 'summary' => $summary];
@@ -495,7 +496,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['api'])) {
             'complete_task' => (function() use (&$data, $input) {
                 $title = trim($input['title'] ?? '');
                 if (empty($title)) {
-                    return ['success' => false, 'error' => 'Titolo richiesto'];
+                    return ['success' => false, 'error' => 'Title required'];
                 }
 
                 $regeneratedCard = null;
@@ -534,15 +535,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['api'])) {
                         }
 
                         saveData($data);
-                        $msg = "Task '{$card['title']}' completato e archiviato";
+                        $msg = "Task '{$card['title']}' completed and archived";
                         if ($regeneratedCard) {
-                            $msg .= ". Task ricreato automaticamente" . ($delayDays > 0 ? " (scadenza: {$dueDate})" : "");
+                            $msg .= ". Task auto-regenerated" . ($delayDays > 0 ? " (due: {$dueDate})" : "");
                         }
                         return ['success' => true, 'message' => $msg, 'regenerated' => $regeneratedCard !== null];
                     }
                 }
 
-                return ['success' => false, 'error' => "Task '{$title}' non trovato"];
+                return ['success' => false, 'error' => "Task '{$title}' not found"];
             })(),
 
             // Move task to column by title
@@ -551,7 +552,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['api'])) {
                 $columnName = trim($input['column'] ?? '');
 
                 if (empty($title) || empty($columnName)) {
-                    return ['success' => false, 'error' => 'Titolo e colonna richiesti'];
+                    return ['success' => false, 'error' => 'Title and column required'];
                 }
 
                 // Find column
@@ -565,7 +566,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['api'])) {
 
                 if (!$targetColumn) {
                     $colNames = implode(', ', array_column($data['columns'], 'name'));
-                    return ['success' => false, 'error' => "Colonna '{$columnName}' non trovata. Disponibili: {$colNames}"];
+                    return ['success' => false, 'error' => "Column '{$columnName}' not found. Available: {$colNames}"];
                 }
 
                 // Find and move card
@@ -577,47 +578,52 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['api'])) {
                         }
                         $card['column_id'] = $targetColumn['id'];
                         saveData($data);
-                        return ['success' => true, 'message' => "Task '{$card['title']}' spostato da '{$oldCol}' a '{$targetColumn['name']}'"];
+                        return ['success' => true, 'message' => "Task '{$card['title']}' moved from '{$oldCol}' to '{$targetColumn['name']}'"];
                     }
                 }
 
-                return ['success' => false, 'error' => "Task '{$title}' non trovato"];
+                return ['success' => false, 'error' => "Task '{$title}' not found"];
             })(),
 
             // Gemini
             'gemini_analyze' => (function() use ($data, $input) {
                 $apiKey = $data['config']['gemini_api_key'] ?? '';
                 if (empty($apiKey)) {
-                    return ['success' => false, 'error' => 'API Key Gemini non configurata'];
+                    return ['success' => false, 'error' => 'Gemini API Key not configured'];
                 }
 
                 $activeCards = array_filter($data['cards'], fn($c) => !$c['archived']);
                 $prompt = $input['prompt'] ?? 'analyze';
 
                 $boardSummary = "Kanban Board: " . ($data['config']['project_name'] ?? 'Project') . "\n\n";
-                $boardSummary .= "Colonne: " . implode(', ', array_column($data['columns'], 'name')) . "\n";
+                $boardSummary .= "Columns: " . implode(', ', array_column($data['columns'], 'name')) . "\n";
                 $boardSummary .= "Swimlanes: " . implode(', ', array_column($data['swimlanes'], 'name')) . "\n\n";
-                $boardSummary .= "Cards attive:\n";
+                $boardSummary .= "Active cards:\n";
 
                 foreach ($activeCards as $card) {
                     $col = array_values(array_filter($data['columns'], fn($c) => $c['id'] === $card['column_id']))[0]['name'] ?? 'N/A';
                     $lane = array_values(array_filter($data['swimlanes'], fn($l) => $l['id'] === $card['swimlane_id']))[0]['name'] ?? 'N/A';
-                    $boardSummary .= "- [{$card['priority']}] {$card['title']} (Colonna: {$col}, Swimlane: {$lane})";
-                    if ($card['due_date']) $boardSummary .= " - Scadenza: {$card['due_date']}";
+                    $boardSummary .= "- [{$card['priority']}] {$card['title']} (Column: {$col}, Swimlane: {$lane})";
+                    if ($card['due_date']) $boardSummary .= " - Due: {$card['due_date']}";
                     $boardSummary .= "\n";
                     if ($card['description']) $boardSummary .= "  Desc: {$card['description']}\n";
                 }
 
+                $lang = $data['config']['ai_language'] ?? 'en';
+                $langInstruction = $lang !== 'en' ? " Respond in " . match($lang) {
+                    'it' => 'Italian', 'es' => 'Spanish', 'fr' => 'French', 'de' => 'German', 'pt' => 'Portuguese', default => 'English'
+                } . "." : "";
+
                 $systemPrompt = match($prompt) {
-                    'suggest_tasks' => "Sei un esperto project manager Agile. Analizza la board Kanban e suggerisci nuovi task utili per il progetto. Rispondi in italiano, in modo conciso.",
-                    'analyze' => "Sei un esperto project manager Agile. Analizza la board Kanban e suggerisci con quale task procedere, eventuali priorità da rivedere e tempistiche stimate. Rispondi in italiano, in modo conciso e pratico.",
-                    'estimate' => "Sei un esperto project manager Agile. Analizza i task e fornisci stime di tempo realistiche per completarli. Rispondi in italiano.",
-                    default => "Sei un assistente per project management Agile. Rispondi in italiano."
+                    'suggest_tasks' => "You are an expert Agile project manager. Analyze the Kanban board and suggest useful new tasks for the project. Be concise.{$langInstruction}",
+                    'analyze' => "You are an expert Agile project manager. Analyze the Kanban board and suggest which task to proceed with, any priorities to review, and estimated timelines. Be concise and practical.{$langInstruction}",
+                    'estimate' => "You are an expert Agile project manager. Analyze the tasks and provide realistic time estimates to complete them.{$langInstruction}",
+                    default => "You are an assistant for Agile project management.{$langInstruction}"
                 };
 
                 $payload = [
                     'contents' => [
-                        ['parts' => [['text' => $boardSummary . "\n\nRichiesta: " . ($input['custom_prompt'] ?? $prompt)]]]
+                        ['parts' => [['text' => $boardSummary . "\n\nRequest: " . ($input['custom_prompt'] ?? $prompt)]]]
                     ],
                     'systemInstruction' => ['parts' => [['text' => $systemPrompt]]],
                     'generationConfig' => ['temperature' => 0.7, 'maxOutputTokens' => 8192]
@@ -638,16 +644,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['api'])) {
 
                 if ($httpCode !== 200) {
                     $errorMsg = match($httpCode) {
-                        429 => 'Rate limit raggiunto. Attendi 1-2 minuti e riprova.',
-                        401, 403 => 'API Key non valida o senza permessi.',
-                        500, 502, 503 => 'Servizio Gemini temporaneamente non disponibile.',
-                        default => 'Errore API Gemini: ' . $httpCode
+                        429 => 'Rate limit reached. Wait 1-2 minutes and try again.',
+                        401, 403 => 'API Key invalid or without permissions.',
+                        500, 502, 503 => 'Gemini service temporarily unavailable.',
+                        default => 'Gemini API error: ' . $httpCode
                     };
                     return ['success' => false, 'error' => $errorMsg];
                 }
 
                 $result = json_decode($response, true);
-                $text = $result['candidates'][0]['content']['parts'][0]['text'] ?? 'Nessuna risposta';
+                $text = $result['candidates'][0]['content']['parts'][0]['text'] ?? 'No response';
 
                 return ['success' => true, 'response' => $text];
             })(),
@@ -656,34 +662,34 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['api'])) {
             'analyze_project' => (function() use ($data) {
                 $apiKey = $data['config']['gemini_api_key'] ?? '';
                 if (empty($apiKey)) {
-                    return ['success' => false, 'error' => 'API Key Gemini non configurata'];
+                    return ['success' => false, 'error' => 'Gemini API Key not configured'];
                 }
 
                 // Scan project
                 $projectData = scanProject(__DIR__);
 
                 // Build context
-                $context = "=== ANALISI PROGETTO ===\n\n";
-                $context .= "Progetto: " . ($data['config']['project_name'] ?? 'N/A') . "\n\n";
+                $context = "=== PROJECT ANALYSIS ===\n\n";
+                $context .= "Project: " . ($data['config']['project_name'] ?? 'N/A') . "\n\n";
 
                 // Stats
-                $context .= "📊 STATISTICHE:\n";
-                $context .= "- File totali: {$projectData['stats']['total_files']}\n";
-                $context .= "- Cartelle: {$projectData['stats']['total_dirs']}\n";
+                $context .= "📊 STATISTICS:\n";
+                $context .= "- Total files: {$projectData['stats']['total_files']}\n";
+                $context .= "- Folders: {$projectData['stats']['total_dirs']}\n";
                 if (!empty($projectData['stats']['by_ext'])) {
                     arsort($projectData['stats']['by_ext']);
                     $topExts = array_slice($projectData['stats']['by_ext'], 0, 5, true);
-                    $context .= "- Tipi file: " . implode(', ', array_map(fn($k, $v) => "$k($v)", array_keys($topExts), $topExts)) . "\n";
+                    $context .= "- File types: " . implode(', ', array_map(fn($k, $v) => "$k($v)", array_keys($topExts), $topExts)) . "\n";
                 }
                 $context .= "\n";
 
                 // Tree
-                $context .= "📁 STRUTTURA:\n";
+                $context .= "📁 STRUCTURE:\n";
                 $context .= implode("\n", array_slice($projectData['tree'], 0, 100)) . "\n\n";
 
                 // Key files
                 if (!empty($projectData['key_files'])) {
-                    $context .= "📄 FILE CHIAVE:\n";
+                    $context .= "📄 KEY FILES:\n";
                     foreach ($projectData['key_files'] as $file => $content) {
                         $context .= "--- {$file} ---\n{$content}\n\n";
                     }
@@ -691,7 +697,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['api'])) {
 
                 // Entry points
                 if (!empty($projectData['entry_points'])) {
-                    $context .= "🚀 ENTRY POINTS (primi 50 righe):\n";
+                    $context .= "🚀 ENTRY POINTS (first 50 lines):\n";
                     foreach ($projectData['entry_points'] as $file => $content) {
                         $context .= "--- {$file} ---\n{$content}\n\n";
                     }
@@ -700,7 +706,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['api'])) {
                 // Current board state
                 $activeCards = array_filter($data['cards'], fn($c) => !$c['archived']);
                 if (!empty($activeCards)) {
-                    $context .= "📋 TASK ATTUALI NEL KANBAN:\n";
+                    $context .= "📋 CURRENT KANBAN TASKS:\n";
                     foreach ($activeCards as $card) {
                         $col = array_values(array_filter($data['columns'], fn($c) => $c['id'] === $card['column_id']))[0]['name'] ?? 'N/A';
                         $context .= "- [{$card['priority']}] {$card['title']} ({$col})\n";
@@ -708,16 +714,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['api'])) {
                 }
 
                 $systemPrompt = <<<PROMPT
-Analizza il progetto e rispondi SOLO con questo JSON (niente altro testo):
+Analyze the project and respond ONLY with this JSON (no other text):
 
-{"analysis":{"overview":"Max 2 frasi","tech_stack":["max 5 tech"],"architecture":"una riga","strengths":["max 3"],"concerns":["max 3"]},"suggested_tasks":[{"title":"breve","description":"max 1 frase","priority":"high|medium|low","category":"bug|feature|refactor|security|docs|test"}]}
+{"analysis":{"overview":"Max 2 sentences","tech_stack":["max 5 tech"],"architecture":"one line","strengths":["max 3"],"concerns":["max 3"]},"suggested_tasks":[{"title":"short","description":"max 1 sentence","priority":"high|medium|low","category":"bug|feature|refactor|security|docs|test"}]}
 
-REGOLE IMPORTANTI:
-- JSON puro, NO markdown, NO ```
-- Max 5 task suggeriti
-- Testi BREVI e concisi
-- In italiano
+IMPORTANT RULES:
+- Pure JSON, NO markdown, NO ```
+- Max 5 suggested tasks
+- Keep text SHORT and concise
 PROMPT;
+                $lang = $data['config']['ai_language'] ?? 'en';
+                if ($lang !== 'en') {
+                    $langName = match($lang) { 'it' => 'Italian', 'es' => 'Spanish', 'fr' => 'French', 'de' => 'German', 'pt' => 'Portuguese', default => 'English' };
+                    $systemPrompt .= "\n- Respond in {$langName}";
+                }
 
                 $payload = [
                     'contents' => [['parts' => [['text' => $context]]]],
@@ -740,10 +750,10 @@ PROMPT;
 
                 if ($httpCode !== 200) {
                     $errorMsg = match($httpCode) {
-                        429 => 'Rate limit raggiunto. Attendi 1-2 minuti e riprova.',
-                        401, 403 => 'API Key non valida o senza permessi.',
-                        500, 502, 503 => 'Servizio Gemini temporaneamente non disponibile.',
-                        default => 'Errore API Gemini: ' . $httpCode
+                        429 => 'Rate limit reached. Wait 1-2 minutes and try again.',
+                        401, 403 => 'API Key invalid or without permissions.',
+                        500, 502, 503 => 'Gemini service temporarily unavailable.',
+                        default => 'Gemini API error: ' . $httpCode
                     };
                     return ['success' => false, 'error' => $errorMsg];
                 }
@@ -768,7 +778,7 @@ PROMPT;
                     // Return raw for debug
                     return [
                         'success' => false,
-                        'error' => 'Risposta non valida da Gemini. Riprova.',
+                        'error' => 'Invalid response from Gemini. Try again.',
                         'debug' => substr($result['candidates'][0]['content']['parts'][0]['text'] ?? 'empty', 0, 500)
                     ];
                 }
@@ -780,7 +790,7 @@ PROMPT;
             'verify_task' => (function() use ($data, $input) {
                 $apiKey = $data['config']['gemini_api_key'] ?? '';
                 if (empty($apiKey)) {
-                    return ['success' => false, 'error' => 'API Key Gemini non configurata'];
+                    return ['success' => false, 'error' => 'Gemini API Key not configured'];
                 }
 
                 $cardId = $input['card_id'] ?? '';
@@ -793,12 +803,12 @@ PROMPT;
                 }
 
                 if (!$card) {
-                    return ['success' => false, 'error' => 'Card non trovata'];
+                    return ['success' => false, 'error' => 'Card not found'];
                 }
 
                 $files = $card['files'] ?? [];
                 if (empty($files)) {
-                    return ['success' => false, 'error' => 'Nessun file associato al task'];
+                    return ['success' => false, 'error' => 'No files associated with task'];
                 }
 
                 // Read file contents
@@ -810,7 +820,7 @@ PROMPT;
                 foreach ($files as $filePath) {
                     $fullPath = __DIR__ . '/' . ltrim($filePath, '/');
                     if (!file_exists($fullPath)) {
-                        $filesContent .= "\n--- FILE: {$filePath} ---\n[FILE NON TROVATO]\n";
+                        $filesContent .= "\n--- FILE: {$filePath} ---\n[FILE NOT FOUND]\n";
                         continue;
                     }
 
@@ -818,9 +828,9 @@ PROMPT;
                     if ($size > $maxSize) {
                         // For large files, read first and last portions
                         $content = file_get_contents($fullPath, false, null, 0, 80000);
-                        $content .= "\n\n[... CONTENUTO TRONCATO ...]\n\n";
+                        $content .= "\n\n[... CONTENT TRUNCATED ...]\n\n";
                         $content .= file_get_contents($fullPath, false, null, max(0, $size - 80000));
-                        $filesContent .= "\n--- FILE: {$filePath} (troncato, originale: {$size} bytes) ---\n{$content}\n";
+                        $filesContent .= "\n--- FILE: {$filePath} (truncated, original: {$size} bytes) ---\n{$content}\n";
                         $totalSize += strlen($content);
                         continue;
                     }
@@ -829,7 +839,7 @@ PROMPT;
                     $totalSize += strlen($content);
 
                     if ($totalSize > $maxTotal) {
-                        $filesContent .= "\n--- FILE: {$filePath} ---\n[LIMITE TOTALE RAGGIUNTO]\n";
+                        $filesContent .= "\n--- FILE: {$filePath} ---\n[TOTAL LIMIT REACHED]\n";
                         break;
                     }
 
@@ -846,31 +856,36 @@ PROMPT;
                 }
 
                 $taskContext = "TASK: {$card['title']}\n";
-                $taskContext .= "TIPO: {$label}\n";
-                $taskContext .= "DESCRIZIONE: {$card['description']}\n";
-                $taskContext .= "PRIORITÀ: {$card['priority']}\n";
+                $taskContext .= "TYPE: {$label}\n";
+                $taskContext .= "DESCRIPTION: {$card['description']}\n";
+                $taskContext .= "PRIORITY: {$card['priority']}\n";
 
                 $systemPrompt = <<<PROMPT
-Sei un assistente per la verifica di task di sviluppo software. Analizza il task e i file forniti.
+You are an assistant for verifying software development tasks. Analyze the task and provided files.
 
-RISPONDI IN ITALIANO con questo formato JSON (niente altro):
+RESPOND with this JSON format (nothing else):
 {
-    "status": "completato|parziale|non_completato|bug_trovato",
+    "status": "completed|partial|not_completed|bug_found",
     "confidence": 0-100,
-    "analysis": "Breve analisi di cosa hai trovato",
-    "evidence": "Dove nel codice hai trovato evidenza (riga, funzione, etc)",
-    "suggestion": "Se non completato o bug: cosa fare. Se completato: null",
+    "analysis": "Brief analysis of what you found",
+    "evidence": "Where in the code you found evidence (line, function, etc)",
+    "suggestion": "If not completed or bug: what to do. If completed: null",
     "can_close": true/false
 }
 
-REGOLE:
-- "completato": il task sembra fatto, il codice riflette quanto richiesto
-- "parziale": alcune parti fatte, altre mancanti
-- "non_completato": non trovi evidenza che il task sia stato fatto
-- "bug_trovato": hai identificato un bug nel codice relativo al task
-- can_close=true solo se sei ragionevolmente sicuro che il task è completato
-- Sii specifico nell'evidence, cita righe o funzioni
+RULES:
+- "completed": the task seems done, the code reflects what was requested
+- "partial": some parts done, others missing
+- "not_completed": you find no evidence that the task was done
+- "bug_found": you identified a bug in the code related to the task
+- can_close=true only if you're reasonably sure the task is completed
+- Be specific in evidence, cite lines or functions
 PROMPT;
+                $lang = $data['config']['ai_language'] ?? 'en';
+                if ($lang !== 'en') {
+                    $langName = match($lang) { 'it' => 'Italian', 'es' => 'Spanish', 'fr' => 'French', 'de' => 'German', 'pt' => 'Portuguese', default => 'English' };
+                    $systemPrompt .= "\n- Write analysis, evidence, and suggestion fields in {$langName}";
+                }
 
                 $payload = [
                     'contents' => [['parts' => [['text' => $taskContext . "\n\nFILE ASSOCIATI:\n" . $filesContent]]]],
@@ -893,9 +908,9 @@ PROMPT;
 
                 if ($httpCode !== 200) {
                     $errorMsg = match($httpCode) {
-                        429 => 'Rate limit raggiunto. Attendi 1-2 minuti.',
-                        401, 403 => 'API Key non valida.',
-                        default => 'Errore API: ' . $httpCode
+                        429 => 'Rate limit reached. Wait 1-2 minutes.',
+                        401, 403 => 'API Key invalid.',
+                        default => 'API error: ' . $httpCode
                     };
                     return ['success' => false, 'error' => $errorMsg];
                 }
@@ -922,14 +937,16 @@ PROMPT;
             // AI Auto-categorize
             'ai_categorize' => (function() use ($data, $input) {
                 $apiKey = $data['config']['gemini_api_key'] ?? '';
-                if (empty($apiKey)) return ['success' => false, 'error' => 'API Key non configurata'];
+                if (empty($apiKey)) return ['success' => false, 'error' => 'API Key not configured'];
 
                 $title = $input['title'] ?? '';
                 $desc = $input['description'] ?? '';
                 $labels = array_map(fn($l) => $l['name'], $data['labels']);
                 $lanes = array_map(fn($l) => $l['name'], $data['swimlanes']);
 
-                $prompt = "Analizza questo task e suggerisci la categorizzazione.\n\nTitolo: {$title}\nDescrizione: {$desc}\n\nLabel disponibili: " . implode(', ', $labels) . "\nSwimlane disponibili: " . implode(', ', $lanes) . "\n\nRispondi SOLO con JSON (niente altro):\n{\"priority\":\"high|medium|low\",\"label\":\"nome_label\",\"swimlane\":\"nome_swimlane\",\"reason\":\"breve motivazione\"}";
+                $lang = $data['config']['ai_language'] ?? 'en';
+                $langSuffix = $lang !== 'en' ? " Respond in " . match($lang) { 'it' => 'Italian', 'es' => 'Spanish', 'fr' => 'French', 'de' => 'German', 'pt' => 'Portuguese', default => 'English' } . "." : "";
+                $prompt = "Analyze this task and suggest categorization.\n\nTitle: {$title}\nDescription: {$desc}\n\nAvailable labels: " . implode(', ', $labels) . "\nAvailable swimlanes: " . implode(', ', $lanes) . "\n\nRespond ONLY with JSON (nothing else):\n{\"priority\":\"high|medium|low\",\"label\":\"label_name\",\"swimlane\":\"swimlane_name\",\"reason\":\"brief reason\"}{$langSuffix}";
 
                 $payload = [
                     'contents' => [['parts' => [['text' => $prompt]]]],
@@ -942,7 +959,7 @@ PROMPT;
                 $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
                 curl_close($ch);
 
-                if ($httpCode !== 200) return ['success' => false, 'error' => 'Errore API: ' . $httpCode];
+                if ($httpCode !== 200) return ['success' => false, 'error' => 'API error: ' . $httpCode];
 
                 $result = json_decode($response, true);
                 $text = $result['candidates'][0]['content']['parts'][0]['text'] ?? '';
@@ -956,12 +973,14 @@ PROMPT;
             // AI Estimate
             'ai_estimate' => (function() use ($data, $input) {
                 $apiKey = $data['config']['gemini_api_key'] ?? '';
-                if (empty($apiKey)) return ['success' => false, 'error' => 'API Key non configurata'];
+                if (empty($apiKey)) return ['success' => false, 'error' => 'API Key not configured'];
 
                 $title = $input['title'] ?? '';
                 $desc = $input['description'] ?? '';
 
-                $prompt = "Stima il tempo necessario per completare questo task di sviluppo software.\n\nTitolo: {$title}\nDescrizione: {$desc}\n\nRispondi SOLO con JSON:\n{\"estimate\":\"es: 2h, 1 giorno, 3-5 giorni\",\"complexity\":\"low|medium|high\",\"breakdown\":[\"step1\",\"step2\"]}";
+                $lang = $data['config']['ai_language'] ?? 'en';
+                $langSuffix = $lang !== 'en' ? " Respond in " . match($lang) { 'it' => 'Italian', 'es' => 'Spanish', 'fr' => 'French', 'de' => 'German', 'pt' => 'Portuguese', default => 'English' } . "." : "";
+                $prompt = "Estimate the time needed to complete this software development task.\n\nTitle: {$title}\nDescription: {$desc}\n\nRespond ONLY with JSON:\n{\"estimate\":\"e.g.: 2h, 1 day, 3-5 days\",\"complexity\":\"low|medium|high\",\"breakdown\":[\"step1\",\"step2\"]}{$langSuffix}";
 
                 $payload = [
                     'contents' => [['parts' => [['text' => $prompt]]]],
@@ -974,7 +993,7 @@ PROMPT;
                 $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
                 curl_close($ch);
 
-                if ($httpCode !== 200) return ['success' => false, 'error' => 'Errore API: ' . $httpCode];
+                if ($httpCode !== 200) return ['success' => false, 'error' => 'API error: ' . $httpCode];
 
                 $result = json_decode($response, true);
                 $text = $result['candidates'][0]['content']['parts'][0]['text'] ?? '';
@@ -988,7 +1007,7 @@ PROMPT;
             // Daily Standup AI
             'ai_standup' => (function() use ($data) {
                 $apiKey = $data['config']['gemini_api_key'] ?? '';
-                if (empty($apiKey)) return ['success' => false, 'error' => 'API Key non configurata'];
+                if (empty($apiKey)) return ['success' => false, 'error' => 'API Key not configured'];
 
                 $summary = "";
                 $cols = array_column($data['columns'], 'name', 'id');
@@ -997,10 +1016,12 @@ PROMPT;
                     if ($c['archived']) continue;
                     $col = $cols[$c['column_id']] ?? 'Unknown';
                     $lane = $lanes[$c['swimlane_id']] ?? '';
-                    $summary .= "- [{$col}] {$c['title']} (priorità: {$c['priority']}, swimlane: {$lane})\n";
+                    $summary .= "- [{$col}] {$c['title']} (priority: {$c['priority']}, swimlane: {$lane})\n";
                 }
 
-                $prompt = "Genera un report Daily Standup Agile basato su questi task:\n\n{$summary}\n\nFormato report:\n1. **Completati ieri** (task in Done)\n2. **In corso oggi** (task In Progress)\n3. **Prossimi** (task prioritari in To Do)\n4. **Bloccanti/Rischi**\n\nRispondi in italiano, max 200 parole.";
+                $lang = $data['config']['ai_language'] ?? 'en';
+                $langSuffix = $lang !== 'en' ? " Respond in " . match($lang) { 'it' => 'Italian', 'es' => 'Spanish', 'fr' => 'French', 'de' => 'German', 'pt' => 'Portuguese', default => 'English' } . "." : "";
+                $prompt = "Generate an Agile Daily Standup report based on these tasks:\n\n{$summary}\n\nReport format:\n1. **Completed yesterday** (tasks in Done)\n2. **In progress today** (tasks In Progress)\n3. **Next up** (priority tasks in To Do)\n4. **Blockers/Risks**\n\nMax 200 words.{$langSuffix}";
 
                 $payload = [
                     'contents' => [['parts' => [['text' => $prompt]]]],
@@ -1013,7 +1034,7 @@ PROMPT;
                 $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
                 curl_close($ch);
 
-                if ($httpCode !== 200) return ['success' => false, 'error' => 'Errore API: ' . $httpCode];
+                if ($httpCode !== 200) return ['success' => false, 'error' => 'API error: ' . $httpCode];
 
                 $result = json_decode($response, true);
                 $text = $result['candidates'][0]['content']['parts'][0]['text'] ?? '';
@@ -1115,7 +1136,7 @@ PROMPT;
                 $token = $data['config']['github_token'] ?? '';
                 $repo = $data['config']['github_repo'] ?? '';
                 if (empty($token) || empty($repo)) {
-                    return ['success' => false, 'error' => 'GitHub non configurato. Vai in Impostazioni.'];
+                    return ['success' => false, 'error' => 'GitHub not configured. Go to Settings.'];
                 }
 
                 $ch = curl_init("https://api.github.com/repos/{$repo}/issues?state=all&per_page=50");
@@ -1151,7 +1172,7 @@ PROMPT;
                 $token = $data['config']['github_token'] ?? '';
                 $repo = $data['config']['github_repo'] ?? '';
                 if (empty($token) || empty($repo)) {
-                    return ['success' => false, 'error' => 'GitHub non configurato'];
+                    return ['success' => false, 'error' => 'GitHub not configured'];
                 }
 
                 $ch = curl_init("https://api.github.com/repos/{$repo}/pulls?state=all&per_page=30");
@@ -1181,7 +1202,7 @@ PROMPT;
                 $token = $data['config']['github_token'] ?? '';
                 $repo = $data['config']['github_repo'] ?? '';
                 if (empty($token) || empty($repo)) {
-                    return ['success' => false, 'error' => 'GitHub non configurato'];
+                    return ['success' => false, 'error' => 'GitHub not configured'];
                 }
 
                 $ch = curl_init("https://api.github.com/repos/{$repo}/commits?per_page=20");
@@ -1211,7 +1232,7 @@ PROMPT;
                 $token = $data['config']['github_token'] ?? '';
                 $repo = $data['config']['github_repo'] ?? '';
                 if (empty($token) || empty($repo)) {
-                    return ['success' => false, 'error' => 'GitHub non configurato'];
+                    return ['success' => false, 'error' => 'GitHub not configured'];
                 }
 
                 $title = $input['title'] ?? '';
@@ -1219,12 +1240,12 @@ PROMPT;
                 $labels = $input['labels'] ?? [];
 
                 if (empty($title)) {
-                    return ['success' => false, 'error' => 'Titolo richiesto'];
+                    return ['success' => false, 'error' => 'Title required'];
                 }
 
                 $payload = json_encode([
                     'title' => $title,
-                    'body' => $body . "\n\n---\n_Creato da _Ykan Kanban_",
+                    'body' => $body . "\n\n---\n_Created from _Ykan Kanban_",
                     'labels' => $labels
                 ]);
 
@@ -1248,7 +1269,7 @@ PROMPT;
 
                 if ($httpCode !== 201) {
                     $err = json_decode($response, true);
-                    return ['success' => false, 'error' => 'Errore creazione issue: ' . ($err['message'] ?? $httpCode)];
+                    return ['success' => false, 'error' => 'Error creating issue: ' . ($err['message'] ?? $httpCode)];
                 }
 
                 return ['success' => true, 'issue' => json_decode($response, true)];
@@ -1259,12 +1280,12 @@ PROMPT;
                 $token = $data['config']['github_token'] ?? '';
                 $repo = $data['config']['github_repo'] ?? '';
                 if (empty($token) || empty($repo)) {
-                    return ['success' => false, 'error' => 'GitHub non configurato'];
+                    return ['success' => false, 'error' => 'GitHub not configured'];
                 }
 
                 $issueNumber = $input['issue_number'] ?? 0;
                 if (!$issueNumber) {
-                    return ['success' => false, 'error' => 'Numero issue richiesto'];
+                    return ['success' => false, 'error' => 'Issue number required'];
                 }
 
                 $payload = json_encode(['state' => 'closed']);
@@ -1288,7 +1309,7 @@ PROMPT;
                 curl_close($ch);
 
                 if ($httpCode !== 200) {
-                    return ['success' => false, 'error' => 'Errore chiusura issue: ' . $httpCode];
+                    return ['success' => false, 'error' => 'Error closing issue: ' . $httpCode];
                 }
 
                 return ['success' => true, 'issue' => json_decode($response, true)];
@@ -1299,7 +1320,7 @@ PROMPT;
                 $token = $data['config']['github_token'] ?? '';
                 $repo = $data['config']['github_repo'] ?? '';
                 if (empty($token) || empty($repo)) {
-                    return ['success' => false, 'error' => 'GitHub non configurato'];
+                    return ['success' => false, 'error' => 'GitHub not configured'];
                 }
 
                 $ch = curl_init("https://api.github.com/repos/{$repo}");
@@ -1339,7 +1360,7 @@ $data = loadData();
 $dataJson = json_encode($data);
 ?>
 <!DOCTYPE html>
-<html lang="it">
+<html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -1580,16 +1601,16 @@ $dataJson = json_encode($data);
             <button class="btn btn-icon" onclick="toggleGemini()" title="Gemini AI">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
             </button>
-            <button class="btn btn-icon" onclick="toggleArchive()" title="Archivio">
+            <button class="btn btn-icon" onclick="toggleArchive()" title="Archive">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 8v13H3V8M1 3h22v5H1zM10 12h4"/></svg>
             </button>
             <button class="btn btn-icon" onclick="toggleGithub()" title="GitHub">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg>
             </button>
-            <button class="btn btn-icon" onclick="toggleTheme()" title="Tema">
+            <button class="btn btn-icon" onclick="toggleTheme()" title="Theme">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
             </button>
-            <button class="btn btn-icon" onclick="openConfigModal()" title="Impostazioni">
+            <button class="btn btn-icon" onclick="openConfigModal()" title="Settings">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
             </button>
         </div>
@@ -1597,30 +1618,30 @@ $dataJson = json_encode($data);
 
     <!-- Search & Filters Bar -->
     <div class="filters-bar">
-        <input type="text" id="searchInput" class="search-input" placeholder="🔍 Cerca..." oninput="applyFilters()">
+        <input type="text" id="searchInput" class="search-input" placeholder="🔍 Search..." oninput="applyFilters()">
         <select id="filterLabel" class="filter-select" onchange="applyFilters()">
-            <option value="">Tutte le label</option>
+            <option value="">All labels</option>
             <?php foreach ($data['labels'] as $l): ?>
             <option value="<?= $l['id'] ?>"><?= htmlspecialchars($l['name']) ?></option>
             <?php endforeach; ?>
         </select>
         <select id="filterPriority" class="filter-select" onchange="applyFilters()">
-            <option value="">Tutte le priorità</option>
-            <option value="high">🔴 Alta</option>
-            <option value="medium">🟡 Media</option>
-            <option value="low">🟢 Bassa</option>
+            <option value="">All priorities</option>
+            <option value="high">🔴 High</option>
+            <option value="medium">🟡 Medium</option>
+            <option value="low">🟢 Low</option>
         </select>
         <select id="filterDue" class="filter-select" onchange="applyFilters()">
-            <option value="">Tutte le scadenze</option>
-            <option value="overdue">⚠️ Scadute</option>
-            <option value="today">📅 Oggi</option>
-            <option value="week">📆 Questa settimana</option>
-            <option value="none">❌ Senza scadenza</option>
+            <option value="">All due dates</option>
+            <option value="overdue">⚠️ Overdue</option>
+            <option value="today">📅 Today</option>
+            <option value="week">📆 This week</option>
+            <option value="none">❌ No due date</option>
         </select>
-        <button class="btn btn-icon" onclick="clearFilters()" title="Reset filtri">✕</button>
+        <button class="btn btn-icon" onclick="clearFilters()" title="Reset filters">✕</button>
         <span style="flex:1"></span>
         <button class="btn" onclick="generateStandup()" title="Daily Standup AI">📋 Standup</button>
-        <button class="btn" onclick="scanTodos()" title="Scan TODO nei file">🔍 TODO</button>
+        <button class="btn" onclick="scanTodos()" title="Scan TODO in files">🔍 TODO</button>
         <button class="btn" onclick="showBurndown()" title="Burndown Chart">📈 Burndown</button>
         <button class="btn" onclick="exportJSON()" title="Export JSON">📥 JSON</button>
         <button class="btn" onclick="exportCSV()" title="Export CSV">📊 CSV</button>
@@ -1629,7 +1650,7 @@ $dataJson = json_encode($data);
     <!-- Board -->
     <div class="board-container">
         <div id="board" class="board"></div>
-        <button class="add-swimlane-btn" onclick="addSwimlane()">+ Aggiungi Swimlane</button>
+        <button class="add-swimlane-btn" onclick="addSwimlane()">+ Add Swimlane</button>
     </div>
 
     <!-- Gemini Panel -->
@@ -1639,27 +1660,27 @@ $dataJson = json_encode($data);
             <button class="btn btn-icon" onclick="toggleGemini()">&times;</button>
         </div>
         <div id="geminiContent" class="gemini-content">
-            <p style="color: var(--text2)">Usa i pulsanti qui sotto per analizzare la board con Gemini AI.</p>
+            <p style="color: var(--text2)">Use the buttons below to analyze the board with Gemini AI.</p>
         </div>
         <div class="gemini-actions">
             <button class="btn btn-primary" onclick="analyzeProject()" style="background:linear-gradient(135deg,#667eea,#764ba2);border:none">
-                🔍 Analizza Progetto
+                🔍 Analyze Project
             </button>
             <hr style="border:none;border-top:1px solid var(--border);margin:8px 0">
-            <button class="btn" onclick="askGemini('analyze')">Analizza Board</button>
-            <button class="btn" onclick="askGemini('suggest_tasks')">Suggerisci Task</button>
-            <button class="btn" onclick="askGemini('estimate')">Stima Tempistiche</button>
+            <button class="btn" onclick="askGemini('analyze')">Analyze Board</button>
+            <button class="btn" onclick="askGemini('suggest_tasks')">Suggest Tasks</button>
+            <button class="btn" onclick="askGemini('estimate')">Estimate Time</button>
             <div class="form-group" style="margin:0">
-                <input type="text" id="geminiCustom" placeholder="Domanda personalizzata...">
+                <input type="text" id="geminiCustom" placeholder="Custom question...">
             </div>
-            <button class="btn btn-primary" onclick="askGeminiCustom()">Chiedi</button>
+            <button class="btn btn-primary" onclick="askGeminiCustom()">Ask</button>
         </div>
     </div>
 
     <!-- Archive Panel -->
     <div id="archivePanel" class="archive-panel">
         <div class="archive-header">
-            <h3>Archivio</h3>
+            <h3>Archive</h3>
             <button class="btn btn-icon" onclick="toggleArchive()">&times;</button>
         </div>
         <div id="archiveList" class="archive-list"></div>
@@ -1679,8 +1700,8 @@ $dataJson = json_encode($data);
         </div>
         <div id="githubContent" class="github-content">
             <div class="github-empty">
-                <p>Configura GitHub Token e Repository nelle Impostazioni per vedere issues, PR e commits.</p>
-                <button class="btn btn-primary" onclick="openConfigModal()" style="margin-top:12px">⚙️ Impostazioni</button>
+                <p>Configure GitHub Token and Repository in Settings to see issues, PRs and commits.</p>
+                <button class="btn btn-primary" onclick="openConfigModal()" style="margin-top:12px">⚙️ Settings</button>
             </div>
         </div>
     </div>
@@ -1688,7 +1709,7 @@ $dataJson = json_encode($data);
     <!-- Card Modal -->
     <div id="cardModal" class="modal-overlay">
         <div class="modal">
-            <h2 id="cardModalTitle">Nuova Card</h2>
+            <h2 id="cardModalTitle">New Card</h2>
             <form id="cardForm">
                 <input type="hidden" id="cardId">
                 <input type="hidden" id="cardColumnId">
@@ -1696,75 +1717,75 @@ $dataJson = json_encode($data);
                 <div class="form-group" id="templateGroup" style="display:none">
                     <label>📋 Template</label>
                     <select id="cardTemplate" onchange="applyTemplate()">
-                        <option value="">Seleziona template...</option>
+                        <option value="">Select template...</option>
                         <option value="bug">🐛 Bug Report</option>
                         <option value="feature">✨ Feature Request</option>
-                        <option value="task">📌 Task Generico</option>
-                        <option value="docs">📚 Documentazione</option>
+                        <option value="task">📌 Generic Task</option>
+                        <option value="docs">📚 Documentation</option>
                         <option value="refactor">🔧 Refactoring</option>
                     </select>
                 </div>
                 <div class="form-group">
-                    <label>Titolo</label>
+                    <label>Title</label>
                     <input type="text" id="cardTitleInput" required>
                 </div>
                 <div class="form-group">
-                    <label>Descrizione</label>
+                    <label>Description</label>
                     <textarea id="cardDescInput"></textarea>
                 </div>
                 <div class="form-group">
-                    <label>Priorità</label>
+                    <label>Priority</label>
                     <div style="display:flex;gap:8px">
                         <select id="cardPriorityInput" style="flex:1">
-                            <option value="low">Bassa</option>
-                            <option value="medium" selected>Media</option>
-                            <option value="high">Alta</option>
+                            <option value="low">Low</option>
+                            <option value="medium" selected>Medium</option>
+                            <option value="high">High</option>
                         </select>
-                        <button type="button" class="btn" onclick="aiSuggestCategory()" title="AI suggerisce label e priorità">🤖 Auto</button>
-                        <button type="button" class="btn" onclick="aiEstimate()" title="AI stima tempo">⏱️</button>
+                        <button type="button" class="btn" onclick="aiSuggestCategory()" title="AI suggests label and priority">🤖 Auto</button>
+                        <button type="button" class="btn" onclick="aiEstimate()" title="AI estimates time">⏱️</button>
                     </div>
                 </div>
                 <div class="form-group">
                     <label>Label</label>
                     <select id="cardLabelInput">
-                        <option value="">Nessuna</option>
+                        <option value="">None</option>
                     </select>
                 </div>
                 <div class="form-group">
-                    <label>Data Scadenza</label>
+                    <label>Due Date</label>
                     <input type="date" id="cardDueInput">
                 </div>
                 <div class="form-group">
-                    <label>Data Next Check</label>
+                    <label>Next Check Date</label>
                     <input type="date" id="cardNextCheckInput">
                 </div>
                 <div class="form-group" style="background:var(--bg2);padding:12px;border-radius:8px;margin-top:16px">
-                    <label style="font-weight:500;margin-bottom:8px;display:block">📁 File Associati</label>
+                    <label style="font-weight:500;margin-bottom:8px;display:block">📁 Associated Files</label>
                     <div id="cardFilesList" style="margin-bottom:8px"></div>
                     <div style="display:flex;gap:8px">
-                        <input type="text" id="cardFileInput" placeholder="percorso/file.php (relativo)" style="flex:1;padding:6px 8px;font-size:12px">
-                        <button type="button" class="btn" onclick="addFileToCard()">+ Aggiungi</button>
+                        <input type="text" id="cardFileInput" placeholder="path/file.php (relative)" style="flex:1;padding:6px 8px;font-size:12px">
+                        <button type="button" class="btn" onclick="addFileToCard()">+ Add</button>
                     </div>
-                    <p style="font-size:10px;color:var(--text2);margin-top:4px">Path relativi alla cartella del progetto</p>
+                    <p style="font-size:10px;color:var(--text2);margin-top:4px">Relative paths to project folder</p>
                 </div>
                 <div class="form-group" style="background:var(--bg2);padding:12px;border-radius:8px;margin-top:12px">
                     <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-bottom:8px">
                         <input type="checkbox" id="cardAutoRegenerate" style="width:16px;height:16px">
-                        <span style="font-weight:500">Task Autorigenerante</span>
-                        <span style="font-size:11px;color:var(--text2)">(si ricrea quando archiviato)</span>
+                        <span style="font-weight:500">Auto-regenerating Task</span>
+                        <span style="font-size:11px;color:var(--text2)">(recreates when archived)</span>
                     </label>
                     <div id="regenerateOptions" style="display:none;margin-top:8px">
-                        <label style="font-size:11px;color:var(--text2)">Ritardo rigenerazione (giorni)</label>
+                        <label style="font-size:11px;color:var(--text2)">Regeneration delay (days)</label>
                         <input type="number" id="cardRegenerateDelay" min="0" value="0" style="width:80px;padding:4px 8px">
-                        <span style="font-size:11px;color:var(--text2);margin-left:8px">0 = immediato</span>
+                        <span style="font-size:11px;color:var(--text2);margin-left:8px">0 = immediate</span>
                     </div>
                 </div>
                 <div class="modal-actions">
-                    <button type="button" class="btn btn-danger" id="deleteCardBtn" onclick="deleteCard()" style="display:none">Elimina</button>
-                    <button type="button" class="btn" id="verifyCardBtn" onclick="verifyTaskWithAI()" style="display:none;background:linear-gradient(135deg,#667eea,#764ba2);color:white;border:none">🤖 Verifica AI</button>
+                    <button type="button" class="btn btn-warning" id="deleteCardBtn" onclick="deleteCard()" style="display:none">📦 Archive</button>
+                    <button type="button" class="btn" id="verifyCardBtn" onclick="verifyTaskWithAI()" style="display:none;background:linear-gradient(135deg,#667eea,#764ba2);color:white;border:none">🤖 AI Verify</button>
                     <span style="flex:1"></span>
-                    <button type="button" class="btn" onclick="closeCardModal()">Annulla</button>
-                    <button type="submit" class="btn btn-primary">Salva</button>
+                    <button type="button" class="btn" onclick="closeCardModal()">Cancel</button>
+                    <button type="submit" class="btn btn-primary">Save</button>
                 </div>
                 <div id="verifyResult" style="display:none;margin-top:12px;padding:12px;border-radius:8px;font-size:12px"></div>
             </form>
@@ -1774,35 +1795,46 @@ $dataJson = json_encode($data);
     <!-- Config Modal -->
     <div id="configModal" class="modal-overlay">
         <div class="modal">
-            <h2>Impostazioni</h2>
+            <h2>Settings</h2>
             <form id="configForm">
                 <div class="form-group">
-                    <label>Nome Progetto</label>
+                    <label>Project Name</label>
                     <input type="text" id="configProjectName">
                 </div>
                 <div class="form-group">
+                    <label>AI Response Language</label>
+                    <select id="configLanguage">
+                        <option value="en">English</option>
+                        <option value="it">Italiano</option>
+                        <option value="es">Español</option>
+                        <option value="fr">Français</option>
+                        <option value="de">Deutsch</option>
+                        <option value="pt">Português</option>
+                    </select>
+                </div>
+                <div class="form-group">
                     <label>Gemini API Key</label>
-                    <input type="password" id="configGeminiKey" placeholder="Inserisci la tua API key...">
+                    <input type="password" id="configGeminiKey" placeholder="Enter your API key...">
                 </div>
                 <hr style="margin:16px 0;border:none;border-top:1px solid var(--border)">
                 <div class="form-group">
                     <label>GitHub Token <span style="font-weight:normal;color:var(--text2)">(Personal Access Token)</span></label>
                     <input type="password" id="configGithubToken" placeholder="ghp_xxxxxxxxxxxx...">
-                    <small style="color:var(--text2);font-size:11px">Genera da: GitHub → Settings → Developer settings → Personal access tokens</small>
+                    <small style="color:var(--text2);font-size:11px">Generate from: GitHub → Settings → Developer settings → Personal access tokens</small>
                 </div>
                 <div class="form-group">
                     <label>GitHub Repository <span style="font-weight:normal;color:var(--text2)">(owner/repo)</span></label>
-                    <input type="text" id="configGithubRepo" placeholder="es. tuousername/_Ykan">
+                    <input type="text" id="configGithubRepo" placeholder="e.g. yourusername/_Ykan">
                 </div>
                 <hr style="margin:16px 0;border:none;border-top:1px solid var(--border)">
                 <div class="form-group">
                     <label>Labels</label>
                     <div id="labelsManager"></div>
-                    <button type="button" class="btn" onclick="addLabel()" style="margin-top:8px">+ Aggiungi Label</button>
+                    <button type="button" class="btn" onclick="addLabel()" style="margin-top:8px">+ Add Label</button>
                 </div>
                 <div class="modal-actions">
-                    <button type="button" class="btn" onclick="closeConfigModal()">Annulla</button>
-                    <button type="submit" class="btn btn-primary">Salva</button>
+                    <button type="button" class="btn" onclick="closeConfigModal()">Cancel</button>
+                    <button type="submit" class="btn btn-primary">Save</button>
                 </div>
             </form>
         </div>
@@ -1898,7 +1930,7 @@ $dataJson = json_encode($data);
                                     .filter(c => c.column_id === col.id && c.swimlane_id === lane.id)
                                     .sort((a, b) => a.position - b.position)
                                     .map(card => renderCard(card)).join('')}
-                                <button class="add-card-btn" onclick="openCardModal(null, '${col.id}', '${lane.id}')">+ Aggiungi Card</button>
+                                <button class="add-card-btn" onclick="openCardModal(null, '${col.id}', '${lane.id}')">+ Add Card</button>
                             </div>
                         `).join('')}
                     </div>
@@ -2010,7 +2042,7 @@ $dataJson = json_encode($data);
 
     // === COLUMNS ===
     async function addColumn() {
-        const result = await api('add_column', { name: 'Nuova Colonna' });
+        const result = await api('add_column', { name: 'New Column' });
         if (result.success) {
             boardData.columns.push(result.column);
             render();
@@ -2025,10 +2057,10 @@ $dataJson = json_encode($data);
 
     async function deleteColumn(id) {
         if (boardData.columns.length <= 1) {
-            toast('Non puoi eliminare l\'ultima colonna', 'error');
+            toast('Cannot delete the last column', 'error');
             return;
         }
-        if (!confirm('Eliminare questa colonna e tutte le sue card?')) return;
+        if (!confirm('Delete this column and all its cards?')) return;
         boardData.columns = boardData.columns.filter(c => c.id !== id);
         boardData.cards = boardData.cards.filter(c => c.column_id !== id);
         render();
@@ -2059,7 +2091,7 @@ $dataJson = json_encode($data);
     }
 
     async function addSwimlane() {
-        const result = await api('add_swimlane', { name: 'Nuova Swimlane' });
+        const result = await api('add_swimlane', { name: 'New Swimlane' });
         if (result.success) {
             boardData.swimlanes.push(result.swimlane);
             render();
@@ -2074,10 +2106,10 @@ $dataJson = json_encode($data);
 
     async function deleteSwimlane(id) {
         if (boardData.swimlanes.length <= 1) {
-            toast('Non puoi eliminare l\'ultima swimlane', 'error');
+            toast('Cannot delete the last swimlane', 'error');
             return;
         }
-        if (!confirm('Eliminare questa swimlane? Le card verranno spostate.')) return;
+        if (!confirm('Delete this swimlane? Cards will be moved.')) return;
         const firstLane = boardData.swimlanes[0].id;
         boardData.cards.forEach(c => { if (c.swimlane_id === id) c.swimlane_id = firstLane; });
         boardData.swimlanes = boardData.swimlanes.filter(l => l.id !== id);
@@ -2101,13 +2133,13 @@ $dataJson = json_encode($data);
 
         // Populate labels dropdown
         const labelSelect = document.getElementById('cardLabelInput');
-        labelSelect.innerHTML = '<option value="">Nessuna</option>' +
+        labelSelect.innerHTML = '<option value="">None</option>' +
             boardData.labels.map(l => `<option value="${l.id}">${escHtml(l.name)}</option>`).join('');
 
         if (cardId) {
             const card = boardData.cards.find(c => c.id === cardId);
             if (!card) return;
-            document.getElementById('cardModalTitle').textContent = 'Modifica Card';
+            document.getElementById('cardModalTitle').textContent = 'Edit Card';
             document.getElementById('cardId').value = card.id;
             document.getElementById('cardColumnId').value = card.column_id;
             document.getElementById('cardSwimlaneId').value = card.swimlane_id;
@@ -2128,7 +2160,7 @@ $dataJson = json_encode($data);
             verifyBtn.style.display = cardFiles.length > 0 ? 'block' : 'none';
             document.getElementById('templateGroup').style.display = 'none';
         } else {
-            document.getElementById('cardModalTitle').textContent = 'Nuova Card';
+            document.getElementById('cardModalTitle').textContent = 'New Card';
             form.reset();
             document.getElementById('cardId').value = '';
             document.getElementById('cardColumnId').value = colId;
@@ -2151,7 +2183,7 @@ $dataJson = json_encode($data);
         const container = document.getElementById('cardFilesList');
         const verifyBtn = document.getElementById('verifyCardBtn');
         if (cardFiles.length === 0) {
-            container.innerHTML = '<p style="font-size:11px;color:var(--text2);margin:0">Nessun file associato</p>';
+            container.innerHTML = '<p style="font-size:11px;color:var(--text2);margin:0">No associated files</p>';
             if (verifyBtn) verifyBtn.style.display = 'none';
         } else {
             container.innerHTML = cardFiles.map((f, i) => `
@@ -2187,7 +2219,7 @@ $dataJson = json_encode($data);
         const resultDiv = document.getElementById('verifyResult');
         resultDiv.style.display = 'block';
         resultDiv.style.background = 'var(--bg)';
-        resultDiv.innerHTML = '<p style="text-align:center;color:var(--text2)">🔍 Analisi in corso...</p>';
+        resultDiv.innerHTML = '<p style="text-align:center;color:var(--text2)">🔍 Analysis in progress...</p>';
 
         const result = await api('verify_task', { card_id: cardId });
 
@@ -2199,24 +2231,24 @@ $dataJson = json_encode($data);
 
         const r = result.result;
         const statusColors = {
-            'completato': { bg: 'rgba(34,197,94,0.1)', icon: '✅', color: 'var(--low)' },
-            'parziale': { bg: 'rgba(245,158,11,0.1)', icon: '⚠️', color: 'var(--medium)' },
-            'non_completato': { bg: 'rgba(239,68,68,0.1)', icon: '❌', color: 'var(--high)' },
-            'bug_trovato': { bg: 'rgba(239,68,68,0.1)', icon: '🐛', color: 'var(--high)' }
+            'completed': { bg: 'rgba(34,197,94,0.1)', icon: '✅', color: 'var(--low)' },
+            'partial': { bg: 'rgba(245,158,11,0.1)', icon: '⚠️', color: 'var(--medium)' },
+            'not_completed': { bg: 'rgba(239,68,68,0.1)', icon: '❌', color: 'var(--high)' },
+            'bug_found': { bg: 'rgba(239,68,68,0.1)', icon: '🐛', color: 'var(--high)' }
         };
-        const s = statusColors[r.status] || statusColors['non_completato'];
+        const s = statusColors[r.status] || statusColors['not_completed'];
 
         resultDiv.style.background = s.bg;
         resultDiv.innerHTML = `
             <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
                 <span style="font-size:20px">${s.icon}</span>
                 <strong style="color:${s.color};text-transform:uppercase">${r.status}</strong>
-                <span style="margin-left:auto;font-size:11px;color:var(--text2)">Confidenza: ${r.confidence || '?'}%</span>
+                <span style="margin-left:auto;font-size:11px;color:var(--text2)">Confidence: ${r.confidence || '?'}%</span>
             </div>
-            <p style="margin-bottom:6px"><strong>Analisi:</strong> ${escHtml(r.analysis || '')}</p>
-            ${r.evidence ? `<p style="margin-bottom:6px;font-size:11px;color:var(--text2)"><strong>Evidenza:</strong> ${escHtml(r.evidence)}</p>` : ''}
-            ${r.suggestion ? `<p style="margin-bottom:6px;padding:8px;background:var(--bg2);border-radius:4px"><strong>💡 Suggerimento:</strong> ${escHtml(r.suggestion)}</p>` : ''}
-            ${r.can_close ? `<button class="btn btn-primary" onclick="deleteCard()" style="margin-top:8px">✓ Archivia Task</button>` : ''}
+            <p style="margin-bottom:6px"><strong>Analysis:</strong> ${escHtml(r.analysis || '')}</p>
+            ${r.evidence ? `<p style="margin-bottom:6px;font-size:11px;color:var(--text2)"><strong>Evidence:</strong> ${escHtml(r.evidence)}</p>` : ''}
+            ${r.suggestion ? `<p style="margin-bottom:6px;padding:8px;background:var(--bg2);border-radius:4px"><strong>💡 Suggestion:</strong> ${escHtml(r.suggestion)}</p>` : ''}
+            ${r.can_close ? `<button class="btn btn-primary" onclick="deleteCard()" style="margin-top:8px">✓ Archive Task</button>` : ''}
         `;
     }
 
@@ -2257,7 +2289,7 @@ $dataJson = json_encode($data);
 
     async function deleteCard() {
         const id = document.getElementById('cardId').value;
-        if (!id || !confirm('Archiviare questa card?')) return;
+        if (!id || !confirm('Archive this card?')) return;
         const card = boardData.cards.find(c => c.id === id);
         if (card) {
             card.archived = true;
@@ -2270,7 +2302,7 @@ $dataJson = json_encode($data);
         // If auto-regenerated, add new card to local data
         if (result.regenerated && result.new_card) {
             boardData.cards.push(result.new_card);
-            toast(`Task "${result.new_card.title}" rigenerato automaticamente`, 'success');
+            toast(`Task "${result.new_card.title}" auto-regenerated`, 'success');
         }
 
         render();
@@ -2287,7 +2319,7 @@ $dataJson = json_encode($data);
     }
 
     async function permanentDeleteCard(id) {
-        if (!confirm('Eliminare definitivamente questa card?')) return;
+        if (!confirm('Permanently delete this card?')) return;
         boardData.cards = boardData.cards.filter(c => c.id !== id);
         render();
         await api('delete_card', { id });
@@ -2296,6 +2328,7 @@ $dataJson = json_encode($data);
     // === CONFIG ===
     function openConfigModal() {
         document.getElementById('configProjectName').value = boardData.config.project_name || '';
+        document.getElementById('configLanguage').value = boardData.config.ai_language || 'en';
         document.getElementById('configGeminiKey').value = boardData.config.gemini_api_key || '';
         document.getElementById('configGithubToken').value = boardData.config.github_token || '';
         document.getElementById('configGithubRepo').value = boardData.config.github_repo || '';
@@ -2311,6 +2344,7 @@ $dataJson = json_encode($data);
         e.preventDefault();
         const config = {
             project_name: document.getElementById('configProjectName').value,
+            ai_language: document.getElementById('configLanguage').value,
             gemini_api_key: document.getElementById('configGeminiKey').value,
             github_token: document.getElementById('configGithubToken').value,
             github_repo: document.getElementById('configGithubRepo').value,
@@ -2325,7 +2359,7 @@ $dataJson = json_encode($data);
 
     // === LABELS ===
     async function addLabel() {
-        const result = await api('add_label', { name: 'Nuova Label', color: '#6b7280' });
+        const result = await api('add_label', { name: 'New Label', color: '#6b7280' });
         if (result.success) {
             boardData.labels.push(result.label);
             renderLabelsManager();
@@ -2421,8 +2455,8 @@ $dataJson = json_encode($data);
 
         if (!boardData.config.github_token || !boardData.config.github_repo) {
             content.innerHTML = `<div class="github-empty">
-                <p>Configura GitHub Token e Repository nelle Impostazioni.</p>
-                <button class="btn btn-primary" onclick="openConfigModal()" style="margin-top:12px">⚙️ Impostazioni</button>
+                <p>Configure GitHub Token and Repository in Settings.</p>
+                <button class="btn btn-primary" onclick="openConfigModal()" style="margin-top:12px">⚙️ Settings</button>
             </div>`;
             return;
         }
@@ -2433,7 +2467,7 @@ $dataJson = json_encode($data);
             return;
         }
 
-        content.innerHTML = '<div class="github-loading">Caricamento...</div>';
+        content.innerHTML = '<div class="github-loading">Loading...</div>';
 
         let result;
         if (tab === 'issues') result = await api('github_issues');
@@ -2455,7 +2489,7 @@ $dataJson = json_encode($data);
         if (tab === 'issues') {
             const issues = data.issues || [];
             if (issues.length === 0) {
-                content.innerHTML = '<div class="github-empty">Nessuna issue trovata</div>';
+                content.innerHTML = '<div class="github-empty">No issues found</div>';
                 return;
             }
             content.innerHTML = issues.map(i => `
@@ -2471,7 +2505,7 @@ $dataJson = json_encode($data);
                         <span>💬 ${i.comments}</span>
                     </div>
                     ${i.labels?.length ? `<div class="github-item-labels">${i.labels.map(l => `<span class="github-label" style="background:#${l.color}">${escHtml(l.name)}</span>`).join('')}</div>` : ''}
-                    <button class="btn" style="margin-top:8px;padding:4px 8px;font-size:11px" onclick="event.stopPropagation();createCardFromIssue(${JSON.stringify(i).replace(/"/g, '&quot;')})">+ Crea Card</button>
+                    <button class="btn" style="margin-top:8px;padding:4px 8px;font-size:11px" onclick="event.stopPropagation();createCardFromIssue(${JSON.stringify(i).replace(/"/g, '&quot;')})">+ Create Card</button>
                 </div>
             `).join('');
         }
@@ -2479,7 +2513,7 @@ $dataJson = json_encode($data);
         else if (tab === 'prs') {
             const prs = data.prs || [];
             if (prs.length === 0) {
-                content.innerHTML = '<div class="github-empty">Nessuna Pull Request trovata</div>';
+                content.innerHTML = '<div class="github-empty">No Pull Requests found</div>';
                 return;
             }
             content.innerHTML = prs.map(pr => `
@@ -2501,7 +2535,7 @@ $dataJson = json_encode($data);
         else if (tab === 'commits') {
             const commits = data.commits || [];
             if (commits.length === 0) {
-                content.innerHTML = '<div class="github-empty">Nessun commit trovato</div>';
+                content.innerHTML = '<div class="github-empty">No commits found</div>';
                 return;
             }
             content.innerHTML = commits.map(c => `
@@ -2519,7 +2553,7 @@ $dataJson = json_encode($data);
 
     function createCardFromIssue(issue) {
         const title = `[#${issue.number}] ${issue.title}`;
-        const desc = `**GitHub Issue:** [#${issue.number}](${issue.html_url})\n\n${issue.body || ''}\n\n---\n_Importato da GitHub_`;
+        const desc = `**GitHub Issue:** [#${issue.number}](${issue.html_url})\n\n${issue.body || ''}\n\n---\n_Imported from GitHub_`;
         const priority = issue.labels?.some(l => l.name.toLowerCase().includes('bug') || l.name.toLowerCase().includes('critical')) ? 'high' : 'medium';
 
         document.getElementById('cardId').value = '';
@@ -2528,7 +2562,7 @@ $dataJson = json_encode($data);
         document.getElementById('cardPriorityInput').value = priority;
         document.getElementById('cardColumnId').value = boardData.columns[0]?.id || '';
         document.getElementById('cardSwimlaneId').value = boardData.swimlanes[0]?.id || '';
-        document.getElementById('cardModalTitle').textContent = 'Nuova Card da GitHub Issue';
+        document.getElementById('cardModalTitle').textContent = 'New Card from GitHub Issue';
         document.getElementById('templateGroup').style.display = 'block';
         document.getElementById('cardModal').classList.add('active');
         toggleGithub();
@@ -2543,13 +2577,13 @@ $dataJson = json_encode($data);
     // === GEMINI ===
     async function askGemini(prompt) {
         if (!boardData.config.gemini_api_key) {
-            toast('Configura prima la API Key di Gemini', 'error');
+            toast('Configure Gemini API Key first', 'error');
             openConfigModal();
             return;
         }
 
         const content = document.getElementById('geminiContent');
-        content.innerHTML = '<div class="gemini-loading">Analisi in corso...</div>';
+        content.innerHTML = '<div class="gemini-loading">Analysis in progress...</div>';
 
         const result = await api('gemini_analyze', { prompt });
         if (result.success) {
@@ -2565,13 +2599,13 @@ $dataJson = json_encode($data);
         if (!question) return;
 
         if (!boardData.config.gemini_api_key) {
-            toast('Configura prima la API Key di Gemini', 'error');
+            toast('Configure Gemini API Key first', 'error');
             openConfigModal();
             return;
         }
 
         const content = document.getElementById('geminiContent');
-        content.innerHTML = '<div class="gemini-loading">Analisi in corso...</div>';
+        content.innerHTML = '<div class="gemini-loading">Analysis in progress...</div>';
         input.value = '';
 
         const result = await api('gemini_analyze', { prompt: 'custom', custom_prompt: question });
@@ -2585,13 +2619,13 @@ $dataJson = json_encode($data);
     // === PROJECT ANALYSIS ===
     async function analyzeProject() {
         if (!boardData.config.gemini_api_key) {
-            toast('Configura prima la API Key di Gemini', 'error');
+            toast('Configure Gemini API Key first', 'error');
             openConfigModal();
             return;
         }
 
         const content = document.getElementById('geminiContent');
-        content.innerHTML = '<div class="gemini-loading">🔍 Scansione progetto in corso...<br><small>Analisi struttura, file chiave e entry points</small></div>';
+        content.innerHTML = '<div class="gemini-loading">🔍 Scanning project...<br><small>Analyzing structure, key files and entry points</small></div>';
 
         const result = await api('analyze_project');
         if (!result.success) {
@@ -2611,7 +2645,7 @@ $dataJson = json_encode($data);
 
         // Analysis Section
         html += '<div class="analysis-section">';
-        html += '<h4>📊 Panoramica</h4>';
+        html += '<h4>📊 Overview</h4>';
         html += `<p style="font-size:12px;color:var(--text2);margin-bottom:8px">${escHtml(analysis.overview || 'N/A')}</p>`;
 
         if (analysis.tech_stack?.length) {
@@ -2621,14 +2655,14 @@ $dataJson = json_encode($data);
         }
 
         if (analysis.architecture) {
-            html += `<p style="font-size:11px;color:var(--text2)"><strong>Architettura:</strong> ${escHtml(analysis.architecture)}</p>`;
+            html += `<p style="font-size:11px;color:var(--text2)"><strong>Architecture:</strong> ${escHtml(analysis.architecture)}</p>`;
         }
         html += '</div>';
 
         // Strengths
         if (analysis.strengths?.length) {
             html += '<div class="analysis-section">';
-            html += '<h4>✅ Punti di forza</h4>';
+            html += '<h4>✅ Strengths</h4>';
             html += '<ul class="analysis-list">';
             analysis.strengths.forEach(s => html += `<li>${escHtml(s)}</li>`);
             html += '</ul></div>';
@@ -2637,7 +2671,7 @@ $dataJson = json_encode($data);
         // Concerns
         if (analysis.concerns?.length) {
             html += '<div class="analysis-section">';
-            html += '<h4>⚠️ Attenzione</h4>';
+            html += '<h4>⚠️ Concerns</h4>';
             html += '<ul class="analysis-list">';
             analysis.concerns.forEach(c => html += `<li>${escHtml(c)}</li>`);
             html += '</ul></div>';
@@ -2646,7 +2680,7 @@ $dataJson = json_encode($data);
         // Suggested Tasks
         if (tasks.length) {
             html += '<div class="analysis-section">';
-            html += '<h4>📋 Task Suggeriti</h4>';
+            html += '<h4>📋 Suggested Tasks</h4>';
             tasks.forEach((task, i) => {
                 const taskJson = JSON.stringify(task).replace(/'/g, "\\'").replace(/"/g, '&quot;');
                 html += `
@@ -2658,7 +2692,7 @@ $dataJson = json_encode($data);
                         <div class="suggested-task-desc">${escHtml(task.description || '')}</div>
                         <div class="suggested-task-footer">
                             <span class="suggested-task-category">${escHtml(task.category || 'task')}</span>
-                            <button class="suggested-task-add" onclick="addSuggestedTask(${i}, '${taskJson}')">+ Aggiungi</button>
+                            <button class="suggested-task-add" onclick="addSuggestedTask(${i}, '${taskJson}')">+ Add</button>
                         </div>
                     </div>
                 `;
@@ -2695,8 +2729,8 @@ $dataJson = json_encode($data);
             boardData.cards.push(result.card);
             render();
             taskEl.classList.add('added');
-            taskEl.querySelector('.suggested-task-add').textContent = '✓ Aggiunto';
-            toast(`Task "${task.title}" aggiunto!`, 'success');
+            taskEl.querySelector('.suggested-task-add').textContent = '✓ Added';
+            toast(`Task "${task.title}" added!`, 'success');
         }
     }
 
@@ -2799,21 +2833,21 @@ $dataJson = json_encode($data);
     function exportJSON() {
         const data = JSON.stringify(boardData, null, 2);
         downloadFile(data, `kanban_${Date.now()}.json`, 'application/json');
-        toast('Board esportata in JSON', 'success');
+        toast('Board exported to JSON', 'success');
     }
 
     function exportCSV() {
-        const headers = ['ID', 'Titolo', 'Descrizione', 'Priorità', 'Label', 'Colonna', 'Swimlane', 'Scadenza', 'Archiviato', 'Creato'];
+        const headers = ['ID', 'Title', 'Description', 'Priority', 'Label', 'Column', 'Swimlane', 'Due Date', 'Archived', 'Created'];
         const rows = boardData.cards.map(c => {
             const label = boardData.labels.find(l => l.id === c.label_id)?.name || '';
             const col = boardData.columns.find(x => x.id === c.column_id)?.name || '';
             const lane = boardData.swimlanes.find(x => x.id === c.swimlane_id)?.name || '';
-            return [c.id, c.title, c.description || '', c.priority, label, col, lane, c.due_date || '', c.archived ? 'Sì' : 'No', c.created_at || '']
+            return [c.id, c.title, c.description || '', c.priority, label, col, lane, c.due_date || '', c.archived ? 'Yes' : 'No', c.created_at || '']
                 .map(v => `"${String(v).replace(/"/g, '""')}"`).join(',');
         });
         const csv = [headers.join(','), ...rows].join('\n');
         downloadFile(csv, `kanban_${Date.now()}.csv`, 'text/csv');
-        toast('Board esportata in CSV', 'success');
+        toast('Board exported to CSV', 'success');
     }
 
     function downloadFile(content, filename, type) {
@@ -2828,31 +2862,31 @@ $dataJson = json_encode($data);
     const cardTemplates = {
         bug: {
             title: '[BUG] ',
-            description: '**Descrizione bug:**\n\n**Steps per riprodurre:**\n- \n\n**Comportamento atteso:**\n\n**Comportamento attuale:**\n',
+            description: '**Bug description:**\n\n**Steps to reproduce:**\n- \n\n**Expected behavior:**\n\n**Current behavior:**\n',
             priority: 'high',
             label_id: 'lbl_1'
         },
         feature: {
             title: '[FEATURE] ',
-            description: '**Descrizione feature:**\n\n**Motivazione:**\n\n**Criteri di accettazione:**\n- \n',
+            description: '**Feature description:**\n\n**Motivation:**\n\n**Acceptance criteria:**\n- \n',
             priority: 'medium',
             label_id: 'lbl_2'
         },
         task: {
             title: '',
-            description: '**Obiettivo:**\n\n**Note:**\n',
+            description: '**Objective:**\n\n**Notes:**\n',
             priority: 'medium',
             label_id: 'lbl_3'
         },
         docs: {
             title: '[DOCS] ',
-            description: '**Sezione da documentare:**\n\n**File coinvolti:**\n- \n',
+            description: '**Section to document:**\n\n**Files involved:**\n- \n',
             priority: 'low',
             label_id: 'lbl_5'
         },
         refactor: {
             title: '[REFACTOR] ',
-            description: '**Codice da refactorare:**\n\n**Motivazione:**\n\n**Approccio proposto:**\n',
+            description: '**Code to refactor:**\n\n**Motivation:**\n\n**Proposed approach:**\n',
             priority: 'low',
             label_id: 'lbl_3'
         }
@@ -2872,9 +2906,9 @@ $dataJson = json_encode($data);
     async function aiSuggestCategory() {
         const title = document.getElementById('cardTitleInput').value;
         const desc = document.getElementById('cardDescInput').value;
-        if (!title) { toast('Inserisci prima un titolo', 'error'); return; }
+        if (!title) { toast('Enter a title first', 'error'); return; }
 
-        toast('🤖 Analisi AI in corso...', 'info');
+        toast('🤖 AI analysis in progress...', 'info');
         const result = await api('ai_categorize', { title, description: desc });
 
         if (!result.success) { toast(result.error, 'error'); return; }
@@ -2885,27 +2919,27 @@ $dataJson = json_encode($data);
             const labelOpt = [...document.getElementById('cardLabelInput').options].find(o => o.text === s.label);
             if (labelOpt) document.getElementById('cardLabelInput').value = labelOpt.value;
         }
-        toast(`✅ ${s.reason || 'Categorizzazione completata'}`, 'success');
+        toast(`✅ ${s.reason || 'Categorization completed'}`, 'success');
     }
 
     async function aiEstimate() {
         const title = document.getElementById('cardTitleInput').value;
         const desc = document.getElementById('cardDescInput').value;
-        if (!title) { toast('Inserisci prima un titolo', 'error'); return; }
+        if (!title) { toast('Enter a title first', 'error'); return; }
 
-        toast('🤖 Stima in corso...', 'info');
+        toast('🤖 Estimating...', 'info');
         const result = await api('ai_estimate', { title, description: desc });
 
         if (!result.success) { toast(result.error, 'error'); return; }
 
         const e = result.estimate;
-        let msg = `⏱️ Stima: ${e.estimate || '?'} (complessità: ${e.complexity || '?'})`;
-        if (e.breakdown?.length) msg += '\n\nStep:\n• ' + e.breakdown.join('\n• ');
+        let msg = `⏱️ Estimate: ${e.estimate || '?'} (complexity: ${e.complexity || '?'})`;
+        if (e.breakdown?.length) msg += '\n\nSteps:\n• ' + e.breakdown.join('\n• ');
         alert(msg);
     }
 
     async function generateStandup() {
-        toast('🤖 Generazione standup...', 'info');
+        toast('🤖 Generating standup...', 'info');
         const result = await api('ai_standup');
 
         if (!result.success) { toast(result.error, 'error'); return; }
@@ -2918,7 +2952,7 @@ $dataJson = json_encode($data);
                 <div style="background:var(--bg);padding:24px;border-radius:12px;max-width:600px;max-height:80vh;overflow:auto" onclick="event.stopPropagation()">
                     <h2 style="margin-bottom:16px">📋 Daily Standup</h2>
                     <div style="font-size:14px;line-height:1.6">${standupHtml}</div>
-                    <button class="btn btn-primary" style="margin-top:16px;width:100%" onclick="this.parentElement.parentElement.remove()">Chiudi</button>
+                    <button class="btn btn-primary" style="margin-top:16px;width:100%" onclick="this.parentElement.parentElement.remove()">Close</button>
                 </div>
             </div>`;
         document.body.appendChild(div);
@@ -2926,7 +2960,7 @@ $dataJson = json_encode($data);
 
     // Git TODO Scanner
     async function scanTodos() {
-        toast('🔍 Scansione TODO nel codice...', 'info');
+        toast('🔍 Scanning TODO in code...', 'info');
         const result = await api('scan_todos');
 
         if (!result.success) { toast(result.error, 'error'); return; }
@@ -2936,9 +2970,9 @@ $dataJson = json_encode($data);
 
         let html = '';
         if (todos.length === 0) {
-            html = '<p style="color:var(--text2);text-align:center;padding:20px">Nessun TODO trovato nel codice!</p>';
+            html = '<p style="color:var(--text2);text-align:center;padding:20px">No TODO found in code!</p>';
         } else {
-            html = `<p style="margin-bottom:12px;color:var(--text2)">Trovati <strong>${todos.length}</strong> TODO nel progetto:</p>`;
+            html = `<p style="margin-bottom:12px;color:var(--text2)">Found <strong>${todos.length}</strong> TODO in project:</p>`;
             html += '<div style="max-height:400px;overflow-y:auto">';
             todos.forEach(t => {
                 html += `<div style="background:var(--bg2);padding:10px;border-radius:8px;margin-bottom:8px;border-left:3px solid ${typeColors[t.type] || '#666'}">
@@ -2948,7 +2982,7 @@ $dataJson = json_encode($data);
                     </div>
                     <div style="font-size:13px">${escHtml(t.text)}</div>
                     <button class="btn" style="margin-top:8px;padding:4px 8px;font-size:11px" onclick="createCardFromTodo('${escHtml(t.type)}', '${escHtml(t.text).replace(/'/g, "\\'")}', '${escHtml(t.file)}', ${t.line})">
-                        + Crea Card
+                        + Create Card
                     </button>
                 </div>`;
             });
@@ -2957,17 +2991,17 @@ $dataJson = json_encode($data);
 
         const legendHtml = `
             <details style="margin-top:16px;padding:12px;background:var(--bg2);border-radius:8px;font-size:12px">
-                <summary style="cursor:pointer;font-weight:600;color:var(--accent)">📖 Tag supportati (clicca per espandere)</summary>
+                <summary style="cursor:pointer;font-weight:600;color:var(--accent)">📖 Supported tags (click to expand)</summary>
                 <div style="margin-top:12px;font-family:monospace;line-height:2">
-                    <div><code style="background:var(--bg);padding:2px 6px;border-radius:4px;color:#3b82f6">// TODO: descrizione task</code> <span style="color:var(--text2)">- Task da completare</span></div>
-                    <div><code style="background:var(--bg);padding:2px 6px;border-radius:4px;color:#ef4444">// FIXME: descrizione bug</code> <span style="color:var(--text2)">- Bug da fixare (priorità alta)</span></div>
-                    <div><code style="background:var(--bg);padding:2px 6px;border-radius:4px;color:#dc2626">// BUG: descrizione bug</code> <span style="color:var(--text2)">- Bug noto (priorità alta)</span></div>
-                    <div><code style="background:var(--bg);padding:2px 6px;border-radius:4px;color:#f59e0b">// HACK: descrizione workaround</code> <span style="color:var(--text2)">- Workaround temporaneo</span></div>
-                    <div><code style="background:var(--bg);padding:2px 6px;border-radius:4px;color:#8b5cf6">// XXX: nota importante</code> <span style="color:var(--text2)">- Richiede attenzione</span></div>
+                    <div><code style="background:var(--bg);padding:2px 6px;border-radius:4px;color:#3b82f6">// TODO: task description</code> <span style="color:var(--text2)">- Task to complete</span></div>
+                    <div><code style="background:var(--bg);padding:2px 6px;border-radius:4px;color:#ef4444">// FIXME: bug description</code> <span style="color:var(--text2)">- Bug to fix (high priority)</span></div>
+                    <div><code style="background:var(--bg);padding:2px 6px;border-radius:4px;color:#dc2626">// BUG: bug description</code> <span style="color:var(--text2)">- Known bug (high priority)</span></div>
+                    <div><code style="background:var(--bg);padding:2px 6px;border-radius:4px;color:#f59e0b">// HACK: workaround description</code> <span style="color:var(--text2)">- Temporary workaround</span></div>
+                    <div><code style="background:var(--bg);padding:2px 6px;border-radius:4px;color:#8b5cf6">// XXX: important note</code> <span style="color:var(--text2)">- Needs attention</span></div>
                 </div>
                 <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);color:var(--text2)">
-                    <strong>Formati accettati:</strong> <code>TAG:</code> o <code>TAG </code> seguito dal testo<br>
-                    <strong>Estensioni:</strong> .php .js .ts .jsx .tsx .css .html .py .java .c .cpp .h .go .rs
+                    <strong>Accepted formats:</strong> <code>TAG:</code> or <code>TAG </code> followed by text<br>
+                    <strong>Extensions:</strong> .php .js .ts .jsx .tsx .css .html .py .java .c .cpp .h .go .rs
                 </div>
             </details>`;
 
@@ -2978,7 +3012,7 @@ $dataJson = json_encode($data);
                     <h2 style="margin-bottom:16px">🔍 TODO Scanner</h2>
                     ${html}
                     ${legendHtml}
-                    <button class="btn btn-primary" style="margin-top:16px;width:100%" onclick="this.parentElement.parentElement.remove()">Chiudi</button>
+                    <button class="btn btn-primary" style="margin-top:16px;width:100%" onclick="this.parentElement.parentElement.remove()">Close</button>
                 </div>
             </div>`;
         document.body.appendChild(div);
@@ -2986,7 +3020,7 @@ $dataJson = json_encode($data);
 
     function createCardFromTodo(type, text, file, line) {
         const title = `[${type}] ${text.substring(0, 50)}${text.length > 50 ? '...' : ''}`;
-        const desc = `**Origine:** \`${file}:${line}\`\n\n**Descrizione:**\n${text}\n\n**Azione richiesta:**\n- [ ] Risolvere il ${type}`;
+        const desc = `**Source:** \`${file}:${line}\`\n\n**Description:**\n${text}\n\n**Action required:**\n- [ ] Resolve the ${type}`;
         const priority = type === 'BUG' || type === 'FIXME' ? 'high' : (type === 'HACK' ? 'medium' : 'low');
 
         document.getElementById('cardId').value = '';
@@ -2996,7 +3030,7 @@ $dataJson = json_encode($data);
         document.getElementById('cardFilesInput').value = file;
         document.getElementById('cardColumnId').value = boardData.columns[0]?.id || '';
         document.getElementById('cardSwimlaneId').value = boardData.swimlanes[0]?.id || '';
-        document.getElementById('cardModalTitle').textContent = 'Nuova Card da TODO';
+        document.getElementById('cardModalTitle').textContent = 'New Card from TODO';
         document.getElementById('templateGroup').style.display = 'block';
         document.getElementById('cardModal').classList.add('active');
 
@@ -3006,7 +3040,7 @@ $dataJson = json_encode($data);
 
     // Burndown Chart
     async function showBurndown() {
-        toast('📈 Calcolo statistiche...', 'info');
+        toast('📈 Calculating statistics...', 'info');
         const result = await api('burndown_data');
 
         if (!result.success) { toast(result.error, 'error'); return; }
@@ -3022,7 +3056,7 @@ $dataJson = json_encode($data);
         const velocityDays = Object.entries(s.velocity || {});
         if (velocityDays.length > 0) {
             const maxVel = Math.max(...velocityDays.map(([,v]) => v));
-            velocityHtml = '<div style="margin-top:16px"><h4 style="margin-bottom:8px;color:var(--accent)">Velocity (card/giorno)</h4>';
+            velocityHtml = '<div style="margin-top:16px"><h4 style="margin-bottom:8px;color:var(--accent)">Velocity (cards/day)</h4>';
             velocityHtml += '<div style="display:flex;align-items:end;gap:4px;height:80px">';
             velocityDays.slice(-14).forEach(([day, count]) => {
                 const h = maxVel > 0 ? Math.round((count / maxVel) * 60) : 0;
@@ -3044,22 +3078,22 @@ $dataJson = json_encode($data);
                     <div style="display:flex;justify-content:space-around;text-align:center;margin-bottom:20px">
                         <div>
                             <div style="font-size:32px;font-weight:600;color:var(--low)">${s.completed}</div>
-                            <div style="font-size:12px;color:var(--text2)">Completati</div>
+                            <div style="font-size:12px;color:var(--text2)">Completed</div>
                         </div>
                         <div>
                             <div style="font-size:32px;font-weight:600;color:var(--medium)">${s.in_progress}</div>
-                            <div style="font-size:12px;color:var(--text2)">In Corso</div>
+                            <div style="font-size:12px;color:var(--text2)">In Progress</div>
                         </div>
                         <div>
                             <div style="font-size:32px;font-weight:600;color:var(--high)">${s.todo}</div>
-                            <div style="font-size:12px;color:var(--text2)">Da Fare</div>
+                            <div style="font-size:12px;color:var(--text2)">To Do</div>
                         </div>
                     </div>
 
                     <div style="background:var(--bg2);border-radius:8px;height:24px;overflow:hidden;display:flex">
-                        <div style="width:${pctDone}%;background:var(--low);transition:width 0.3s" title="Completati ${pctDone}%"></div>
-                        <div style="width:${pctProgress}%;background:var(--medium);transition:width 0.3s" title="In corso ${pctProgress}%"></div>
-                        <div style="width:${pctTodo}%;background:var(--high);transition:width 0.3s" title="Da fare ${pctTodo}%"></div>
+                        <div style="width:${pctDone}%;background:var(--low);transition:width 0.3s" title="Completed ${pctDone}%"></div>
+                        <div style="width:${pctProgress}%;background:var(--medium);transition:width 0.3s" title="In progress ${pctProgress}%"></div>
+                        <div style="width:${pctTodo}%;background:var(--high);transition:width 0.3s" title="To do ${pctTodo}%"></div>
                     </div>
                     <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--text2);margin-top:4px">
                         <span>🟢 ${pctDone}%</span>
@@ -3071,16 +3105,16 @@ $dataJson = json_encode($data);
 
                     <div style="margin-top:16px;padding:12px;background:var(--bg2);border-radius:8px">
                         <div style="display:flex;justify-content:space-between;font-size:13px">
-                            <span>Totale task attivi:</span>
+                            <span>Total active tasks:</span>
                             <strong>${total}</strong>
                         </div>
                         <div style="display:flex;justify-content:space-between;font-size:13px;margin-top:4px">
-                            <span>Velocity media:</span>
-                            <strong>${s.avg_velocity} card/giorno</strong>
+                            <span>Average velocity:</span>
+                            <strong>${s.avg_velocity} cards/day</strong>
                         </div>
                     </div>
 
-                    <button class="btn btn-primary" style="margin-top:16px;width:100%" onclick="this.parentElement.parentElement.remove()">Chiudi</button>
+                    <button class="btn btn-primary" style="margin-top:16px;width:100%" onclick="this.parentElement.parentElement.remove()">Close</button>
                 </div>
             </div>`;
         document.body.appendChild(div);
@@ -3102,100 +3136,109 @@ $dataJson = json_encode($data);
             </div>
 
             <div class="changelog-version">
-                <h3>v1.6.0 - Dicembre 2025</h3>
+                <h3>v1.7.0 - December 2025</h3>
                 <ul>
-                    <li>🐙 <strong>Integrazione GitHub</strong> - connetti il tuo repository</li>
-                    <li>🐛 <strong>Visualizza Issues</strong> - vedi tutte le issues del repo</li>
-                    <li>🔀 <strong>Pull Requests</strong> - monitora le PR aperte/chiuse</li>
-                    <li>📜 <strong>Commits</strong> - ultimi commit del progetto</li>
+                    <li>🌍 <strong>Full English UI</strong> - complete interface translation</li>
+                    <li>🗣️ <strong>AI Response Language</strong> - choose AI response language (EN, IT, ES, FR, DE, PT)</li>
+                    <li>⚙️ <strong>Language Settings</strong> - new config option for preferred language</li>
+                </ul>
+            </div>
+
+            <div class="changelog-version">
+                <h3>v1.6.0 - December 2025</h3>
+                <ul>
+                    <li>🐙 <strong>GitHub Integration</strong> - connect your repository</li>
+                    <li>🐛 <strong>View Issues</strong> - see all repo issues</li>
+                    <li>🔀 <strong>Pull Requests</strong> - monitor open/closed PRs</li>
+                    <li>📜 <strong>Commits</strong> - latest project commits</li>
                     <li>📊 <strong>Repo Stats</strong> - stars, forks, watchers</li>
-                    <li>➕ <strong>Issue → Card</strong> - crea card da issues GitHub</li>
-                    <li>🔗 <strong>Link diretti</strong> - apri issues/PR/commit su GitHub</li>
+                    <li>➕ <strong>Issue → Card</strong> - create cards from GitHub issues</li>
+                    <li>🔗 <strong>Direct Links</strong> - open issues/PR/commit on GitHub</li>
                 </ul>
             </div>
 
             <div class="changelog-version">
-                <h3>v1.5.0 - Dicembre 2025</h3>
+                <h3>v1.5.0 - December 2025</h3>
                 <ul>
-                    <li>🔍 <strong>Ricerca istantanea</strong> - cerca tra tutti i task</li>
-                    <li>🏷️ <strong>Filtri avanzati</strong> - per label, priorità, scadenza</li>
-                    <li>📝 <strong>Supporto Markdown</strong> - formattazione descrizioni</li>
-                    <li>📥 <strong>Export JSON/CSV</strong> - esporta board completa</li>
+                    <li>🔍 <strong>Instant Search</strong> - search all tasks</li>
+                    <li>🏷️ <strong>Advanced Filters</strong> - by label, priority, due date</li>
+                    <li>📝 <strong>Markdown Support</strong> - format descriptions</li>
+                    <li>📥 <strong>Export JSON/CSV</strong> - export complete board</li>
                     <li>📋 <strong>Card Templates</strong> - Bug, Feature, Task, Docs, Refactor</li>
-                    <li>🤖 <strong>Auto-categorizzazione AI</strong> - suggerisce label/priorità</li>
-                    <li>⏱️ <strong>Stima automatica AI</strong> - tempo e complessità</li>
-                    <li>📋 <strong>Daily Standup AI</strong> - genera report Agile</li>
-                    <li>🔍 <strong>Git TODO Scanner</strong> - trova TODO/FIXME nel codice</li>
-                    <li>📈 <strong>Burndown Chart</strong> - statistiche e velocity</li>
+                    <li>🤖 <strong>AI Auto-categorization</strong> - suggests label/priority</li>
+                    <li>⏱️ <strong>AI Time Estimation</strong> - time and complexity</li>
+                    <li>📋 <strong>Daily Standup AI</strong> - generates Agile reports</li>
+                    <li>🔍 <strong>TODO Scanner</strong> - find TODO/FIXME in code</li>
+                    <li>📈 <strong>Burndown Chart</strong> - statistics and velocity</li>
                 </ul>
             </div>
 
             <div class="changelog-version">
-                <h3>v1.4.0 - Dicembre 2025</h3>
+                <h3>v1.4.0 - December 2025</h3>
                 <ul>
-                    <li>Aggiunto sistema <strong>File Associati</strong> ai task</li>
-                    <li>Nuovo bottone <strong>🤖 Verifica AI</strong> - analizza file e verifica completamento task</li>
-                    <li>Gemini legge i file associati e suggerisce fix per bug</li>
-                    <li>Indicatore 📁 su card con file associati</li>
-                    <li>Aumentati limiti file (200KB/file, 500KB totale)</li>
-                    <li>Aggiunto questo pannello Changelog</li>
+                    <li>Added <strong>Associated Files</strong> system to tasks</li>
+                    <li>New <strong>🤖 AI Verify</strong> button - analyze files and verify task completion</li>
+                    <li>Gemini reads associated files and suggests bug fixes</li>
+                    <li>📁 indicator on cards with associated files</li>
+                    <li>Increased file limits (200KB/file, 500KB total)</li>
+                    <li>Added this Changelog panel</li>
                 </ul>
             </div>
 
             <div class="changelog-version">
-                <h3>v1.3.0 - Dicembre 2025</h3>
+                <h3>v1.3.0 - December 2025</h3>
                 <ul>
-                    <li>Implementati <strong>Task Autorigeneranti</strong> - si ricreano quando archiviati</li>
-                    <li>Campo <code>auto_regenerate</code> e <code>regenerate_delay_days</code></li>
-                    <li>Indicatore 🔄 su card autorigeneranti</li>
-                    <li>Contatore rigenerazioni (×N)</li>
-                    <li>Label "Recurring" di default</li>
+                    <li>Implemented <strong>Auto-regenerating Tasks</strong> - recreate when archived</li>
+                    <li>Fields <code>auto_regenerate</code> and <code>regenerate_delay_days</code></li>
+                    <li>🔄 indicator on auto-regenerating cards</li>
+                    <li>Regeneration counter (×N)</li>
+                    <li>Default "Recurring" label</li>
                 </ul>
             </div>
 
             <div class="changelog-version">
-                <h3>v1.2.0 - Dicembre 2025</h3>
+                <h3>v1.2.0 - December 2025</h3>
                 <ul>
-                    <li>Aggiunta <strong>AI Integration Guide</strong> nell'header PHP</li>
-                    <li>Endpoint <code>get_summary</code> - riepilogo testuale per AI</li>
-                    <li>Endpoint <code>complete_task</code> - archivia task per titolo</li>
-                    <li>Endpoint <code>move_task</code> - sposta task per titolo</li>
-                    <li>Funzione <strong>Analizza Progetto</strong> - scansiona codebase e suggerisce task</li>
-                    <li>Click su task suggeriti per aggiungerli al kanban</li>
+                    <li>Added <strong>AI Integration Guide</strong> in PHP header</li>
+                    <li>Endpoint <code>get_summary</code> - text summary for AI</li>
+                    <li>Endpoint <code>complete_task</code> - archive task by title</li>
+                    <li>Endpoint <code>move_task</code> - move task by title</li>
+                    <li><strong>Analyze Project</strong> function - scan codebase and suggest tasks</li>
+                    <li>Click on suggested tasks to add them to kanban</li>
                 </ul>
             </div>
 
             <div class="changelog-version">
-                <h3>v1.1.0 - Dicembre 2025</h3>
+                <h3>v1.1.0 - December 2025</h3>
                 <ul>
-                    <li>Integrazione <strong>Gemini AI</strong> (gemini-2.5-flash)</li>
-                    <li>Analisi board con AI</li>
-                    <li>Suggerimenti priorità e stime</li>
-                    <li>Pannello laterale Gemini</li>
-                    <li>Configurazione API Key via modal</li>
+                    <li><strong>Gemini AI</strong> integration (gemini-2.5-flash)</li>
+                    <li>Board analysis with AI</li>
+                    <li>Priority and time suggestions</li>
+                    <li>Gemini side panel</li>
+                    <li>API Key configuration via modal</li>
                 </ul>
             </div>
 
             <div class="changelog-version">
-                <h3>v1.0.0 - Dicembre 2025</h3>
+                <h3>v1.0.0 - December 2025</h3>
                 <ul>
-                    <li>Kanban board single-file PHP</li>
-                    <li>Colonne personalizzabili (To Do, In Progress, Done)</li>
-                    <li>Swimlanes con accordion collassabile</li>
-                    <li>Frecce ↑↓ per riordinare swimlanes</li>
-                    <li>Drag & drop cards tra colonne</li>
-                    <li>Labels con colori</li>
-                    <li>Priorità (high/medium/low)</li>
-                    <li>Date scadenza e next check</li>
-                    <li>Sistema archivio (ordinato per data)</li>
-                    <li>Tema chiaro/scuro</li>
-                    <li>Salvataggio automatico su JSON</li>
+                    <li>Single-file PHP Kanban board</li>
+                    <li>Customizable columns (To Do, In Progress, Done)</li>
+                    <li>Swimlanes with collapsible accordion</li>
+                    <li>↑↓ arrows to reorder swimlanes</li>
+                    <li>Drag & drop cards between columns</li>
+                    <li>Labels with colors</li>
+                    <li>Priority (high/medium/low)</li>
+                    <li>Due dates and next check</li>
+                    <li>Archive system (sorted by date)</li>
+                    <li>Light/dark theme</li>
+                    <li>Auto-save to JSON</li>
                     <li>Toast notifications</li>
                 </ul>
             </div>
 
             <div class="changelog-footer">
-                Sviluppato da <strong>Yurrena</strong> &bull; <a href="mailto:yurrena@gmail.com">yurrena@gmail.com</a>
+                Developed by <strong>Yuri Nuresi</strong> &bull; <a href="mailto:yurrena@gmail.com">yurrena@gmail.com</a>
             </div>
         </div>
     </div>

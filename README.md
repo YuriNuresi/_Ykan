@@ -4,7 +4,7 @@
 
 A lightweight, self-contained Kanban board that runs from a single PHP file. Perfect for developers who want a simple, fast, and AI-enhanced project management tool without complex setups.
 
-![Version](https://img.shields.io/badge/version-1.6.0-blue)
+![Version](https://img.shields.io/badge/version-1.7.0-blue)
 ![PHP](https://img.shields.io/badge/PHP-8.2+-purple)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
@@ -27,6 +27,7 @@ A lightweight, self-contained Kanban board that runs from a single PHP file. Per
 - **Auto-categorization** - AI suggests labels and priority
 - **Time Estimation** - AI estimates complexity and duration
 - **Daily Standup** - Generate Agile standup reports
+- **Multi-language AI** - AI responds in your preferred language (EN, IT, ES, FR, DE, PT)
 
 ### GitHub Integration
 - **View Issues** - See all repo issues with labels and status
@@ -71,6 +72,7 @@ Click on **Settings** (gear icon) to configure:
 | Setting | Description |
 |---------|-------------|
 | **Project Name** | Displayed in header |
+| **AI Language** | Language for AI responses (English, Italiano, Español, Français, Deutsch, Português) |
 | **Gemini API Key** | For AI features ([Get one here](https://makersuite.google.com/app/apikey)) |
 | **GitHub Token** | For GitHub integration ([Generate token](https://github.com/settings/tokens)) |
 | **GitHub Repo** | Format: `owner/repo` (e.g., `YuriNuresi/_Ykan`) |
@@ -124,6 +126,11 @@ POST ?api=github_commits     # Get GitHub commits
 ---
 
 ## Changelog
+
+### v1.7.0 (December 2025)
+- Full English UI translation
+- AI Response Language setting (EN, IT, ES, FR, DE, PT)
+- AI prompts now respond in user's preferred language
 
 ### v1.6.0 (December 2025)
 - GitHub API integration (issues, PRs, commits)
