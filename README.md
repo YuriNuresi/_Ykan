@@ -7,6 +7,7 @@ A lightweight, self-contained Kanban board that runs from a single PHP file. Per
 ![Version](https://img.shields.io/badge/version-1.7.0-blue)
 ![PHP](https://img.shields.io/badge/PHP-8.2+-purple)
 ![License](https://img.shields.io/badge/license-MIT-green)
+[![Demo](https://img.shields.io/badge/demo-live-brightgreen)](https://portale3d.it/projects/_Ykan/demo.php)
 
 ---
 
