@@ -89,15 +89,24 @@ header('Access-Control-Allow-Origin: *');
 header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
 header('Access-Control-Allow-Headers: Content-Type, Authorization, Mcp-Session-Id, Mcp-Protocol-Version');
 
-$method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+$method  = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+$accept  = $_SERVER['HTTP_ACCEPT'] ?? '';
+$wantsSse = stripos($accept, 'text/event-stream') !== false;
 
 if ($method === 'OPTIONS') {
     http_response_code(204);
     exit;
 }
 
-// Simple info page for humans hitting the URL in a browser (no secret leaked).
-if ($method === 'GET' && !isset($_GET['mcp'])) {
+// GET: some MCP clients open a GET stream for server-initiated messages. We are
+// stateless and have none, so signal that per the Streamable HTTP spec (405).
+// A plain browser GET (no SSE) gets a small info page instead — no secret leaked.
+if ($method === 'GET') {
+    if ($wantsSse) {
+        http_response_code(405);
+        header('Allow: POST, OPTIONS');
+        exit;
+    }
     header('Content-Type: application/json; charset=utf-8');
     echo json_encode([
         'name'      => '_Ykan MCP',
@@ -129,7 +138,7 @@ if (!hash_equals(MCP_SECRET, mcp_provided_secret())) {
     exit;
 }
 
-header('Content-Type: application/json; charset=utf-8');
+// Content-Type is chosen at output time (JSON vs SSE), see the dispatch tail.
 
 // ============================================================================
 // Data helpers (same on-disk format as _Ykan.php)
@@ -638,10 +647,13 @@ function mcp_handle(array $msg): ?array {
 }
 
 // ---- Read + dispatch the request body ----------------------------------------
+// A session id keeps clients happy that require the Streamable HTTP header.
+header('Mcp-Session-Id: ' . bin2hex(random_bytes(8)));
+
 $body = json_decode(file_get_contents('php://input'), true);
 
 if (!is_array($body)) {
-    echo json_encode(mcp_rpc_error(null, -32700, 'Parse error'));
+    mcp_emit([mcp_rpc_error(null, -32700, 'Parse error')], false, $wantsSse);
     exit;
 }
 
@@ -656,4 +668,24 @@ foreach ($messages as $m) {
 }
 
 if (!$responses) { http_response_code(202); exit; } // only notifications
-echo json_encode($isBatch ? $responses : $responses[0], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+mcp_emit($responses, $isBatch, $wantsSse);
+
+/**
+ * Send JSON-RPC responses either as plain JSON or as Server-Sent Events,
+ * depending on what the client's Accept header asked for. claude.ai's remote
+ * MCP client negotiates text/event-stream, so we honor it.
+ */
+function mcp_emit(array $responses, bool $isBatch, bool $wantsSse): void {
+    if ($wantsSse) {
+        header('Content-Type: text/event-stream; charset=utf-8');
+        header('Cache-Control: no-cache');
+        header('Connection: keep-alive');
+        foreach ($responses as $r) {
+            echo 'data: ' . json_encode($r, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) . "\n\n";
+        }
+        return;
+    }
+    header('Content-Type: application/json; charset=utf-8');
+    $payload = $isBatch ? $responses : $responses[0];
+    echo json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+}
