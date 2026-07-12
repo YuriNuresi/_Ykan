@@ -244,7 +244,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['api'])) {
                 $lane = [
                     'id' => generateId('lane'),
                     'name' => $input['name'] ?? 'New Swimlane',
-                    'position' => count($data['swimlanes'])
+                    'position' => count($data['swimlanes']),
+                    // Project link (used by mcp.php for scoped file operations)
+                    'path' => $input['path'] ?? '',
+                    'url' => $input['url'] ?? ''
                 ];
                 $data['swimlanes'][] = $lane;
                 saveData($data);
@@ -255,6 +258,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['api'])) {
                 foreach ($data['swimlanes'] as &$lane) {
                     if ($lane['id'] === $input['id']) {
                         $lane['name'] = $input['name'] ?? $lane['name'];
+                        // Project link fields (only touched when provided)
+                        if (array_key_exists('path', $input)) $lane['path'] = $input['path'];
+                        if (array_key_exists('url', $input)) $lane['url'] = $input['url'];
                         break;
                     }
                 }
@@ -1640,6 +1646,7 @@ $dataJson = json_encode($data);
         </select>
         <button class="btn btn-icon" onclick="clearFilters()" title="Reset filters">✕</button>
         <span style="flex:1"></span>
+        <button class="btn" onclick="openProjectsModal()" title="Link swimlanes to project folders (for mobile/MCP)">🔗 Projects</button>
         <button class="btn" onclick="generateStandup()" title="Daily Standup AI">📋 Standup</button>
         <button class="btn" onclick="scanTodos()" title="Scan TODO in files">🔍 TODO</button>
         <button class="btn" onclick="showBurndown()" title="Burndown Chart">📈 Burndown</button>
@@ -1840,6 +1847,24 @@ $dataJson = json_encode($data);
         </div>
     </div>
 
+    <!-- Projects Modal (link swimlanes to hosting folders for mobile/MCP editing) -->
+    <div id="projectsModal" class="modal-overlay">
+        <div class="modal">
+            <h2>🔗 Projects</h2>
+            <p style="color:var(--text2);font-size:13px;margin-bottom:12px">
+                Each swimlane can be linked to a folder on your hosting. Once linked, the
+                mobile/MCP endpoint (<code>mcp.php</code>) can read and edit files inside that
+                folder — scoped to it, nothing else.
+                <strong>Folder</strong> is relative to the MCP root configured in <code>mcp.php</code>
+                (e.g. <code>clienteA</code> or <code>sites/shopX</code>).
+            </p>
+            <div id="projectsManager"></div>
+            <div class="modal-actions">
+                <button type="button" class="btn btn-primary" onclick="closeProjectsModal()">Done</button>
+            </div>
+        </div>
+    </div>
+
     <!-- Toast Container -->
     <div id="toastContainer" class="toast-container"></div>
 
@@ -1893,6 +1918,7 @@ $dataJson = json_encode($data);
                     <div class="swimlane-header" onclick="toggleSwimlane('${lane.id}', event)">
                         <span class="swimlane-toggle">▼</span>
                         <input class="swimlane-name" value="${escHtml(lane.name)}" onchange="updateSwimlane('${lane.id}', this.value)" onclick="event.stopPropagation()">
+                        ${lane.path ? `<span class="swimlane-link" title="Linked to folder: ${escHtml(lane.path)}" onclick="event.stopPropagation();openProjectsModal()" style="cursor:pointer;font-size:13px">🔗</span>` : ''}
                         <div class="swimlane-actions" onclick="event.stopPropagation()">
                             <button class="btn btn-icon" onclick="moveSwimlane('${lane.id}', -1)" title="Sposta su" ${index === 0 ? 'disabled style="opacity:0.3"' : ''}>
                                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 15l-6-6-6 6"/></svg>
@@ -2115,6 +2141,45 @@ $dataJson = json_encode($data);
         boardData.swimlanes = boardData.swimlanes.filter(l => l.id !== id);
         render();
         await api('delete_swimlane', { id });
+    }
+
+    // === PROJECTS (swimlane <-> hosting folder links, used by mcp.php) ===
+    function openProjectsModal() {
+        renderProjectsManager();
+        document.getElementById('projectsModal').classList.add('active');
+    }
+
+    function closeProjectsModal() {
+        document.getElementById('projectsModal').classList.remove('active');
+    }
+
+    function renderProjectsManager() {
+        const container = document.getElementById('projectsManager');
+        const lanes = [...boardData.swimlanes].sort((a, b) => a.position - b.position);
+        container.innerHTML = lanes.map(lane => `
+            <div class="project-row" style="border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:8px">
+                <div style="font-weight:600;margin-bottom:6px">${escHtml(lane.name)} ${lane.path ? '🔗' : ''}</div>
+                <div class="form-group" style="margin-bottom:6px">
+                    <label style="font-size:11px">Folder (relative to MCP root)</label>
+                    <input type="text" id="proj-path-${lane.id}" value="${escHtml(lane.path || '')}" placeholder="e.g. clienteA">
+                </div>
+                <div class="form-group" style="margin-bottom:6px">
+                    <label style="font-size:11px">Public URL (optional)</label>
+                    <input type="text" id="proj-url-${lane.id}" value="${escHtml(lane.url || '')}" placeholder="https://...">
+                </div>
+                <button class="btn btn-primary" onclick="saveProjectLink('${lane.id}')">Save link</button>
+            </div>
+        `).join('');
+    }
+
+    async function saveProjectLink(id) {
+        const path = document.getElementById('proj-path-' + id).value.trim();
+        const url = document.getElementById('proj-url-' + id).value.trim();
+        const lane = boardData.swimlanes.find(l => l.id === id);
+        if (lane) { lane.path = path; lane.url = url; }
+        await api('update_swimlane', { id, path, url });
+        renderProjectsManager();
+        render();
     }
 
     // === CARDS ===
