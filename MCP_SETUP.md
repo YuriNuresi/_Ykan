@@ -24,16 +24,26 @@ ykan/
 └── mcp.php
 ```
 
-## 2. Configure `mcp.php`
+## 2. Configure via `.env` (outside the served folders)
 
-Edit the two constants at the top of `mcp.php`:
+Secret and root live in a `.env` file placed **above the web root**, so it is
+never served by Apache and never committed to git. Create it (see
+`.env.example`):
 
-| Constant | What to put |
-|----------|-------------|
+```
+MCP_SECRET=your-long-random-string
+MCP_ROOT=/homez.NNN/youruser/www
+```
+
+| Key | What to put |
+|-----|-------------|
 | `MCP_SECRET` | A long random string. **It is the password** — the whole URL is a secret. |
-| `MCP_ROOT` | Absolute path to the folder that **contains** your project folders (usually your hosting web root). Ask OVH/your FTP client for the absolute path, e.g. `/homez.NNN/youruser/www`. |
+| `MCP_ROOT` | Absolute path to the folder that **contains** your project folders (usually your hosting web root). Your FTP client shows the absolute path, e.g. `/homez.NNN/youruser/www`. |
 
-Every project folder you link is resolved **relative to `MCP_ROOT`**.
+Then set `MCP_ENV_FILE` in `mcp.php` to the absolute path of that file. The
+default is `__DIR__ . '/../.env'` — i.e. one level **above** the `ykan/` folder,
+which is already out of the web-served area. Every project folder you link is
+resolved **relative to `MCP_ROOT`**.
 
 ## 3. Link swimlanes to folders (the "Projects" popup)
 

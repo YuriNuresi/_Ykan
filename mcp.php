@@ -13,12 +13,11 @@
  * SETUP (3 steps)
  * ============================================================================
  * 1. Put this file next to _Ykan.php (same folder, e.g. ykan.portale3d.it/).
- * 2. Set the two constants below:
- *      - MCP_SECRET : a long random string. It IS the password. Treat the whole
- *                     URL as a secret.
- *      - MCP_ROOT   : absolute path to the folder that CONTAINS your projects
- *                     (usually your hosting web root). Every "Folder" you link
- *                     to a swimlane in _Ykan is resolved relative to this.
+ * 2. Create a .env file ABOVE the web root (not web-accessible), containing:
+ *      MCP_SECRET=your-long-random-string   (it IS the password)
+ *      MCP_ROOT=/homez.NNN/youruser/www     (folder that CONTAINS your projects)
+ *    Point MCP_ENV_FILE (below) at its absolute path. Every "Folder" you link to
+ *    a swimlane in _Ykan is resolved relative to MCP_ROOT.
  * 3. In claude.ai -> Settings -> Connectors -> Add custom connector, paste:
  *      https://ykan.portale3d.it/mcp.php?k=YOUR_SECRET
  *    It then works in the Android app too.
@@ -36,10 +35,47 @@
 declare(strict_types=1);
 
 // ============================================================================
-// CONFIG  —  edit these two lines after uploading
+// CONFIG  —  secret + root are read from a .env file OUTSIDE the served folders
 // ============================================================================
-const MCP_SECRET = 'CHANGE-ME-to-a-long-random-string';
-const MCP_ROOT   = '/CHANGE/ME/to/your/hosting/webroot'; // folder that contains your project folders
+// Create a plain-text file (e.g. one level ABOVE this folder, not web-accessible):
+//
+//     MCP_SECRET=your-long-random-string
+//     MCP_ROOT=/homez.NNN/youruser/www
+//
+// Point MCP_ENV_FILE at its absolute path. Keeping it above the web root means
+// it is never served by Apache and never committed to git.
+const MCP_ENV_FILE = __DIR__ . '/../.env';  // default: parent of the ykan/ folder
+const MCP_ROOT_FALLBACK = '';               // optional: hardcode a root if you skip .env
+
+/** Minimal KEY=VALUE .env parser (supports # comments and optional quotes). */
+function mcp_parse_env(string $file): array {
+    $out = [];
+    if (!is_file($file) || !is_readable($file)) return $out;
+    foreach (file($file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) as $line) {
+        $line = trim($line);
+        if ($line === '' || $line[0] === '#') continue;
+        $pos = strpos($line, '=');
+        if ($pos === false) continue;
+        $k = trim(substr($line, 0, $pos));
+        $v = trim(substr($line, $pos + 1));
+        if (strlen($v) >= 2 && ($v[0] === '"' || $v[0] === "'") && substr($v, -1) === $v[0]) {
+            $v = substr($v, 1, -1);
+        }
+        $out[$k] = $v;
+    }
+    return $out;
+}
+
+/** Config value: .env wins, then a real environment variable, then default. */
+function mcp_cfg(array $env, string $key, string $default = ''): string {
+    if (isset($env[$key]) && $env[$key] !== '') return $env[$key];
+    $g = getenv($key);
+    return ($g !== false && $g !== '') ? $g : $default;
+}
+
+$mcpEnv = mcp_parse_env(MCP_ENV_FILE);
+define('MCP_SECRET', mcp_cfg($mcpEnv, 'MCP_SECRET'));
+define('MCP_ROOT',   mcp_cfg($mcpEnv, 'MCP_ROOT', MCP_ROOT_FALLBACK));
 
 const MCP_DATA_FILE = __DIR__ . '/_Ykan_data.json';
 const MCP_MAX_READ  = 500_000;   // max bytes returned by read_file
@@ -67,7 +103,7 @@ if ($method === 'GET' && !isset($_GET['mcp'])) {
         'name'      => '_Ykan MCP',
         'transport' => 'streamable-http (stateless JSON-RPC 2.0)',
         'usage'     => 'POST JSON-RPC to this URL with ?k=SECRET. Add as a custom connector in claude.ai.',
-        'configured'=> MCP_SECRET !== 'CHANGE-ME-to-a-long-random-string' && MCP_ROOT !== '/CHANGE/ME/to/your/hosting/webroot',
+        'configured'=> MCP_SECRET !== '' && MCP_ROOT !== '' && realpath(MCP_ROOT) !== false,
     ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
     exit;
 }
@@ -80,6 +116,12 @@ function mcp_provided_secret(): string {
     return '';
 }
 
+if (MCP_SECRET === '') {
+    http_response_code(500);
+    header('Content-Type: application/json; charset=utf-8');
+    echo json_encode(['error' => 'server not configured: MCP_SECRET missing (.env not found or unreadable)']);
+    exit;
+}
 if (!hash_equals(MCP_SECRET, mcp_provided_secret())) {
     http_response_code(401);
     header('Content-Type: application/json; charset=utf-8');
