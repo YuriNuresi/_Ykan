@@ -21,19 +21,30 @@ Put both files in the folder served by your subdomain (e.g.
 ykan/
 ├── _Ykan.php
 ├── _Ykan_data.json   (created automatically on first run)
-└── mcp.php
+├── mcp.php
+└── .env              (you create this — holds the secrets, keep it out of git)
 ```
 
-## 2. Configure `mcp.php`
+## 2. Configure via `.env`
 
-Edit the two constants at the top of `mcp.php`:
+`mcp.php` reads its config from a `.env` file (no more editing constants in the
+code). Create a `.env` next to `mcp.php` — or one level up in your hosting root —
+with these two keys:
 
-| Constant | What to put |
-|----------|-------------|
+```
+MCP_SECRET=a-long-random-string-that-is-the-password
+MCP_ROOT=/absolute/path/that/contains/your/project/folders
+```
+
+| Key | What to put |
+|-----|-------------|
 | `MCP_SECRET` | A long random string. **It is the password** — the whole URL is a secret. |
 | `MCP_ROOT` | Absolute path to the folder that **contains** your project folders (usually your hosting web root). Ask OVH/your FTP client for the absolute path, e.g. `/homez.NNN/youruser/www`. |
 
+A `.env` next to `mcp.php` takes precedence over one in the hosting root.
 Every project folder you link is resolved **relative to `MCP_ROOT`**.
+
+> **Keep `.env` out of git and off public HTTP.** It holds the password.
 
 ## 3. Link swimlanes to folders (the "Projects" popup)
 

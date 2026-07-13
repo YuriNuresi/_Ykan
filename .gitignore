@@ -1,0 +1,18 @@
+# Secrets & config
+.env
+.htpasswd
+
+# Board data (may contain API keys)
+_Ykan_data.json
+
+# User-created themes (only the template ships with the repo)
+themes/*.json
+
+# MCP audit log & backups
+_ykan_mcp_audit.log
+.ykan_backups/
+
+# Editor / tooling
+.claude/
+.DS_Store
+Thumbs.db

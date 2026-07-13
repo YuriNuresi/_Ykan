@@ -1,0 +1,36 @@
+# ============================================================================
+# _Ykan — example Apache config (rename/adapt to your host)
+# ============================================================================
+# This is a deployment EXAMPLE. Adjust the paths to your own hosting before use.
+
+# Visiting the root opens the board.
+DirectoryIndex index.php _Ykan.php
+
+# ---- Basic Auth: protects the whole folder (the Kanban board) --------------
+# Point AuthUserFile at your own .htpasswd (absolute path on your server).
+AuthType Basic
+AuthName "_Ykan - restricted access"
+AuthUserFile /path/to/your/.htpasswd
+Require valid-user
+
+# ---- Exception: mcp.php stays public (guarded by its own ?k= secret) -------
+# claude.ai cannot do Basic Auth, so the MCP endpoint must bypass it.
+<Files "mcp.php">
+    Satisfy Any
+    Order allow,deny
+    Allow from all
+</Files>
+
+# ---- Never serve these over HTTP -------------------------------------------
+<Files ".env">
+    Require all denied
+</Files>
+<Files ".htpasswd">
+    Require all denied
+</Files>
+<Files ".htaccess">
+    Require all denied
+</Files>
+<Files "_ykan_mcp_audit.log">
+    Require all denied
+</Files>

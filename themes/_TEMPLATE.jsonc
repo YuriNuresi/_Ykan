@@ -1,0 +1,68 @@
+// =============================================================================
+//  _Ykan — THEME TEMPLATE (reference for humans & AIs)
+// -----------------------------------------------------------------------------
+//  This is a DOCUMENTED template. It uses // comments to explain every field,
+//  so it is NOT a loadable theme (JSON has no comments). To create a real theme,
+//  copy this, fill the values, and remove the comments — the board loads only
+//  strict ".json" files from this folder.
+//
+//  HOW A THEME WORKS
+//  - "colors" and "layout" become CSS variables (--bg, --card-pad, ...).
+//  - When a theme is active the board removes the light/dark base class and
+//    injects ":root{ --bg:...; --card-pad:...; }" so your values win everywhere.
+//  - "colors" should be complete. "layout" is optional: omit a key to keep the
+//    default; include it to change density / shape.
+// =============================================================================
+{
+  "name": "My Theme",              // shown in the header dropdown and Themes manager
+  "author": "who made it",         // free text (e.g. "GPT-5", "Yuri")
+  "description": "one-line vibe",  // short subtitle in the Themes manager
+  "dark": true,                    // true = dark background, false = light. Only a hint
+                                   //        (used for the icon and toggle base).
+
+  // ---- COLORS — required in full. Any CSS color (hex, rgb, rgba, hsl). --------
+  "colors": {
+    "bg":      "#0d1117",  // PAGE background. Also the column body (.cell) background.
+    "bg2":     "#161b22",  // BARS: top header, swimlane header, column-header row, filters bar.
+    "bg3":     "#1c2129",  // RAISED surfaces: cards, modals, side panels, buttons.
+                           //   For a GLASS look make this an rgba() with alpha ~0.5 and set layout.blur.
+    "text":    "#e6edf3",  // PRIMARY text: titles, card titles, input text.
+    "text2":   "#8b949e",  // SECONDARY/muted text: descriptions, meta, counts, placeholders.
+    "border":  "#30363d",  // ALL borders & dividers, and the dashed "add" buttons.
+    "accent":  "#2f81f7",  // PRIMARY accent: primary buttons, links, focus rings, active tabs, hover borders.
+    "accent2": "#1f6feb",  // Accent HOVER / stronger accent (usually a bit darker than accent).
+    "high":    "#f85149",  // HIGH priority dot on cards (red-ish).
+    "medium":  "#d29922",  // MEDIUM priority dot on cards (amber-ish).
+    "low":     "#3fb950",  // LOW priority dot on cards (green-ish).
+    "shadow":  "0 1px 2px rgba(0,0,0,0.4)"  // FULL CSS box-shadow of cards (not a color).
+  },
+
+  // ---- LAYOUT — optional. All values are CSS lengths (keep the units). --------
+  "layout": {
+    "radius":      "8px",       // corner radius of swimlanes, modals, panels, buttons.
+    "card-radius": "6px",       // corner radius of task cards (0 = square, 16px = pill-ish).
+    "card-pad":    "10px",      // inner padding of a card (small = dense).
+    "gap":         "8px",       // vertical space between cards in a column.
+    "col-min":     "280px",     // min column width → DENSITY. ~200px = tight, ~320px = roomy.
+    "cell-pad":    "8px",       // padding inside a column body (the drop area).
+    "font-base":   "13px",      // base font size; the whole UI scales from it (11px compact … 15px large).
+    "header-pad":  "12px 20px", // padding of the top app header (full CSS padding value).
+    "blur":        "0px"        // backdrop blur behind cards for glassmorphism. Use ~12px WITH a translucent bg3.
+  },
+
+  // ---- SURFACES — optional. Each may be a GRADIENT or image, not just a color. -
+  //      Use these to make bold, distinctive headers/bars. Default = the flat colors.
+  "surfaces": {
+    "header-bg":   "linear-gradient(135deg,#5b2be0,#c026d3)", // TOP app bar background.
+    "header-text": "#ffffff",  // text/icons color in the top app bar (set light if header-bg is dark).
+    "swimlane-bg": "linear-gradient(90deg,#1e293b,#334155)",  // the PROJECT (swimlane) bar.
+    "colhead-bg":  "#1e293b",  // the COLUMN TITLES row (To Do / In Progress / Done).
+    "card-bg":     "#1c2233"   // task CARD background (use rgba() for glass).
+  },
+
+  // ---- CSS — optional escape hatch. Raw CSS injected verbatim for FULL control. -
+  //      Target the app's real classes. Useful for glows, hover FX, borders, fonts.
+  //      Selectors: .header .swimlane-header .column-header-row .column-header .cell
+  //                 .card .card:hover .btn .btn-primary .column-count .card-title
+  "css": ".card:hover{transform:translateY(-2px);box-shadow:0 8px 24px rgba(0,0,0,.3)} .btn-primary{border:none}"
+}

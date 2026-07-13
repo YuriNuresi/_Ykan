@@ -36,10 +36,40 @@
 declare(strict_types=1);
 
 // ============================================================================
-// CONFIG  —  edit these two lines after uploading
+// CONFIG  —  loaded from a .env file, NOT hardcoded here.
+// Put these two keys in the .env in your hosting root (the folder that CONTAINS
+// your project folders, i.e. one level above this file):
+//     MCP_SECRET=<a long random string — it is the password>
+//     MCP_ROOT=<absolute path that contains your project folders>
+// A local .env next to mcp.php (ykan/.env) also works and takes precedence.
 // ============================================================================
-const MCP_SECRET = 'CHANGE-ME-to-a-long-random-string';
-const MCP_ROOT   = '/CHANGE/ME/to/your/hosting/webroot'; // folder that contains your project folders
+
+/** Minimal .env reader: KEY=VALUE per line, ignores comments and blank lines. */
+function mcp_load_env(): array {
+    $out = [];
+    // Search order: next to mcp.php first, then one directory up (hosting root).
+    foreach ([__DIR__ . '/.env', dirname(__DIR__) . '/.env'] as $path) {
+        if (!is_file($path) || !is_readable($path)) continue;
+        foreach (file($path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) as $line) {
+            $line = ltrim($line);
+            if ($line === '' || $line[0] === '#') continue;
+            $eq = strpos($line, '=');
+            if ($eq === false) continue;
+            $key = trim(substr($line, 0, $eq));
+            $val = trim(substr($line, $eq + 1));
+            // Strip one layer of surrounding quotes, if present.
+            if (strlen($val) >= 2 && ($val[0] === '"' || $val[0] === "'") && substr($val, -1) === $val[0]) {
+                $val = substr($val, 1, -1);
+            }
+            if ($key !== '' && !array_key_exists($key, $out)) $out[$key] = $val; // first file wins
+        }
+    }
+    return $out;
+}
+
+$__env = mcp_load_env();
+define('MCP_SECRET', (string)($__env['MCP_SECRET'] ?? ''));
+define('MCP_ROOT',   (string)($__env['MCP_ROOT']   ?? ''));
 
 const MCP_DATA_FILE = __DIR__ . '/_Ykan_data.json';
 const MCP_MAX_READ  = 500_000;   // max bytes returned by read_file
@@ -67,7 +97,7 @@ if ($method === 'GET' && !isset($_GET['mcp'])) {
         'name'      => '_Ykan MCP',
         'transport' => 'streamable-http (stateless JSON-RPC 2.0)',
         'usage'     => 'POST JSON-RPC to this URL with ?k=SECRET. Add as a custom connector in claude.ai.',
-        'configured'=> MCP_SECRET !== 'CHANGE-ME-to-a-long-random-string' && MCP_ROOT !== '/CHANGE/ME/to/your/hosting/webroot',
+        'configured'=> MCP_SECRET !== '' && MCP_ROOT !== '' && is_dir(MCP_ROOT),
     ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
     exit;
 }
@@ -80,10 +110,10 @@ function mcp_provided_secret(): string {
     return '';
 }
 
-if (!hash_equals(MCP_SECRET, mcp_provided_secret())) {
+if (MCP_SECRET === '' || !hash_equals(MCP_SECRET, mcp_provided_secret())) {
     http_response_code(401);
     header('Content-Type: application/json; charset=utf-8');
-    echo json_encode(['error' => 'unauthorized']);
+    echo json_encode(['error' => MCP_SECRET === '' ? 'server not configured (.env missing MCP_SECRET)' : 'unauthorized']);
     exit;
 }
 

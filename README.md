@@ -4,7 +4,7 @@
 
 A lightweight, self-contained Kanban board that runs from a single PHP file. Perfect for developers who want a simple, fast, and AI-enhanced project management tool without complex setups.
 
-![Version](https://img.shields.io/badge/version-1.7.0-blue)
+![Version](https://img.shields.io/badge/version-1.8.0-blue)
 ![PHP](https://img.shields.io/badge/PHP-8.2+-purple)
 ![License](https://img.shields.io/badge/license-MIT-green)
 [![Demo](https://img.shields.io/badge/demo-live-brightgreen)](https://portale3d.it/projects/_Ykan/demo.php)
@@ -21,6 +21,19 @@ A lightweight, self-contained Kanban board that runs from a single PHP file. Per
 - **Due dates** - Track deadlines with overdue alerts
 - **Dark/Light theme** - Easy on the eyes
 - **Auto-regenerating tasks** - Recurring tasks that recreate when archived
+
+### Custom Themes
+- **JSON themes** - Drop a theme file in `themes/` and switch it live from the header
+- **Theme editor** - Create, save and delete themes from the UI
+- **Full control** - Override colors, layout (density/shape) and surfaces (gradients, glass)
+- **Documented template** - `themes/_TEMPLATE.jsonc` explains every field for humans & AIs
+
+### MCP - Remote control from mobile
+- **Claude mobile app** - Manage the board and edit project files from your phone via `mcp.php`
+- **JSON-RPC 2.0 over HTTPS** - Stateless, runs on plain shared hosting (no VPS)
+- **Projects** - Link swimlanes to project folders and browse their files safely
+- **`.env` config** - Secrets (`MCP_SECRET`, `MCP_ROOT`) loaded from `.env`, never hardcoded
+- See [MCP_SETUP.md](MCP_SETUP.md) for the full setup guide
 
 ### AI Integration (Gemini)
 - **Project Analysis** - Scan your codebase and get task suggestions
@@ -127,6 +140,14 @@ POST ?api=github_commits     # Get GitHub commits
 ---
 
 ## Changelog
+
+### v1.8.0 (July 2026)
+- Custom Themes system: JSON themes in `themes/` with a live switcher
+- Theme editor (create/save/delete) with color, layout and surface overrides
+- Documented theme template (`themes/_TEMPLATE.jsonc`)
+- MCP remote control (`mcp.php`): manage the board and edit project files from the Claude mobile app
+- Projects: link swimlanes to folders and browse project files safely
+- `mcp.php` now reads `MCP_SECRET`/`MCP_ROOT` from `.env` instead of hardcoded constants
 
 ### v1.7.0 (December 2025)
 - Full English UI translation

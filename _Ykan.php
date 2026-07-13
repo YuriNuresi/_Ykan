@@ -3,7 +3,7 @@
  * _Ykan - Minimal Kanban Board
  * Single-file PHP Kanban for Scrum/Agile projects
  *
- * @version 1.7.0
+ * @version 1.8.0
  * @license MIT
  * @requires PHP 8.2+
  *
@@ -60,6 +60,10 @@
 declare(strict_types=1);
 
 const DATA_FILE = __DIR__ . '/_Ykan_data.json';
+const THEMES_DIR = __DIR__ . '/themes';
+const THEME_KEYS = ['bg','bg2','bg3','text','text2','border','accent','accent2','high','medium','low','shadow'];
+const THEME_LAYOUT_KEYS = ['radius','card-radius','card-pad','gap','col-min','cell-pad','font-base','header-pad','blur'];
+const THEME_SURFACE_KEYS = ['header-bg','header-text','swimlane-bg','colhead-bg','card-bg'];
 const DEFAULT_DATA = [
     'config' => [
         'gemini_api_key' => '',
@@ -103,6 +107,161 @@ function saveData(array $data): bool {
 
 function generateId(string $prefix = 'id'): string {
     return $prefix . '_' . bin2hex(random_bytes(8));
+}
+
+// === MCP project root + safe file browsing (shared model with mcp.php) ========
+// The swimlane 'path' is relative to MCP_ROOT, configured in the hosting .env
+// (same file mcp.php reads). We resolve it here so the board can browse a
+// project's folder and let the user tag doc/structure files for the AI.
+
+function ykanMcpRoot(): string {
+    static $root = null;
+    if ($root !== null) return $root;
+    $root = '';
+    foreach ([__DIR__ . '/.env', dirname(__DIR__) . '/.env'] as $envPath) {
+        if (!is_file($envPath) || !is_readable($envPath)) continue;
+        foreach (file($envPath, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) as $line) {
+            $line = ltrim($line);
+            if ($line === '' || $line[0] === '#') continue;
+            if (preg_match('/^MCP_ROOT\s*=\s*(.*)$/', $line, $m)) {
+                $v = trim($m[1]);
+                if (strlen($v) >= 2 && ($v[0] === '"' || $v[0] === "'") && substr($v, -1) === $v[0]) {
+                    $v = substr($v, 1, -1);
+                }
+                if ($v !== '') $root = $v;
+            }
+        }
+        if ($root !== '') break;
+    }
+    if ($root === '') $root = dirname(__DIR__); // fallback: parent of this app's folder
+    return $root;
+}
+
+/** Lexically resolve ./ and ../ without touching the filesystem. */
+function ykanCanonical(string $path): string {
+    $abs = str_starts_with($path, '/');
+    $out = [];
+    foreach (explode('/', str_replace('\\', '/', $path)) as $p) {
+        if ($p === '' || $p === '.') continue;
+        if ($p === '..') { array_pop($out); continue; }
+        $out[] = $p;
+    }
+    return ($abs ? '/' : '') . implode('/', $out);
+}
+
+/** Resolve a swimlane's linked project folder to a real, confined base path. */
+function ykanProjectBase(array $lane): string {
+    $rel = trim((string)($lane['path'] ?? ''));
+    if ($rel === '') throw new RuntimeException('Nessuna cartella collegata a questo progetto.');
+    $rootReal = realpath(ykanMcpRoot());
+    if ($rootReal === false) throw new RuntimeException('MCP_ROOT non valido sul server.');
+    $baseReal = realpath($rootReal . '/' . $rel);
+    if ($baseReal === false) throw new RuntimeException('La cartella collegata non esiste: ' . $rel);
+    if ($baseReal !== $rootReal && !str_starts_with($baseReal, $rootReal . '/')) {
+        throw new RuntimeException('La cartella collegata esce da MCP_ROOT.');
+    }
+    return $baseReal;
+}
+
+/** Confine a relative subpath inside a base folder; returns the absolute path. */
+function ykanSafePath(string $baseReal, string $rel): string {
+    if (strpos($rel, "\0") !== false) throw new RuntimeException('Path non valido.');
+    $rel = ltrim(str_replace('\\', '/', $rel), '/');
+    $target = ykanCanonical($baseReal . '/' . $rel);
+    if ($target !== $baseReal && !str_starts_with($target, $baseReal . '/')) {
+        throw new RuntimeException('Il path esce dalla cartella del progetto.');
+    }
+    return $target;
+}
+
+// === THEMES ===================================================================
+// A theme is a small JSON file in themes/ with a "colors" map keyed by the CSS
+// variable names (without the leading --). Any AI can generate one; the board
+// loads them into a live switcher on top of the built-in light/dark themes.
+
+/** filename-safe slug from a theme name. */
+function ykanThemeSlug(string $name): string {
+    $s = strtolower(trim($name));
+    $s = preg_replace('/[^a-z0-9]+/', '-', $s);
+    $s = trim((string)$s, '-');
+    return $s !== '' ? substr($s, 0, 60) : 'theme-' . bin2hex(random_bytes(3));
+}
+
+/** Validate + normalise a theme array. Missing colors are filled from $base. */
+function ykanNormalizeTheme(array $t, array $base = []): array {
+    $colorsIn = is_array($t['colors'] ?? null) ? $t['colors'] : [];
+    $colors = [];
+    foreach (THEME_KEYS as $k) {
+        $v = $colorsIn[$k] ?? ($base[$k] ?? '');
+        $colors[$k] = is_string($v) ? trim($v) : '';
+    }
+    // layout + surfaces are optional: keep only the tokens actually provided.
+    $pick = function(array $src, array $keys): array {
+        $out = [];
+        foreach ($keys as $k) {
+            $v = $src[$k] ?? '';
+            if (is_string($v) || is_int($v) || is_float($v)) {
+                $v = trim((string)$v);
+                if ($v !== '') $out[$k] = $v;
+            }
+        }
+        return $out;
+    };
+    $layout   = $pick(is_array($t['layout'] ?? null) ? $t['layout'] : [], THEME_LAYOUT_KEYS);
+    $surfaces = $pick(is_array($t['surfaces'] ?? null) ? $t['surfaces'] : [], THEME_SURFACE_KEYS);
+
+    // Raw CSS escape hatch — injected verbatim after the variables. Strip any
+    // </style> so a theme can't break out of its <style> block.
+    $css = is_string($t['css'] ?? null) ? str_ireplace('</style', '', $t['css']) : '';
+
+    return [
+        'name'        => trim((string)($t['name'] ?? 'Untitled theme')),
+        'author'      => trim((string)($t['author'] ?? '')),
+        'description' => trim((string)($t['description'] ?? '')),
+        'dark'        => (bool)($t['dark'] ?? false),
+        'colors'      => $colors,
+        'layout'      => (object)$layout,   // empty object if none → valid JSON {}
+        'surfaces'    => (object)$surfaces,
+        'css'         => $css,
+    ];
+}
+
+/** Read every theme file, newest first. Returns list with 'file' slug added. */
+function ykanListThemes(): array {
+    if (!is_dir(THEMES_DIR)) return [];
+    $out = [];
+    foreach (glob(THEMES_DIR . '/*.json') ?: [] as $path) {
+        $t = json_decode((string)@file_get_contents($path), true);
+        if (!is_array($t)) continue;
+        $norm = ykanNormalizeTheme($t);
+        $norm['file'] = basename($path, '.json');
+        $out[] = $norm;
+    }
+    usort($out, fn($a, $b) => strcasecmp($a['name'], $b['name']));
+    return $out;
+}
+
+/** Build the ":root{ --var:value; }" CSS for a stored theme file (or ''). */
+function ykanThemeCss(string $file): string {
+    $file = basename($file); // no path traversal
+    $path = THEMES_DIR . '/' . $file . '.json';
+    if (!is_file($path)) return '';
+    $t = json_decode((string)@file_get_contents($path), true);
+    if (!is_array($t)) return '';
+    $t = ykanNormalizeTheme($t);
+    $decls = [];
+    foreach ($t['colors'] as $k => $v) {
+        if ($v !== '') $decls[] = '--' . $k . ':' . $v;
+    }
+    foreach ((array)$t['layout'] as $k => $v) {
+        if ($v !== '') $decls[] = '--' . $k . ':' . $v;
+    }
+    foreach ((array)$t['surfaces'] as $k => $v) {
+        if ($v !== '') $decls[] = '--' . $k . ':' . $v;
+    }
+    $css = $decls ? ':root{' . implode(';', $decls) . '}' : '';
+    if (!empty($t['css'])) $css .= "\n" . $t['css']; // raw theme CSS (already sanitised)
+    return $css;
 }
 
 // === PROJECT SCANNER ===
@@ -261,6 +420,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['api'])) {
                         // Project link fields (only touched when provided)
                         if (array_key_exists('path', $input)) $lane['path'] = $input['path'];
                         if (array_key_exists('url', $input)) $lane['url'] = $input['url'];
+                        // Doc/structure files the AI should study before working
+                        if (array_key_exists('doc_files', $input)) $lane['doc_files'] = array_values($input['doc_files'] ?? []);
                         break;
                     }
                 }
@@ -291,6 +452,75 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['api'])) {
                 }
                 usort($data['swimlanes'], fn($a, $b) => $a['position'] <=> $b['position']);
                 saveData($data);
+                return ['success' => true];
+            })(),
+
+            // Browse a project's linked folder (for tagging doc/structure files)
+            'list_project_files' => (function() use ($data, $input) {
+                $lane = null;
+                foreach ($data['swimlanes'] as $l) {
+                    if ($l['id'] === ($input['id'] ?? '')) { $lane = $l; break; }
+                }
+                if (!$lane) return ['success' => false, 'error' => 'Swimlane non trovata'];
+                $base = ykanProjectBase($lane); // throws if not linked / invalid
+                $sub  = (string)($input['subpath'] ?? '');
+                $dir  = ykanSafePath($base, $sub);
+                if (!is_dir($dir)) return ['success' => false, 'error' => 'Non è una cartella: ' . $sub];
+                $sub  = trim(str_replace('\\', '/', $sub), '/');
+                $entries = [];
+                foreach (@scandir($dir) ?: [] as $it) {
+                    if ($it === '.' || $it === '..' || $it === '.ykan_backups') continue;
+                    $full  = $dir . '/' . $it;
+                    $isDir = is_dir($full);
+                    $rel   = ltrim(($sub !== '' ? $sub . '/' : '') . $it, '/');
+                    $entries[] = [
+                        'name' => $it,
+                        'type' => $isDir ? 'dir' : 'file',
+                        'rel'  => $rel,
+                        'size' => $isDir ? null : (@filesize($full) ?: 0),
+                    ];
+                }
+                usort($entries, fn($a, $b) =>
+                    [$a['type'] === 'file' ? 1 : 0, strtolower($a['name'])]
+                    <=> [$b['type'] === 'file' ? 1 : 0, strtolower($b['name'])]
+                );
+                return [
+                    'success'   => true,
+                    'subpath'   => $sub,
+                    'entries'   => $entries,
+                    'doc_files' => array_values($lane['doc_files'] ?? []),
+                ];
+            })(),
+
+            // Themes
+            'list_themes' => ['success' => true, 'themes' => ykanListThemes()],
+
+            'save_theme' => (function() use ($input) {
+                $theme = $input['theme'] ?? null;
+                // Also accept a raw JSON string in 'json'
+                if (!is_array($theme) && isset($input['json'])) {
+                    $theme = json_decode((string)$input['json'], true);
+                }
+                if (!is_array($theme)) return ['success' => false, 'error' => 'JSON tema non valido.'];
+                $norm = ykanNormalizeTheme($theme);
+                if ($norm['name'] === '') return ['success' => false, 'error' => 'Il tema deve avere un nome.'];
+                if (!is_dir(THEMES_DIR) && !@mkdir(THEMES_DIR, 0775, true)) {
+                    return ['success' => false, 'error' => 'Impossibile creare la cartella themes/.'];
+                }
+                $slug = ykanThemeSlug($norm['name']);
+                $path = THEMES_DIR . '/' . $slug . '.json';
+                if (file_put_contents($path, json_encode($norm, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE)) === false) {
+                    return ['success' => false, 'error' => 'Scrittura del tema fallita (permessi?).'];
+                }
+                $norm['file'] = $slug;
+                return ['success' => true, 'theme' => $norm];
+            })(),
+
+            'delete_theme' => (function() use ($input) {
+                $file = basename((string)($input['file'] ?? ''));
+                if ($file === '') return ['success' => false, 'error' => 'File tema mancante.'];
+                $path = THEMES_DIR . '/' . $file . '.json';
+                if (is_file($path)) @unlink($path);
                 return ['success' => true];
             })(),
 
@@ -1377,16 +1607,33 @@ $dataJson = json_encode($data);
             --border: #cbd5e1; --accent: #3b82f6; --accent2: #2563eb;
             --high: #ef4444; --medium: #f59e0b; --low: #22c55e;
             --shadow: 0 1px 3px rgba(0,0,0,0.1);
+            /* Layout tokens — themes can override these for different densities/shapes */
+            --radius: 8px;        /* swimlanes, modals, panels */
+            --card-radius: 6px;   /* task cards */
+            --card-pad: 10px;     /* card inner padding */
+            --gap: 8px;           /* space between cards */
+            --col-min: 280px;     /* column width → density */
+            --cell-pad: 8px;      /* column body padding */
+            --font-base: 13px;    /* base font size */
+            --header-pad: 12px 20px; /* top header padding */
+            --blur: 0px;          /* glass backdrop blur (0 = off) */
+            /* Surface tokens — default to the flat colors above, but a theme can
+               set them to a gradient/image for bolder headers, bars and cards. */
+            --header-bg: var(--bg2);   /* top app bar */
+            --header-text: var(--text);/* text/icons in the top app bar */
+            --swimlane-bg: var(--bg2); /* project (swimlane) bar */
+            --colhead-bg: var(--bg2);  /* column titles row (To Do / In Progress…) */
+            --card-bg: var(--bg3);     /* task cards */
         }
         .dark {
             --bg: #0f172a; --bg2: #1e293b; --bg3: #334155; --text: #f1f5f9; --text2: #94a3b8;
             --border: #475569; --shadow: 0 1px 3px rgba(0,0,0,0.3);
         }
         * { box-sizing: border-box; margin: 0; padding: 0; }
-        body { font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; }
+        body { font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; font-size: var(--font-base); }
 
         /* Header */
-        .header { display: flex; align-items: center; gap: 12px; padding: 12px 20px; background: var(--bg2); border-bottom: 1px solid var(--border); }
+        .header { display: flex; align-items: center; gap: 12px; padding: var(--header-pad); background: var(--header-bg); color: var(--header-text); border-bottom: 1px solid var(--border); }
         .header h1 { font-size: 18px; font-weight: 600; cursor: pointer; }
         .header h1:hover { color: var(--accent); }
         .header-actions { display: flex; gap: 8px; margin-left: auto; }
@@ -1405,8 +1652,8 @@ $dataJson = json_encode($data);
         .board { display: flex; flex-direction: column; gap: 0; min-width: fit-content; }
 
         /* Swimlane */
-        .swimlane { border: 1px solid var(--border); border-radius: 8px; margin-bottom: 12px; overflow: hidden; }
-        .swimlane-header { display: flex; align-items: center; gap: 8px; padding: 8px 12px; background: var(--bg2); border-bottom: 1px solid var(--border); cursor: pointer; }
+        .swimlane { border: 1px solid var(--border); border-radius: var(--radius); margin-bottom: 12px; overflow: hidden; }
+        .swimlane-header { display: flex; align-items: center; gap: 8px; padding: 8px 12px; background: var(--swimlane-bg); border-bottom: 1px solid var(--border); cursor: pointer; }
         .swimlane-toggle { transition: transform 0.2s; font-size: 12px; color: var(--text2); }
         .swimlane.collapsed .swimlane-toggle { transform: rotate(-90deg); }
         .swimlane.collapsed .cells-row { display: none; }
@@ -1418,8 +1665,8 @@ $dataJson = json_encode($data);
 
         /* Columns */
         .columns-row { display: flex; }
-        .column-header-row { display: flex; background: var(--bg2); border-bottom: 1px solid var(--border); }
-        .column-header { flex: 1; min-width: 280px; padding: 10px 12px; display: flex; align-items: center; gap: 8px; border-right: 1px solid var(--border); }
+        .column-header-row { display: flex; background: var(--colhead-bg); border-bottom: 1px solid var(--border); }
+        .column-header { flex: 1; min-width: var(--col-min); padding: 10px 12px; display: flex; align-items: center; gap: 8px; border-right: 1px solid var(--border); }
         .column-header:last-child { border-right: none; }
         .column-name { font-weight: 500; font-size: 13px; background: transparent; border: none; color: var(--text); flex: 1; }
         .column-name:focus { outline: 1px solid var(--accent); border-radius: 4px; }
@@ -1429,12 +1676,15 @@ $dataJson = json_encode($data);
 
         /* Cells */
         .cells-row { display: flex; }
-        .cell { flex: 1; min-width: 280px; min-height: 120px; padding: 8px; border-right: 1px solid var(--border); background: var(--bg); }
+        /* Reserve the same trailing width as the "+ add column" button so the
+           header cells stay aligned with the card cells below them. */
+        .cells-row::after { content: ''; flex: 0 0 58px; }
+        .cell { flex: 1; min-width: var(--col-min); min-height: 120px; padding: var(--cell-pad); border-right: 1px solid var(--border); background: var(--bg); }
         .cell:last-child { border-right: none; }
         .cell.drag-over { background: var(--bg2); }
 
         /* Cards */
-        .card { background: var(--bg3); border: 1px solid var(--border); border-radius: 6px; padding: 10px; margin-bottom: 8px; cursor: grab; box-shadow: var(--shadow); transition: all 0.15s; }
+        .card { background: var(--card-bg); border: 1px solid var(--border); border-radius: var(--card-radius); padding: var(--card-pad); margin-bottom: var(--gap); cursor: grab; box-shadow: var(--shadow); transition: all 0.15s; backdrop-filter: blur(var(--blur)); -webkit-backdrop-filter: blur(var(--blur)); }
         .card:hover { border-color: var(--accent); }
         .card.dragging { opacity: 0.5; transform: rotate(2deg); }
         .card-header { display: flex; align-items: flex-start; gap: 8px; margin-bottom: 6px; }
@@ -1453,6 +1703,8 @@ $dataJson = json_encode($data);
         .add-card-btn { width: 100%; padding: 8px; border: 1px dashed var(--border); border-radius: 6px; background: transparent; color: var(--text2); cursor: pointer; font-size: 12px; }
         .add-card-btn:hover { border-color: var(--accent); color: var(--accent); }
         .add-column-btn, .add-swimlane-btn { padding: 8px 16px; border: 1px dashed var(--border); border-radius: 6px; background: transparent; color: var(--text2); cursor: pointer; font-size: 12px; margin: 8px; }
+        /* Fixed-width so it matches the .cells-row::after spacer (46 + 2×6 margin = 58px). */
+        .column-header-row .add-column-btn { flex: 0 0 46px; width: 46px; min-width: 46px; padding: 8px 0; margin: 6px; }
         .add-column-btn:hover, .add-swimlane-btn:hover { border-color: var(--accent); color: var(--accent); }
 
         /* Modal */
@@ -1598,8 +1850,17 @@ $dataJson = json_encode($data);
         .changelog-footer { margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--border); font-size: 11px; color: var(--text2); text-align: center; }
         .changelog-footer a { color: var(--accent); text-decoration: none; }
     </style>
+    <!-- Custom theme overrides (populated on load + when switching themes) -->
+    <style id="customThemeStyle"><?= !empty($data['config']['theme_file']) ? ykanThemeCss($data['config']['theme_file']) : '' ?></style>
 </head>
-<body class="<?= $data['config']['theme'] === 'dark' ? 'dark' : '' ?>">
+<?php
+    // Body base class: a custom theme supplies all vars itself (no .dark base);
+    // otherwise fall back to the built-in light/dark.
+    $bodyClass = !empty($data['config']['theme_file'])
+        ? ''
+        : ($data['config']['theme'] === 'dark' ? 'dark' : '');
+?>
+<body class="<?= $bodyClass ?>">
     <!-- Header -->
     <header class="header">
         <h1 id="projectName" onclick="openConfigModal()"><?= htmlspecialchars($data['config']['project_name'] ?? 'My Project') ?></h1>
@@ -1613,7 +1874,12 @@ $dataJson = json_encode($data);
             <button class="btn btn-icon" onclick="toggleGithub()" title="GitHub">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg>
             </button>
-            <button class="btn btn-icon" onclick="toggleTheme()" title="Theme">
+            <select id="themeSelect" class="filter-select" onchange="onThemeSelect(this.value)" title="Tema attivo" style="max-width:150px">
+                <option value="light">☀️ Light</option>
+                <option value="dark">🌙 Dark</option>
+            </select>
+            <button class="btn btn-icon" onclick="openThemesModal()" title="Gestisci temi">🎨</button>
+            <button class="btn btn-icon" onclick="toggleTheme()" title="Toggle light/dark">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
             </button>
             <button class="btn btn-icon" onclick="openConfigModal()" title="Settings">
@@ -1865,6 +2131,77 @@ $dataJson = json_encode($data);
         </div>
     </div>
 
+    <!-- Project Docs Modal (tag files/folders the AI should study for a project) -->
+    <div id="docsModal" class="modal-overlay">
+        <div class="modal" style="max-width:640px">
+            <h2 style="display:flex;align-items:center;gap:8px">📄 Documentazione — <span id="docsProjName"></span></h2>
+            <p style="color:var(--text2);font-size:13px;margin-bottom:12px">
+                Spunta i file e le cartelle che l'AI deve studiare prima di lavorare su questo
+                progetto (doc, struttura, note…). La selezione è salvata nello swimlane.
+            </p>
+
+            <div id="docsNoFolder" style="display:none">
+                <p style="font-size:13px;margin-bottom:8px">Questo progetto non è ancora collegato a una cartella.</p>
+                <div class="form-group">
+                    <label style="font-size:11px">Cartella (relativa a MCP root)</label>
+                    <input type="text" id="docsFolderInput" placeholder="es. becrafty oppure sites/shopX">
+                </div>
+                <button class="btn btn-primary" onclick="docsSaveFolder()">Collega cartella</button>
+            </div>
+
+            <div id="docsBrowserWrap" style="display:none">
+                <div style="display:flex;align-items:center;gap:6px;margin-bottom:8px;flex-wrap:wrap">
+                    <span style="font-size:11px;color:var(--text2)">Cartella:</span>
+                    <code style="font-size:11px" id="docsFolderLabel"></code>
+                    <span style="flex:1"></span>
+                    <span id="docsBreadcrumb" style="font-size:12px"></span>
+                </div>
+                <div id="docsBrowser" style="border:1px solid var(--border);border-radius:8px;max-height:300px;overflow-y:auto;padding:4px"></div>
+
+                <div style="margin-top:12px">
+                    <div style="font-size:12px;font-weight:600;margin-bottom:4px">Assegnati (<span id="docsSelCount">0</span>)</div>
+                    <div id="docsSelected" style="display:flex;flex-wrap:wrap;gap:6px"></div>
+                </div>
+            </div>
+
+            <div class="modal-actions">
+                <button type="button" class="btn" onclick="closeDocsModal()">Chiudi</button>
+                <button type="button" class="btn btn-primary" id="docsSaveBtn" onclick="saveDocs()" style="display:none">Salva</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Themes Modal -->
+    <div id="themesModal" class="modal-overlay">
+        <div class="modal" style="max-width:620px">
+            <h2>🎨 Temi</h2>
+            <p style="color:var(--text2);font-size:13px;margin-bottom:12px">
+                Light e Dark sono i due temi di default. Puoi aggiungerne altri: incolla o carica
+                un file <code>.json</code> di tema (fatto anche da un'altra AI) e switcha al volo dall'header.
+            </p>
+
+            <div style="display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap">
+                <button class="btn" onclick="copyThemeSpec()">📋 Copia spec per AI</button>
+                <button class="btn" onclick="copyCurrentTheme()">📄 Esporta tema attuale</button>
+                <label class="btn" style="cursor:pointer">📂 Carica .json
+                    <input type="file" accept=".json,application/json" onchange="uploadThemeFile(event)" style="display:none">
+                </label>
+            </div>
+
+            <div style="font-size:12px;font-weight:600;margin-bottom:6px">Temi installati</div>
+            <div id="themesList" style="margin-bottom:16px"></div>
+
+            <div style="font-size:12px;font-weight:600;margin-bottom:6px">Aggiungi tema (incolla JSON)</div>
+            <textarea id="themeJsonInput" placeholder='{ "name": "...", "colors": { ... } }'
+                style="width:100%;min-height:120px;padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--text);font-size:12px;font-family:monospace"></textarea>
+
+            <div class="modal-actions">
+                <button type="button" class="btn" onclick="closeThemesModal()">Chiudi</button>
+                <button type="button" class="btn btn-primary" onclick="saveThemeFromInput()">Salva tema</button>
+            </div>
+        </div>
+    </div>
+
     <!-- Toast Container -->
     <div id="toastContainer" class="toast-container"></div>
 
@@ -1919,7 +2256,11 @@ $dataJson = json_encode($data);
                         <span class="swimlane-toggle">▼</span>
                         <input class="swimlane-name" value="${escHtml(lane.name)}" onchange="updateSwimlane('${lane.id}', this.value)" onclick="event.stopPropagation()">
                         ${lane.path ? `<span class="swimlane-link" title="Linked to folder: ${escHtml(lane.path)}" onclick="event.stopPropagation();openProjectsModal()" style="cursor:pointer;font-size:13px">🔗</span>` : ''}
+                        ${(lane.doc_files && lane.doc_files.length) ? `<span title="${lane.doc_files.length} file di documentazione assegnati" style="font-size:12px;cursor:pointer" onclick="event.stopPropagation();openDocsModal('${lane.id}')">📄${lane.doc_files.length}</span>` : ''}
                         <div class="swimlane-actions" onclick="event.stopPropagation()">
+                            <button class="btn btn-icon" onclick="openDocsModal('${lane.id}')" title="Documentazione del progetto (file per l'AI)">
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 11-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 11-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 11-2.83-2.83l.06-.06a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H3a2 2 0 110-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 112.83-2.83l.06.06a1.65 1.65 0 001.82.33H9a1.65 1.65 0 001-1.51V3a2 2 0 114 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 112.83 2.83l-.06.06a1.65 1.65 0 00-.33 1.82V9a1.65 1.65 0 001.51 1H21a2 2 0 110 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg>
+                            </button>
                             <button class="btn btn-icon" onclick="moveSwimlane('${lane.id}', -1)" title="Sposta su" ${index === 0 ? 'disabled style="opacity:0.3"' : ''}>
                                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 15l-6-6-6 6"/></svg>
                             </button>
@@ -2180,6 +2521,130 @@ $dataJson = json_encode($data);
         await api('update_swimlane', { id, path, url });
         renderProjectsManager();
         render();
+    }
+
+    // === PROJECT DOCS (files the AI studies before working) ===
+    let docsState = { laneId: null, subpath: '', selected: new Map() }; // path -> type
+
+    function openDocsModal(laneId) {
+        const lane = boardData.swimlanes.find(l => l.id === laneId);
+        if (!lane) return;
+        docsState = { laneId, subpath: '', selected: new Map() };
+        (lane.doc_files || []).forEach(d => {
+            if (typeof d === 'string') docsState.selected.set(d, 'file');
+            else if (d && d.path) docsState.selected.set(d.path, d.type || 'file');
+        });
+        document.getElementById('docsProjName').textContent = lane.name;
+        document.getElementById('docsFolderInput').value = lane.path || '';
+        document.getElementById('docsModal').classList.add('active');
+
+        if (!lane.path) {
+            document.getElementById('docsNoFolder').style.display = 'block';
+            document.getElementById('docsBrowserWrap').style.display = 'none';
+            document.getElementById('docsSaveBtn').style.display = 'none';
+        } else {
+            document.getElementById('docsNoFolder').style.display = 'none';
+            document.getElementById('docsBrowserWrap').style.display = 'block';
+            document.getElementById('docsSaveBtn').style.display = '';
+            document.getElementById('docsFolderLabel').textContent = lane.path;
+            renderDocsSelected();
+            docsNavigate('');
+        }
+    }
+
+    function closeDocsModal() {
+        document.getElementById('docsModal').classList.remove('active');
+    }
+
+    async function docsSaveFolder() {
+        const path = document.getElementById('docsFolderInput').value.trim();
+        if (!path) { toast('Inserisci una cartella', 'error'); return; }
+        const lane = boardData.swimlanes.find(l => l.id === docsState.laneId);
+        if (lane) lane.path = path;
+        await api('update_swimlane', { id: docsState.laneId, path });
+        render();
+        openDocsModal(docsState.laneId); // reopen now that it's linked
+    }
+
+    function docsGo(relEnc) { docsNavigate(decodeURIComponent(relEnc)); }
+
+    async function docsNavigate(subpath) {
+        docsState.subpath = subpath || '';
+        const browser = document.getElementById('docsBrowser');
+        browser.innerHTML = '<div style="padding:12px;color:var(--text2);font-size:13px">Carico…</div>';
+        const res = await api('list_project_files', { id: docsState.laneId, subpath: docsState.subpath });
+        if (!res.success) {
+            browser.innerHTML = `<div style="padding:12px;color:var(--danger,#ef4444);font-size:13px">${escHtml(res.error || 'Errore')}</div>`;
+            return;
+        }
+        renderDocsBreadcrumb();
+        renderDocsBrowser(res.entries || []);
+    }
+
+    function renderDocsBreadcrumb() {
+        const parts = docsState.subpath ? docsState.subpath.split('/') : [];
+        let acc = '';
+        const crumbs = [`<a href="#" onclick="docsNavigate('');return false" style="color:var(--accent)">/</a>`];
+        parts.forEach(p => {
+            acc = acc ? acc + '/' + p : p;
+            const target = acc;
+            crumbs.push(`<a href="#" onclick="docsNavigate('${target}');return false" style="color:var(--accent)">${escHtml(p)}</a>`);
+        });
+        document.getElementById('docsBreadcrumb').innerHTML = crumbs.join(' <span style="color:var(--text2)">/</span> ');
+    }
+
+    function renderDocsBrowser(entries) {
+        const browser = document.getElementById('docsBrowser');
+        if (!entries.length) { browser.innerHTML = '<div style="padding:12px;color:var(--text2);font-size:13px">(cartella vuota)</div>'; return; }
+        browser.innerHTML = entries.map(e => {
+            const checked = docsState.selected.has(e.rel) ? 'checked' : '';
+            const icon = e.type === 'dir' ? '📁' : '📄';
+            const relEnc = encodeURIComponent(e.rel);
+            const size = e.type === 'file' ? `<span style="color:var(--text2);font-size:11px">${fmtBytes(e.size)}</span>` : '';
+            const nameCell = e.type === 'dir'
+                ? `<a href="#" onclick="docsGo('${relEnc}');return false" style="color:var(--text);text-decoration:none;flex:1">${icon} ${escHtml(e.name)}/</a>`
+                : `<span onclick="toggleDoc('${relEnc}','file')" style="flex:1;cursor:pointer">${icon} ${escHtml(e.name)}</span>`;
+            return `<div style="display:flex;align-items:center;gap:8px;padding:5px 6px;border-radius:5px;font-size:13px" onmouseover="this.style.background='var(--bg2,rgba(0,0,0,0.04))'" onmouseout="this.style.background=''">
+                        <input type="checkbox" ${checked} onchange="toggleDoc('${relEnc}','${e.type}')" style="width:auto;margin:0;cursor:pointer">
+                        ${nameCell}
+                        ${size}
+                    </div>`;
+        }).join('');
+    }
+
+    function toggleDoc(relEnc, type) {
+        const rel = decodeURIComponent(relEnc);
+        if (docsState.selected.has(rel)) docsState.selected.delete(rel);
+        else docsState.selected.set(rel, type);
+        renderDocsSelected();
+    }
+
+    function renderDocsSelected() {
+        const wrap = document.getElementById('docsSelected');
+        document.getElementById('docsSelCount').textContent = docsState.selected.size;
+        if (!docsState.selected.size) { wrap.innerHTML = '<span style="color:var(--text2);font-size:12px">Nessuno</span>'; return; }
+        wrap.innerHTML = [...docsState.selected.entries()].map(([rel, type]) =>
+            `<span style="display:inline-flex;align-items:center;gap:4px;background:var(--bg,rgba(0,0,0,0.05));border:1px solid var(--border);border-radius:12px;padding:2px 8px;font-size:12px">
+                ${type === 'dir' ? '📁' : '📄'} ${escHtml(rel)}
+                <a href="#" onclick="toggleDoc('${encodeURIComponent(rel)}','${type}');return false" style="color:var(--text2);text-decoration:none;font-weight:700">×</a>
+            </span>`
+        ).join('');
+    }
+
+    async function saveDocs() {
+        const doc_files = [...docsState.selected.entries()].map(([path, type]) => ({ path, type }));
+        const lane = boardData.swimlanes.find(l => l.id === docsState.laneId);
+        if (lane) lane.doc_files = doc_files;
+        await api('update_swimlane', { id: docsState.laneId, doc_files });
+        render();
+        closeDocsModal();
+    }
+
+    function fmtBytes(n) {
+        n = n || 0;
+        if (n < 1024) return n + ' B';
+        if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+        return (n / 1024 / 1024).toFixed(1) + ' MB';
     }
 
     // === CARDS ===
@@ -2450,10 +2915,231 @@ $dataJson = json_encode($data);
     }
 
     // === THEME ===
+    const THEME_KEYS = ['bg','bg2','bg3','text','text2','border','accent','accent2','high','medium','low','shadow'];
+    const THEME_LAYOUT_KEYS = ['radius','card-radius','card-pad','gap','col-min','cell-pad','font-base','header-pad','blur'];
+    const THEME_SURFACE_KEYS = ['header-bg','header-text','swimlane-bg','colhead-bg','card-bg'];
+    let customThemes = []; // [{file,name,author,description,dark,colors,layout,surfaces,css}]
+
     function toggleTheme() {
-        const isDark = document.body.classList.toggle('dark');
-        boardData.config.theme = isDark ? 'dark' : 'light';
+        // Toggle strictly between the two built-in themes (clears any custom).
+        const next = (boardData.config.theme === 'dark' && !boardData.config.theme_file) ? 'light' : 'dark';
+        onThemeSelect(next);
+    }
+
+    // Apply a theme by id: 'light' | 'dark' | 'file:<slug>'
+    function applyThemeById(id) {
+        const styleEl = document.getElementById('customThemeStyle');
+        if (id === 'light' || id === 'dark') {
+            styleEl.textContent = '';
+            document.body.classList.toggle('dark', id === 'dark');
+        } else if (id.startsWith('file:')) {
+            const slug = id.slice(5);
+            const t = customThemes.find(x => x.file === slug);
+            if (!t) { applyThemeById('light'); return; }
+            document.body.classList.remove('dark'); // custom supplies all vars
+            styleEl.textContent = themeToCss(t);
+        }
+    }
+
+    function themeToCss(t) {
+        const colors = t.colors || {}, layout = t.layout || {}, surfaces = t.surfaces || {};
+        const decls = [];
+        THEME_KEYS.forEach(k => { if (colors[k]) decls.push(`--${k}:${colors[k]}`); });
+        THEME_LAYOUT_KEYS.forEach(k => { if (layout[k]) decls.push(`--${k}:${layout[k]}`); });
+        THEME_SURFACE_KEYS.forEach(k => { if (surfaces[k]) decls.push(`--${k}:${surfaces[k]}`); });
+        let css = decls.length ? `:root{${decls.join(';')}}` : '';
+        if (t.css) css += '\n' + String(t.css).replace(/<\/style/gi, '');
+        return css;
+    }
+
+    function currentThemeId() {
+        return boardData.config.theme_file ? ('file:' + boardData.config.theme_file) : (boardData.config.theme || 'light');
+    }
+
+    function onThemeSelect(id) {
+        applyThemeById(id);
+        if (id.startsWith('file:')) {
+            boardData.config.theme_file = id.slice(5);
+            const t = customThemes.find(x => x.file === boardData.config.theme_file);
+            boardData.config.theme = (t && t.dark) ? 'dark' : 'light';
+        } else {
+            boardData.config.theme_file = '';
+            boardData.config.theme = id;
+        }
+        syncThemeSelect();
         api('save_config', boardData.config);
+    }
+
+    function syncThemeSelect() {
+        const sel = document.getElementById('themeSelect');
+        if (sel) sel.value = currentThemeId();
+    }
+
+    function populateThemeSelect() {
+        const sel = document.getElementById('themeSelect');
+        if (!sel) return;
+        const opts = ['<option value="light">☀️ Light</option>', '<option value="dark">🌙 Dark</option>'];
+        customThemes.forEach(t => {
+            opts.push(`<option value="file:${t.file}">${t.dark ? '🌘' : '🎨'} ${escHtml(t.name)}</option>`);
+        });
+        sel.innerHTML = opts.join('');
+        syncThemeSelect();
+    }
+
+    async function loadThemes() {
+        const res = await api('list_themes');
+        customThemes = (res && res.themes) ? res.themes : [];
+        populateThemeSelect();
+    }
+
+    function openThemesModal() {
+        renderThemesList();
+        document.getElementById('themesModal').classList.add('active');
+    }
+    function closeThemesModal() {
+        document.getElementById('themesModal').classList.remove('active');
+    }
+
+    function renderThemesList() {
+        const box = document.getElementById('themesList');
+        if (!customThemes.length) {
+            box.innerHTML = '<div style="color:var(--text2);font-size:13px">Nessun tema personalizzato ancora.</div>';
+            return;
+        }
+        box.innerHTML = customThemes.map(t => {
+            const swatches = ['bg','bg2','accent','accent2','high','low']
+                .map(k => `<span title="${k}" style="width:16px;height:16px;border-radius:3px;border:1px solid rgba(128,128,128,.4);background:${t.colors[k] || 'transparent'}"></span>`).join('');
+            const active = currentThemeId() === ('file:' + t.file);
+            return `<div style="display:flex;align-items:center;gap:10px;border:1px solid var(--border);border-radius:8px;padding:8px 10px;margin-bottom:6px">
+                        <div style="display:flex;gap:3px">${swatches}</div>
+                        <div style="flex:1">
+                            <div style="font-weight:600;font-size:13px">${escHtml(t.name)} ${t.dark ? '🌘' : ''} ${active ? '<span style="color:var(--accent);font-size:11px">• attivo</span>' : ''}</div>
+                            <div style="font-size:11px;color:var(--text2)">${escHtml(t.author || '—')}${t.description ? ' · ' + escHtml(t.description) : ''}</div>
+                        </div>
+                        <button class="btn" onclick="onThemeSelect('file:${t.file}');renderThemesList()">Applica</button>
+                        <button class="btn btn-danger" onclick="deleteTheme('${t.file}')" title="Elimina">✕</button>
+                    </div>`;
+        }).join('');
+    }
+
+    async function saveThemeFromInput() {
+        const raw = document.getElementById('themeJsonInput').value.trim();
+        if (!raw) { toast('Incolla il JSON del tema', 'error'); return; }
+        let parsed;
+        try { parsed = JSON.parse(raw); } catch (e) { toast('JSON non valido: ' + e.message, 'error'); return; }
+        const res = await api('save_theme', { theme: parsed });
+        if (!res.success) return;
+        document.getElementById('themeJsonInput').value = '';
+        await loadThemes();
+        renderThemesList();
+        toast('Tema salvato', 'success');
+    }
+
+    function uploadThemeFile(ev) {
+        const file = ev.target.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = () => {
+            document.getElementById('themeJsonInput').value = reader.result;
+            saveThemeFromInput();
+        };
+        reader.readAsText(file);
+        ev.target.value = '';
+    }
+
+    async function deleteTheme(fileSlug) {
+        if (!confirm('Eliminare questo tema?')) return;
+        if (boardData.config.theme_file === fileSlug) onThemeSelect('light');
+        await api('delete_theme', { file: fileSlug });
+        await loadThemes();
+        renderThemesList();
+    }
+
+    function currentColors() {
+        // Read the effective computed CSS variables → a colors object.
+        const cs = getComputedStyle(document.body);
+        const colors = {};
+        THEME_KEYS.forEach(k => { colors[k] = cs.getPropertyValue('--' + k).trim(); });
+        return colors;
+    }
+
+    function currentLayout() {
+        const cs = getComputedStyle(document.body);
+        const layout = {};
+        THEME_LAYOUT_KEYS.forEach(k => { layout[k] = cs.getPropertyValue('--' + k).trim(); });
+        return layout;
+    }
+
+    function copyCurrentTheme() {
+        const theme = {
+            name: (boardData.config.project_name || 'My') + ' theme',
+            author: 'me', description: '', dark: document.body.classList.contains('dark'),
+            colors: currentColors(), layout: currentLayout()
+        };
+        navigator.clipboard.writeText(JSON.stringify(theme, null, 2))
+            .then(() => toast('Tema attuale copiato', 'success'))
+            .catch(() => toast('Copia non riuscita', 'error'));
+    }
+
+    function copyThemeSpec() {
+        const spec = `Create a full theme for a Kanban board as a JSON object with EXACTLY this shape.
+It controls BOTH colors AND layout dimensions (density, shapes, spacing).
+
+{
+  "name": "Theme name",
+  "author": "who made it",
+  "description": "one line",
+  "dark": true,
+  "colors": {
+    "bg":      "#RRGGBB",   // app background (page)
+    "bg2":     "#RRGGBB",   // header / swimlane / column bars
+    "bg3":     "#RRGGBB",   // cards, modals, panels (raised surfaces) — may be rgba() for glass
+    "text":    "#RRGGBB",   // primary text
+    "text2":   "#RRGGBB",   // secondary / muted text
+    "border":  "#RRGGBB",   // borders & dividers
+    "accent":  "#RRGGBB",   // primary accent (buttons, links, focus)
+    "accent2": "#RRGGBB",   // accent hover / stronger accent
+    "high":    "#RRGGBB",   // high priority (red-ish)
+    "medium":  "#RRGGBB",   // medium priority (amber-ish)
+    "low":     "#RRGGBB",   // low priority (green-ish)
+    "shadow":  "0 1px 3px rgba(0,0,0,0.3)"  // full CSS box-shadow value
+  },
+  "layout": {
+    "radius":      "8px",       // corners of swimlanes/modals/panels
+    "card-radius": "6px",       // corners of task cards (big = rounded, 0 = square)
+    "card-pad":    "10px",      // inner padding of cards (small = dense)
+    "gap":         "8px",       // vertical space between cards
+    "col-min":     "280px",     // column width → density (e.g. 200px dense, 340px roomy)
+    "cell-pad":    "8px",       // padding inside a column body
+    "font-base":   "13px",      // base font size (11px compact, 15px large)
+    "header-pad":  "12px 20px", // top header padding
+    "blur":        "0px"        // backdrop blur for glassmorphism (e.g. 12px). If >0, make bg3 an rgba() with alpha ~0.5
+  },
+  "surfaces": {                 // OPTIONAL. Any of these may be a gradient/image, not just a color.
+    "header-bg":   "linear-gradient(135deg,#5b2be0,#c026d3)", // top app bar background
+    "header-text": "#ffffff",   // text/icons color inside the top app bar
+    "swimlane-bg": "linear-gradient(90deg,#1e293b,#334155)",  // the project (swimlane) bar
+    "colhead-bg":  "#1e293b",   // the column-titles row (To Do / In Progress …)
+    "card-bg":     "#1c2233"    // task cards (can be an rgba() for glass)
+  },
+  "css": ""                     // OPTIONAL escape hatch: raw CSS injected verbatim for full control.
+}
+
+Selectors you can target in "css": .header, .swimlane-header, .column-header-row,
+.column-header, .cell, .card, .card:hover, .btn, .btn-primary, .column-count, .card-title.
+
+Rules:
+- "dark": true if the background is dark, false if light.
+- Ensure strong contrast: text on bg, bg2 and bg3 must be easily readable (WCAG AA).
+- "colors" is required in full. "layout", "surfaces" and "css" are optional.
+- Use "surfaces" for BOLD headers with gradients (header-bg / swimlane-bg / colhead-bg). If a header
+  gets a dark gradient, set "header-text" to a light color for contrast.
+- "css" lets you add glows, borders, hover effects, custom fonts, etc. Keep it valid CSS only.
+- For glass: set "blur" ~12px and "card-bg"/"bg3" to an rgba() like "rgba(255,255,255,0.08)".
+- Output ONLY the JSON, no markdown, no comments.`;
+        navigator.clipboard.writeText(spec)
+            .then(() => toast('Spec copiata — incollala in qualsiasi AI', 'success'))
+            .catch(() => toast('Copia non riuscita', 'error'));
     }
 
     // === PANELS ===
@@ -2818,6 +3504,7 @@ $dataJson = json_encode($data);
 
     // === INIT ===
     render();
+    loadThemes(); // populate the theme switcher (built-ins + custom files)
 
     // Enter key for Gemini custom input
     document.getElementById('geminiCustom').addEventListener('keypress', (e) => {
@@ -3198,6 +3885,18 @@ $dataJson = json_encode($data);
             <div class="changelog-header">
                 <span class="changelog-title">_Ykan Changelog</span>
                 <button class="changelog-close" onclick="toggleChangelog()">&times;</button>
+            </div>
+
+            <div class="changelog-version">
+                <h3>v1.8.0 - July 2026</h3>
+                <ul>
+                    <li>🎨 <strong>Custom Themes</strong> - JSON themes in <code>themes/</code> with a live switcher on top of light/dark</li>
+                    <li>🖌️ <strong>Theme editor</strong> - create, save and delete themes; override colors, layout density/shape and surfaces (gradients, glass)</li>
+                    <li>📄 <strong>Theme template</strong> - documented <code>_TEMPLATE.jsonc</code> reference for humans & AIs</li>
+                    <li>📱 <strong>MCP remote control</strong> - manage the board and edit project files from the Claude mobile app via <code>mcp.php</code></li>
+                    <li>🔗 <strong>Projects</strong> - link swimlanes to project folders and browse their files safely</li>
+                    <li>🔐 <strong>.env config</strong> - <code>mcp.php</code> now reads <code>MCP_SECRET</code>/<code>MCP_ROOT</code> from <code>.env</code> instead of hardcoded constants</li>
+                </ul>
             </div>
 
             <div class="changelog-version">
