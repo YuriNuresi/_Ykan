@@ -2255,6 +2255,7 @@ $dataJson = json_encode($data);
                     <div class="swimlane-header" onclick="toggleSwimlane('${lane.id}', event)">
                         <span class="swimlane-toggle">▼</span>
                         <input class="swimlane-name" value="${escHtml(lane.name)}" onchange="updateSwimlane('${lane.id}', this.value)" onclick="event.stopPropagation()">
+                        ${safeUrl(lane.url) ? `<a class="swimlane-url" href="${escHtml(safeUrl(lane.url))}" target="_blank" rel="noopener noreferrer" title="Open project: ${escHtml(safeUrl(lane.url))}" onclick="event.stopPropagation()" style="text-decoration:none;font-size:13px">🌐</a>` : ''}
                         ${lane.path ? `<span class="swimlane-link" title="Linked to folder: ${escHtml(lane.path)}" onclick="event.stopPropagation();openProjectsModal()" style="cursor:pointer;font-size:13px">🔗</span>` : ''}
                         ${(lane.doc_files && lane.doc_files.length) ? `<span title="${lane.doc_files.length} file di documentazione assegnati" style="font-size:12px;cursor:pointer" onclick="event.stopPropagation();openDocsModal('${lane.id}')">📄${lane.doc_files.length}</span>` : ''}
                         <div class="swimlane-actions" onclick="event.stopPropagation()">
@@ -3489,6 +3490,16 @@ Rules:
     function escHtml(str) {
         if (!str) return '';
         return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+
+    // Normalize a user-entered project URL: add a scheme if missing, block
+    // non-http(s) schemes (e.g. javascript:) so the link is safe to render.
+    function safeUrl(str) {
+        const url = (str || '').trim();
+        if (!url) return '';
+        if (/^https?:\/\//i.test(url)) return url;
+        if (/^[a-z][a-z0-9+.-]*:/i.test(url)) return ''; // some other scheme -> reject
+        return 'https://' + url; // scheme-less -> assume https
     }
 
     function renderMarkdown(text) {
