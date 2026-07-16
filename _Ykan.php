@@ -2256,7 +2256,7 @@ $dataJson = json_encode($data);
                         <span class="swimlane-toggle">▼</span>
                         <input class="swimlane-name" value="${escHtml(lane.name)}" onchange="updateSwimlane('${lane.id}', this.value)" onclick="event.stopPropagation()">
                         ${safeUrl(lane.url) ? `<a class="swimlane-url" href="${escHtml(safeUrl(lane.url))}" target="_blank" rel="noopener noreferrer" title="Open project: ${escHtml(safeUrl(lane.url))}" onclick="event.stopPropagation()" style="text-decoration:none;font-size:13px">🌐</a>` : ''}
-                        ${lane.path ? `<span class="swimlane-link" title="Linked to folder: ${escHtml(lane.path)}" onclick="event.stopPropagation();openProjectsModal()" style="cursor:pointer;font-size:13px">🔗</span>` : ''}
+                        ${lane.path ? `<span class="swimlane-link" title="Linked to folder: ${escHtml(lane.path)}" onclick="event.stopPropagation();openProjectsModal('${lane.id}')" style="cursor:pointer;font-size:13px">🔗</span>` : ''}
                         ${(lane.doc_files && lane.doc_files.length) ? `<span title="${lane.doc_files.length} file di documentazione assegnati" style="font-size:12px;cursor:pointer" onclick="event.stopPropagation();openDocsModal('${lane.id}')">📄${lane.doc_files.length}</span>` : ''}
                         <div class="swimlane-actions" onclick="event.stopPropagation()">
                             <button class="btn btn-icon" onclick="openDocsModal('${lane.id}')" title="Documentazione del progetto (file per l'AI)">
@@ -2486,7 +2486,11 @@ $dataJson = json_encode($data);
     }
 
     // === PROJECTS (swimlane <-> hosting folder links, used by mcp.php) ===
-    function openProjectsModal() {
+    // When a laneId is given (e.g. the 🔗 in a swimlane header) the modal is
+    // scoped to that single project; with no arg (toolbar button) it shows all.
+    let projectsFilterLaneId = null;
+    function openProjectsModal(laneId) {
+        projectsFilterLaneId = laneId || null;
         renderProjectsManager();
         document.getElementById('projectsModal').classList.add('active');
     }
@@ -2497,7 +2501,8 @@ $dataJson = json_encode($data);
 
     function renderProjectsManager() {
         const container = document.getElementById('projectsManager');
-        const lanes = [...boardData.swimlanes].sort((a, b) => a.position - b.position);
+        let lanes = [...boardData.swimlanes].sort((a, b) => a.position - b.position);
+        if (projectsFilterLaneId) lanes = lanes.filter(l => l.id === projectsFilterLaneId);
         container.innerHTML = lanes.map(lane => `
             <div class="project-row" style="border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:8px">
                 <div style="font-weight:600;margin-bottom:6px">${escHtml(lane.name)} ${lane.path ? '🔗' : ''}</div>
