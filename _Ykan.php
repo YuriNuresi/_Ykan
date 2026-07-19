@@ -1658,8 +1658,7 @@ $dataJson = json_encode($data);
         .swimlane.collapsed .swimlane-toggle { transform: rotate(-90deg); }
         .swimlane.collapsed .cells-row { display: none; }
         .swimlane.collapsed .column-header-row { border-bottom: none; }
-        .swimlane-name { font-weight: 600; font-size: 14px; background: transparent; border: none; color: var(--text); }
-        .swimlane-name:focus { outline: 1px solid var(--accent); border-radius: 4px; }
+        .swimlane-name { font-weight: 600; font-size: 14px; color: var(--text); user-select: none; }
         .swimlane-actions { margin-left: auto; display: flex; gap: 4px; opacity: 0; transition: opacity 0.15s; }
         .swimlane:hover .swimlane-actions { opacity: 1; }
 
@@ -2254,10 +2253,13 @@ $dataJson = json_encode($data);
                 <div class="swimlane${index > 0 ? ' collapsed' : ''}" data-lane-id="${lane.id}">
                     <div class="swimlane-header" onclick="toggleSwimlane('${lane.id}', event)">
                         <span class="swimlane-toggle">▼</span>
-                        <input class="swimlane-name" value="${escHtml(lane.name)}" onchange="updateSwimlane('${lane.id}', this.value)" onclick="event.stopPropagation()">
+                        <span class="swimlane-name">${escHtml(lane.name)}</span>
                         ${lane.path ? `<span class="swimlane-link" title="Linked to folder: ${escHtml(lane.path)}" onclick="event.stopPropagation();openProjectsModal()" style="cursor:pointer;font-size:13px">🔗</span>` : ''}
                         ${(lane.doc_files && lane.doc_files.length) ? `<span title="${lane.doc_files.length} file di documentazione assegnati" style="font-size:12px;cursor:pointer" onclick="event.stopPropagation();openDocsModal('${lane.id}')">📄${lane.doc_files.length}</span>` : ''}
                         <div class="swimlane-actions" onclick="event.stopPropagation()">
+                            <button class="btn btn-icon" onclick="renameSwimlane('${lane.id}')" title="Rinomina">
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+                            </button>
                             <button class="btn btn-icon" onclick="openDocsModal('${lane.id}')" title="Documentazione del progetto (file per l'AI)">
                                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 11-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 11-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 11-2.83-2.83l.06-.06a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H3a2 2 0 110-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 112.83-2.83l.06.06a1.65 1.65 0 001.82.33H9a1.65 1.65 0 001-1.51V3a2 2 0 114 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 112.83 2.83l-.06.06a1.65 1.65 0 00-.33 1.82V9a1.65 1.65 0 001.51 1H21a2 2 0 110 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg>
                             </button>
@@ -2469,6 +2471,17 @@ $dataJson = json_encode($data);
         const lane = boardData.swimlanes.find(l => l.id === id);
         if (lane) lane.name = name;
         await api('update_swimlane', { id, name });
+    }
+
+    async function renameSwimlane(id) {
+        const lane = boardData.swimlanes.find(l => l.id === id);
+        if (!lane) return;
+        const name = prompt('Nome swimlane:', lane.name);
+        if (name === null) return;
+        const trimmed = name.trim();
+        if (!trimmed || trimmed === lane.name) return;
+        await updateSwimlane(id, trimmed);
+        render();
     }
 
     async function deleteSwimlane(id) {
