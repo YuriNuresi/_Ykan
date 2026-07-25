@@ -11,6 +11,7 @@ themes/*.json
 # MCP audit log & backups
 _ykan_mcp_audit.log
 .ykan_backups/
+.db_backups/
 
 # Editor / tooling
 .claude/

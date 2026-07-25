@@ -75,6 +75,19 @@ const MCP_DATA_FILE = __DIR__ . '/_Ykan_data.json';
 const MCP_MAX_READ  = 500_000;   // max bytes returned by read_file
 const MCP_MAX_WRITE = 2_000_000; // max bytes accepted by write_file
 const MCP_AUDIT_LOG = __DIR__ . '/_ykan_mcp_audit.log';
+const MCP_DB_BACKUP_DIR = __DIR__ . '/.db_backups';
+
+// DB credentials from root .env (DB_*)
+define('MCP_DB_HOST',    (string)($__env['DB_HOST']    ?? ''));
+define('MCP_DB_PORT',    (int)   ($__env['DB_PORT']    ?? 3306));
+define('MCP_DB_NAME',    (string)($__env['DB_NAME']    ?? ''));
+define('MCP_DB_USER',    (string)($__env['DB_USER']    ?? ''));
+define('MCP_DB_PASS',    (string)($__env['DB_PASS']    ?? ''));
+define('MCP_DB_CHARSET', (string)($__env['DB_CHARSET'] ?? 'utf8mb4'));
+
+// Mail settings
+define('MCP_MAIL_TO',   (string)($__env['ADMIN_EMAILS'] ?? 'yurrena@gmail.com'));
+define('MCP_MAIL_FROM', (string)($__env['SMTP_FROM']    ?? 'noreply@portale3d.it'));
 
 // ============================================================================
 // Boilerplate: headers / CORS / method routing
@@ -138,10 +151,94 @@ function mcp_id(string $prefix = 'card'): string {
     return $prefix . '_' . bin2hex(random_bytes(8));
 }
 
+// --- Short task ids (#25) ---------------------------------------------------
+// Shared with _Ykan.php via the same _Ykan_data.json: every card gets a
+// globally-progressive integer 'seq', the next value kept in config.next_seq.
+
+function mcp_max_seq(array $data): int {
+    $max = 0;
+    foreach (($data['cards'] ?? []) as $c) {
+        if (isset($c['seq']) && (int)$c['seq'] > $max) $max = (int)$c['seq'];
+    }
+    return $max;
+}
+
+/** Reserve and return the next short id, initialising the counter if needed. */
+function mcp_alloc_seq(array &$data): int {
+    if (!isset($data['config']['next_seq'])) {
+        $data['config']['next_seq'] = mcp_max_seq($data) + 1;
+    }
+    $seq = (int)$data['config']['next_seq'];
+    $data['config']['next_seq'] = $seq + 1;
+    return $seq;
+}
+
+/** Give every card missing a 'seq' one. Returns true if anything changed. */
+function mcp_ensure_seq(array &$data): bool {
+    $changed = false;
+    $max = mcp_max_seq($data);
+    // (Re)initialise the counter if it is missing, corrupt (<= max), or no card
+    // is numbered yet (fresh rollout) — the last case restarts cleanly from #1.
+    if (!isset($data['config']['next_seq']) || (int)$data['config']['next_seq'] <= $max || $max === 0) {
+        $data['config']['next_seq'] = $max + 1;
+        $changed = true;
+    }
+    foreach (array_keys($data['cards'] ?? []) as $i) {
+        if (!isset($data['cards'][$i]['seq']) || !is_int($data['cards'][$i]['seq'])) {
+            $data['cards'][$i]['seq'] = mcp_alloc_seq($data);
+            $changed = true;
+        }
+    }
+    return $changed;
+}
+
+/** Locate an active card by short id (#25 / 25) or title (partial). Returns array index or null. */
+function mcp_find_card_index(array $data, string $needle, ?array $filter): ?int {
+    $needle = trim($needle);
+    $bySeq = preg_match('/^#?(\d+)$/', $needle, $m) ? (int)$m[1] : null;
+    foreach (($data['cards'] ?? []) as $i => $c) {
+        if (!empty($c['archived'])) continue;
+        if ($filter && ($c['swimlane_id'] ?? '') !== $filter['id']) continue;
+        if ($bySeq !== null) {
+            if ((int)($c['seq'] ?? 0) === $bySeq) return $i;
+        } elseif ($needle !== '' && stripos($c['title'], $needle) !== false) {
+            return $i;
+        }
+    }
+    return null;
+}
+
 function mcp_audit(string $tool, array $info): void {
     $line = date('c') . "\t" . ($_SERVER['REMOTE_ADDR'] ?? '?') . "\t" . $tool
           . "\t" . json_encode($info, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) . "\n";
     @file_put_contents(MCP_AUDIT_LOG, $line, FILE_APPEND);
+}
+
+// ---- Database (lazy singleton) -------------------------------------------------
+function mcp_pdo(): PDO {
+    static $pdo = null;
+    if ($pdo) return $pdo;
+    if (MCP_DB_HOST === '' || MCP_DB_NAME === '') {
+        throw new McpError('Database not configured (DB_HOST / DB_NAME missing from .env).');
+    }
+    $dsn = 'mysql:host=' . MCP_DB_HOST . ';port=' . MCP_DB_PORT
+         . ';dbname=' . MCP_DB_NAME . ';charset=' . MCP_DB_CHARSET;
+    $pdo = new PDO($dsn, MCP_DB_USER, MCP_DB_PASS, [
+        PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
+        PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+        PDO::ATTR_EMULATE_PREPARES   => false,
+    ]);
+    return $pdo;
+}
+
+// ---- Mailer (riuso pattern Faro: mail() di PHP) --------------------------------
+function mcp_send_mail(string $to, string $subject, string $html): array {
+    $subjectEnc = '=?UTF-8?B?' . base64_encode($subject) . '?=';
+    $headers  = 'From: Ykan <' . MCP_MAIL_FROM . ">\r\n";
+    $headers .= "MIME-Version: 1.0\r\n";
+    $headers .= "Content-Type: text/html; charset=utf-8\r\n";
+    $ok = @mail($to, $subjectEnc, $html, $headers, '-f' . MCP_MAIL_FROM);
+    return [$ok, $ok ? 'inviata con mail()' : 'mail() ha restituito false'];
 }
 
 // ---- Swimlane (= project) lookup ---------------------------------------------
@@ -244,10 +341,19 @@ function mcp_tool_defs(): array {
         ],
         [
             'name' => 'list_tasks',
-            'description' => 'List active tasks, optionally filtered by project and/or column.',
+            'description' => 'List active tasks (each prefixed with its short id, e.g. #25), optionally filtered by project and/or column.',
             'inputSchema' => ['type' => 'object', 'properties' => [
                 'project' => $projectArg,
                 'column'  => ['type' => 'string', 'description' => 'Column name filter (partial match).'],
+            ]],
+        ],
+        [
+            'name' => 'get_task',
+            'description' => 'Get the full details of one task (title, project, column, priority, files, description) by its short id like "25" (or "#25"), or by title.',
+            'inputSchema' => ['type' => 'object', 'properties' => [
+                'id'      => ['type' => 'string', 'description' => 'Short task id, e.g. "25" or "#25".'],
+                'title'   => ['type' => 'string', 'description' => 'Task title (partial match) — use if you do not have the id.'],
+                'project' => $projectArg,
             ]],
         ],
         [
@@ -259,24 +365,27 @@ function mcp_tool_defs(): array {
                 'description' => ['type' => 'string', 'description' => 'Task details (optional).'],
                 'priority'    => ['type' => 'string', 'enum' => ['high', 'medium', 'low']],
                 'column'      => ['type' => 'string', 'description' => 'Target column name (optional, partial match).'],
+                'label'       => ['type' => 'string', 'description' => 'Label name (optional, partial match, e.g. "Claude", "Bug").'],
             ], 'required' => ['project', 'title']],
         ],
         [
             'name' => 'move_task',
-            'description' => 'Move a task (matched by title) to another column.',
+            'description' => 'Move a task to another column. Match it by short id (e.g. "25") or by title.',
             'inputSchema' => ['type' => 'object', 'properties' => [
-                'title'   => ['type' => 'string', 'description' => 'Task title (partial match).'],
+                'id'      => ['type' => 'string', 'description' => 'Short task id, e.g. "25" or "#25".'],
+                'title'   => ['type' => 'string', 'description' => 'Task title (partial match) — use if you do not have the id.'],
                 'column'  => ['type' => 'string', 'description' => 'Destination column name (partial match).'],
                 'project' => $projectArg,
-            ], 'required' => ['title', 'column']],
+            ], 'required' => ['column']],
         ],
         [
             'name' => 'complete_task',
-            'description' => 'Complete (archive) a task matched by title. Honors auto-regenerate tasks.',
+            'description' => 'Complete (archive) a task, matched by short id (e.g. "25") or by title. Honors auto-regenerate tasks.',
             'inputSchema' => ['type' => 'object', 'properties' => [
-                'title'   => ['type' => 'string', 'description' => 'Task title (partial match).'],
+                'id'      => ['type' => 'string', 'description' => 'Short task id, e.g. "25" or "#25".'],
+                'title'   => ['type' => 'string', 'description' => 'Task title (partial match) — use if you do not have the id.'],
                 'project' => $projectArg,
-            ], 'required' => ['title']],
+            ]],
         ],
         // -------- Phase 2: Files (scoped to a linked project folder) --------
         [
@@ -325,12 +434,58 @@ function mcp_tool_defs(): array {
                 'max_results' => ['type' => 'integer', 'description' => 'Max matches to return (default 50).'],
             ], 'required' => ['project', 'query']],
         ],
+        // -------- Phase 0: Database --------
+        [
+            'name' => 'db_list_tables',
+            'description' => 'List all tables in the MySQL database, with row counts.',
+            'inputSchema' => ['type' => 'object', 'properties' => (object)[]],
+        ],
+        [
+            'name' => 'db_schema',
+            'description' => 'Show the CREATE TABLE statement (schema) for a table.',
+            'inputSchema' => ['type' => 'object', 'properties' => [
+                'table' => ['type' => 'string', 'description' => 'Table name.'],
+            ], 'required' => ['table']],
+        ],
+        [
+            'name' => 'db_query',
+            'description' => 'Run a read-only SELECT query. Returns up to 200 rows as formatted text.',
+            'inputSchema' => ['type' => 'object', 'properties' => [
+                'sql'   => ['type' => 'string', 'description' => 'SELECT query to execute.'],
+                'limit' => ['type' => 'integer', 'description' => 'Max rows (default 200, max 1000).'],
+            ], 'required' => ['sql']],
+        ],
+        [
+            'name' => 'db_exec',
+            'description' => 'Execute a write query (INSERT, UPDATE, DELETE, ALTER, etc.). ALWAYS call db_dump_table on affected tables before a batch of writes.',
+            'inputSchema' => ['type' => 'object', 'properties' => [
+                'sql' => ['type' => 'string', 'description' => 'SQL statement to execute.'],
+            ], 'required' => ['sql']],
+        ],
+        [
+            'name' => 'db_dump_table',
+            'description' => 'Backup a single table to a SQL dump file in ykan/.db_backups/. Call this BEFORE any batch of write operations on that table.',
+            'inputSchema' => ['type' => 'object', 'properties' => [
+                'table' => ['type' => 'string', 'description' => 'Table name to backup.'],
+            ], 'required' => ['table']],
+        ],
+        // -------- Phase 0: Mail --------
+        [
+            'name' => 'send_digest_mail',
+            'description' => 'Send an HTML email digest/report to the admin (yurrena@gmail.com). Used by the nightly routine to send the task summary.',
+            'inputSchema' => ['type' => 'object', 'properties' => [
+                'subject' => ['type' => 'string', 'description' => 'Email subject line.'],
+                'html'    => ['type' => 'string', 'description' => 'HTML body content.'],
+            ], 'required' => ['subject', 'html']],
+        ],
     ];
 }
 
 /** Execute a tool. Returns a plain-text result string. Throws McpError on failure. */
 function mcp_run_tool(string $name, array $a): string {
     $data = mcp_load();
+    // One-off backfill of short ids for boards created before them.
+    if ($data && mcp_ensure_seq($data)) mcp_save($data);
 
     switch ($name) {
 
@@ -390,7 +545,8 @@ function mcp_run_tool(string $name, array $a): string {
                 $col = $cols[$c['column_id'] ?? ''] ?? '?';
                 if ($colName !== '' && stripos($col, $colName) === false) continue;
                 $lane = $lanes[$c['swimlane_id'] ?? ''] ?? '';
-                $rows[] = "- [$col] {$c['title']} (" . ($c['priority'] ?? 'medium') . ($filter ? '' : ", @$lane") . ')';
+                $sid = isset($c['seq']) ? '#' . $c['seq'] . ' ' : '';
+                $rows[] = "- {$sid}[$col] {$c['title']} (" . ($c['priority'] ?? 'medium') . ($filter ? '' : ", @$lane") . ')';
             }
             return $rows ? implode("\n", $rows) : 'No matching tasks.';
         }
@@ -409,23 +565,31 @@ function mcp_run_tool(string $name, array $a): string {
             }
             $priority = in_array($a['priority'] ?? 'medium', ['high', 'medium', 'low'], true) ? $a['priority'] : 'medium';
 
+            $labelId = null;
+            if (!empty($a['label'])) {
+                foreach (($data['labels'] ?? []) as $lbl) {
+                    if (stripos($lbl['name'], (string)$a['label']) !== false) { $labelId = $lbl['id']; break; }
+                }
+            }
+
+            $seq = mcp_alloc_seq($data);
             $card = [
-                'id' => mcp_id('card'), 'title' => $title,
+                'id' => mcp_id('card'), 'seq' => $seq, 'title' => $title,
                 'description' => (string)($a['description'] ?? ''),
                 'priority' => $priority, 'due_date' => null, 'next_check' => null,
-                'label_id' => null, 'column_id' => $colId, 'swimlane_id' => $lane['id'],
+                'label_id' => $labelId, 'column_id' => $colId, 'swimlane_id' => $lane['id'],
                 'archived' => false, 'auto_regenerate' => false, 'regenerate_delay_days' => 0,
                 'files' => [], 'position' => 0,
                 'created_at' => date('Y-m-d H:i:s'), 'regenerated_count' => 0,
             ];
             $data['cards'][] = $card;
             mcp_save($data);
-            mcp_audit('add_task', ['project' => $lane['name'], 'title' => $title]);
-            return "Added task '$title' to project '{$lane['name']}'.";
+            mcp_audit('add_task', ['project' => $lane['name'], 'title' => $title, 'seq' => $seq]);
+            return "Added task #$seq '$title' to project '{$lane['name']}'.";
         }
 
         case 'move_task': {
-            $title = trim((string)($a['title'] ?? ''));
+            $needle = trim((string)($a['id'] ?? $a['title'] ?? ''));
             $colName = trim((string)($a['column'] ?? ''));
             $filter = isset($a['project']) ? mcp_find_lane($data, $a['project']) : null;
             $target = null;
@@ -433,49 +597,63 @@ function mcp_run_tool(string $name, array $a): string {
                 if (stripos($col['name'], $colName) !== false) { $target = $col; break; }
             }
             if (!$target) throw new McpError("Column '$colName' not found. Available: " . implode(', ', array_column($data['columns'] ?? [], 'name')));
-            foreach ($data['cards'] as &$c) {
-                if (!empty($c['archived'])) continue;
-                if ($filter && ($c['swimlane_id'] ?? '') !== $filter['id']) continue;
-                if (stripos($c['title'], $title) !== false) {
-                    $c['column_id'] = $target['id'];
-                    mcp_save($data);
-                    mcp_audit('move_task', ['title' => $c['title'], 'column' => $target['name']]);
-                    return "Moved '{$c['title']}' to '{$target['name']}'.";
-                }
-            }
-            throw new McpError("Task '$title' not found.");
+            $i = mcp_find_card_index($data, $needle, $filter);
+            if ($i === null) throw new McpError("Task '$needle' not found.");
+            $data['cards'][$i]['column_id'] = $target['id'];
+            mcp_save($data);
+            $c = $data['cards'][$i];
+            mcp_audit('move_task', ['seq' => $c['seq'] ?? null, 'title' => $c['title'], 'column' => $target['name']]);
+            return 'Moved #' . ($c['seq'] ?? '?') . " '{$c['title']}' to '{$target['name']}'.";
         }
 
         case 'complete_task': {
-            $title = trim((string)($a['title'] ?? ''));
+            $needle = trim((string)($a['id'] ?? $a['title'] ?? ''));
             $filter = isset($a['project']) ? mcp_find_lane($data, $a['project']) : null;
-            foreach ($data['cards'] as &$c) {
-                if (!empty($c['archived'])) continue;
-                if ($filter && ($c['swimlane_id'] ?? '') !== $filter['id']) continue;
-                if (stripos($c['title'], $title) !== false) {
-                    $c['archived'] = true;
-                    $c['archived_at'] = date('Y-m-d H:i:s');
-                    $msg = "Completed and archived '{$c['title']}'.";
-                    if (!empty($c['auto_regenerate'])) {
-                        $delay = (int)($c['regenerate_delay_days'] ?? 0);
-                        $due = $delay > 0 ? date('Y-m-d', strtotime("+$delay days")) : null;
-                        $data['cards'][] = [
-                            'id' => mcp_id('card'), 'title' => $c['title'],
-                            'description' => $c['description'] ?? '', 'priority' => $c['priority'] ?? 'medium',
-                            'due_date' => $due, 'next_check' => $due, 'label_id' => $c['label_id'] ?? null,
-                            'column_id' => $data['columns'][0]['id'], 'swimlane_id' => $c['swimlane_id'],
-                            'archived' => false, 'auto_regenerate' => true, 'regenerate_delay_days' => $delay,
-                            'position' => 0, 'created_at' => date('Y-m-d H:i:s'),
-                            'regenerated_count' => ($c['regenerated_count'] ?? 0) + 1, 'regenerated_from' => $c['id'],
-                        ];
-                        $msg .= ' Task auto-regenerated' . ($due ? " (due $due)" : '') . '.';
-                    }
-                    mcp_save($data);
-                    mcp_audit('complete_task', ['title' => $c['title']]);
-                    return $msg;
-                }
+            $i = mcp_find_card_index($data, $needle, $filter);
+            if ($i === null) throw new McpError("Task '$needle' not found.");
+            $c = &$data['cards'][$i];
+            $c['archived'] = true;
+            $c['archived_at'] = date('Y-m-d H:i:s');
+            $msg = 'Completed and archived #' . ($c['seq'] ?? '?') . " '{$c['title']}'.";
+            if (!empty($c['auto_regenerate'])) {
+                $delay = (int)($c['regenerate_delay_days'] ?? 0);
+                $due = $delay > 0 ? date('Y-m-d', strtotime("+$delay days")) : null;
+                $data['cards'][] = [
+                    'id' => mcp_id('card'), 'seq' => mcp_alloc_seq($data), 'title' => $c['title'],
+                    'description' => $c['description'] ?? '', 'priority' => $c['priority'] ?? 'medium',
+                    'due_date' => $due, 'next_check' => $due, 'label_id' => $c['label_id'] ?? null,
+                    'column_id' => $data['columns'][0]['id'], 'swimlane_id' => $c['swimlane_id'],
+                    'archived' => false, 'auto_regenerate' => true, 'regenerate_delay_days' => $delay,
+                    'position' => 0, 'created_at' => date('Y-m-d H:i:s'),
+                    'regenerated_count' => ($c['regenerated_count'] ?? 0) + 1, 'regenerated_from' => $c['id'],
+                ];
+                $msg .= ' Task auto-regenerated' . ($due ? " (due $due)" : '') . '.';
             }
-            throw new McpError("Task '$title' not found.");
+            unset($c);
+            mcp_save($data);
+            mcp_audit('complete_task', ['seq' => $data['cards'][$i]['seq'] ?? null, 'title' => $data['cards'][$i]['title']]);
+            return $msg;
+        }
+
+        case 'get_task': {
+            $needle = trim((string)($a['id'] ?? $a['title'] ?? ''));
+            $filter = isset($a['project']) ? mcp_find_lane($data, $a['project']) : null;
+            $i = mcp_find_card_index($data, $needle, $filter);
+            if ($i === null) throw new McpError("Task '$needle' not found.");
+            $c = $data['cards'][$i];
+            $cols  = array_column($data['columns'] ?? [], 'name', 'id');
+            $lanes = array_column($data['swimlanes'] ?? [], 'name', 'id');
+            $labels = array_column($data['labels'] ?? [], 'name', 'id');
+            $out = [];
+            $out[] = 'Task #' . ($c['seq'] ?? '?') . ': ' . $c['title'];
+            $out[] = 'Project: ' . ($lanes[$c['swimlane_id'] ?? ''] ?? '?');
+            $out[] = 'Column: ' . ($cols[$c['column_id'] ?? ''] ?? '?') . '   Priority: ' . ($c['priority'] ?? 'medium');
+            if (!empty($c['label_id'])) $out[] = 'Label: ' . ($labels[$c['label_id']] ?? '?');
+            if (!empty($c['due_date'])) $out[] = 'Due: ' . $c['due_date'];
+            if (!empty($c['files'])) $out[] = 'Files: ' . implode(', ', array_map(fn($f) => is_array($f) ? ($f['path'] ?? '') : $f, $c['files']));
+            $out[] = '';
+            $out[] = trim((string)($c['description'] ?? '')) !== '' ? $c['description'] : '(no description)';
+            return implode("\n", $out);
         }
 
         // ---------------- Phase 2 ----------------
@@ -569,6 +747,115 @@ function mcp_run_tool(string $name, array $a): string {
                 }
             }
             return $hits ? implode("\n", $hits) : "No matches for '$query'.";
+        }
+        // ---------------- Phase 0: Database ----------------
+        case 'db_list_tables': {
+            $pdo = mcp_pdo();
+            $tables = $pdo->query("SHOW TABLES")->fetchAll(PDO::FETCH_COLUMN);
+            if (!$tables) return 'No tables found.';
+            $out = [];
+            foreach ($tables as $t) {
+                $row = $pdo->query("SELECT COUNT(*) AS c FROM `" . str_replace('`', '``', $t) . "`")->fetch();
+                $out[] = sprintf('- %s (%s rows)', $t, number_format((int)$row['c']));
+            }
+            return "Tables in " . MCP_DB_NAME . ":\n" . implode("\n", $out);
+        }
+
+        case 'db_schema': {
+            $table = trim((string)($a['table'] ?? ''));
+            if ($table === '') throw new McpError('table is required.');
+            $pdo = mcp_pdo();
+            $stmt = $pdo->query("SHOW CREATE TABLE `" . str_replace('`', '``', $table) . "`");
+            $row = $stmt->fetch();
+            if (!$row) throw new McpError("Table '$table' not found.");
+            return $row['Create Table'] ?? $row[array_keys($row)[1]] ?? 'No schema.';
+        }
+
+        case 'db_query': {
+            $sql = trim((string)($a['sql'] ?? ''));
+            if ($sql === '') throw new McpError('sql is required.');
+            if (!preg_match('/^\s*(SELECT|SHOW|DESCRIBE|DESC|EXPLAIN)\b/i', $sql)) {
+                throw new McpError('db_query allows only SELECT / SHOW / DESCRIBE / EXPLAIN. Use db_exec for writes.');
+            }
+            $limit = max(1, min(1000, (int)($a['limit'] ?? 200)));
+            if (!preg_match('/\bLIMIT\s+\d/i', $sql)) {
+                $sql = rtrim($sql, "; \t\n\r") . " LIMIT $limit";
+            }
+            $pdo = mcp_pdo();
+            $stmt = $pdo->query($sql);
+            $rows = $stmt->fetchAll();
+            if (!$rows) return '(no rows)';
+            $cols = array_keys($rows[0]);
+            $lines = [implode("\t", $cols)];
+            foreach ($rows as $r) {
+                $vals = [];
+                foreach ($cols as $c) $vals[] = $r[$c] === null ? 'NULL' : (string)$r[$c];
+                $lines[] = implode("\t", $vals);
+            }
+            $result = implode("\n", $lines);
+            if (strlen($result) > 100_000) $result = substr($result, 0, 100_000) . "\n... (truncated)";
+            mcp_audit('db_query', ['sql' => substr($sql, 0, 500), 'rows' => count($rows)]);
+            return $result;
+        }
+
+        case 'db_exec': {
+            $sql = trim((string)($a['sql'] ?? ''));
+            if ($sql === '') throw new McpError('sql is required.');
+            if (preg_match('/^\s*(SELECT|SHOW|DESCRIBE|DESC|EXPLAIN)\b/i', $sql)) {
+                throw new McpError('Use db_query for read queries, not db_exec.');
+            }
+            $pdo = mcp_pdo();
+            $affected = $pdo->exec($sql);
+            mcp_audit('db_exec', ['sql' => substr($sql, 0, 500), 'affected' => $affected]);
+            return "Executed. Rows affected: $affected";
+        }
+
+        case 'db_dump_table': {
+            $table = trim((string)($a['table'] ?? ''));
+            if ($table === '') throw new McpError('table is required.');
+            $safeTable = str_replace('`', '``', $table);
+            $pdo = mcp_pdo();
+            // Verify table exists
+            $check = $pdo->query("SHOW TABLES LIKE " . $pdo->quote($table))->fetch();
+            if (!$check) throw new McpError("Table '$table' not found.");
+            // Get CREATE TABLE
+            $create = $pdo->query("SHOW CREATE TABLE `$safeTable`")->fetch();
+            $createSql = $create['Create Table'] ?? $create[array_keys($create)[1]] ?? '';
+            // Dump rows
+            $rows = $pdo->query("SELECT * FROM `$safeTable`")->fetchAll();
+            $dump = "-- Backup of `$table` — " . date('Y-m-d H:i:s') . "\n";
+            $dump .= "-- Rows: " . count($rows) . "\n\n";
+            $dump .= "DROP TABLE IF EXISTS `$safeTable`;\n$createSql;\n\n";
+            if ($rows) {
+                $cols = array_keys($rows[0]);
+                $colList = implode(', ', array_map(fn($c) => "`" . str_replace('`', '``', $c) . "`", $cols));
+                foreach ($rows as $r) {
+                    $vals = [];
+                    foreach ($cols as $c) {
+                        $vals[] = $r[$c] === null ? 'NULL' : $pdo->quote((string)$r[$c]);
+                    }
+                    $dump .= "INSERT INTO `$safeTable` ($colList) VALUES (" . implode(', ', $vals) . ");\n";
+                }
+            }
+            @mkdir(MCP_DB_BACKUP_DIR, 0775, true);
+            $file = MCP_DB_BACKUP_DIR . '/' . $table . '_' . date('Ymd-His') . '.sql';
+            if (file_put_contents($file, $dump) === false) {
+                throw new McpError('Failed to write backup file.');
+            }
+            mcp_audit('db_dump_table', ['table' => $table, 'rows' => count($rows), 'file' => basename($file)]);
+            return "Backup saved: " . basename($file) . " (" . count($rows) . " rows, " . strlen($dump) . " bytes)";
+        }
+
+        // ---------------- Phase 0: Mail ----------------
+        case 'send_digest_mail': {
+            $subject = trim((string)($a['subject'] ?? ''));
+            $html    = (string)($a['html'] ?? '');
+            if ($subject === '') throw new McpError('subject is required.');
+            if ($html === '') throw new McpError('html is required.');
+            [$ok, $info] = mcp_send_mail(MCP_MAIL_TO, $subject, $html);
+            mcp_audit('send_digest_mail', ['to' => MCP_MAIL_TO, 'subject' => $subject, 'ok' => $ok]);
+            if (!$ok) throw new McpError("Mail failed: $info");
+            return "Mail sent to " . MCP_MAIL_TO . " — subject: $subject ($info)";
         }
     }
     throw new McpError("Unknown tool: $name");

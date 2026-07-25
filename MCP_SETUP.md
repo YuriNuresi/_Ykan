@@ -29,17 +29,31 @@ ykan/
 
 `mcp.php` reads its config from a `.env` file (no more editing constants in the
 code). Create a `.env` next to `mcp.php` — or one level up in your hosting root —
-with these two keys:
+with these keys (only the first two are required):
 
 ```
 MCP_SECRET=a-long-random-string-that-is-the-password
 MCP_ROOT=/absolute/path/that/contains/your/project/folders
+
+# Optional — only needed for the db_* tools:
+DB_HOST=localhost
+DB_PORT=3306
+DB_NAME=your_database
+DB_USER=your_db_user
+DB_PASS=your_db_password
+DB_CHARSET=utf8mb4
+
+# Optional — only needed for send_digest_mail:
+ADMIN_EMAILS=you@example.com
+SMTP_FROM=noreply@yourdomain.tld
 ```
 
 | Key | What to put |
 |-----|-------------|
 | `MCP_SECRET` | A long random string. **It is the password** — the whole URL is a secret. |
 | `MCP_ROOT` | Absolute path to the folder that **contains** your project folders (usually your hosting web root). Ask OVH/your FTP client for the absolute path, e.g. `/homez.NNN/youruser/www`. |
+| `DB_*` | MySQL credentials. Required only if you use the database tools. Without them the `db_*` tools return "Database not configured". |
+| `ADMIN_EMAILS` / `SMTP_FROM` | Recipient and sender for `send_digest_mail`. Defaults are used if omitted. |
 
 A `.env` next to `mcp.php` takes precedence over one in the hosting root.
 Every project folder you link is resolved **relative to `MCP_ROOT`**.
@@ -81,10 +95,21 @@ Try, in order:
 ## Tools exposed
 
 **Board (Phase 1):** `list_projects`, `board_summary`, `list_tasks`,
-`add_task`, `move_task`, `complete_task`
+`get_task`, `add_task`, `move_task`, `complete_task`
+(tasks carry a short id like `#25`; `get_task`/`move_task`/`complete_task`
+accept either the id or a title match).
 
 **Files, scoped to a linked folder (Phase 2):** `list_files`, `read_file`,
 `edit_file`, `write_file`, `search_files`
+
+**Database (Phase 0, MySQL — needs `DB_*` in `.env`):** `db_list_tables`,
+`db_schema`, `db_query` (read-only SELECT/SHOW/DESCRIBE/EXPLAIN, auto-`LIMIT`),
+`db_exec` (writes), `db_dump_table` (SQL backup into `.db_backups/`).
+
+**Mail:** `send_digest_mail` — sends an HTML report to `ADMIN_EMAILS`.
+
+> ⚠️ `db_exec` runs arbitrary write SQL behind the single URL secret. Always
+> `db_dump_table` first, and drop the `DB_*` keys from `.env` if you don't need it.
 
 ## Safety built in
 
