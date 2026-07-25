@@ -46,6 +46,13 @@ DB_CHARSET=utf8mb4
 # Optional — only needed for send_digest_mail:
 ADMIN_EMAILS=you@example.com
 SMTP_FROM=noreply@yourdomain.tld
+
+# Optional — only needed for the OVH control-panel tools (DNS/email/hosting).
+# Create all four values in one step at https://www.ovh.com/auth/api/createToken
+OVH_ENDPOINT=ovh-eu
+OVH_APP_KEY=your_application_key
+OVH_APP_SECRET=your_application_secret
+OVH_CONSUMER_KEY=your_consumer_key
 ```
 
 | Key | What to put |
@@ -108,8 +115,20 @@ accept either the id or a title match).
 
 **Mail:** `send_digest_mail` — sends an HTML report to `ADMIN_EMAILS`.
 
+**OVH control panel (Phase 3, signed API — needs `OVH_*` in `.env`):**
+`ovh_whoami` (test the connection), `list_dns_records`, `add_dns_record`
+(creates a record and refreshes the zone), `delete_dns_record`,
+`create_email_redirect`, `list_hostings`, `attach_subdomain` (binds a
+(sub)domain to a hosting folder). A full subdomain that serves a site =
+`add_dns_record` (A/CNAME) + `attach_subdomain`.
+
 > ⚠️ `db_exec` runs arbitrary write SQL behind the single URL secret. Always
 > `db_dump_table` first, and drop the `DB_*` keys from `.env` if you don't need it.
+>
+> ⚠️ The `OVH_*` credentials let the connector modify your real DNS, email and
+> hosting. When you create the token at `createToken`, grant only the routes you
+> need (e.g. `GET/POST/DELETE /domain/zone/*`, `POST /email/domain/*/redirection`,
+> `POST /hosting/web/*/attachedDomain`, `GET /me`) — least privilege.
 
 ## Safety built in
 

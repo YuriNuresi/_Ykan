@@ -89,6 +89,13 @@ define('MCP_DB_CHARSET', (string)($__env['DB_CHARSET'] ?? 'utf8mb4'));
 define('MCP_MAIL_TO',   (string)($__env['ADMIN_EMAILS'] ?? 'yurrena@gmail.com'));
 define('MCP_MAIL_FROM', (string)($__env['SMTP_FROM']    ?? 'noreply@portale3d.it'));
 
+// OVH API credentials (from .env). Create them once at
+// https://www.ovh.com/auth/api/createToken — no setup page needed, just paste.
+define('MCP_OVH_ENDPOINT',     (string)($__env['OVH_ENDPOINT']     ?? 'ovh-eu'));
+define('MCP_OVH_APP_KEY',      (string)($__env['OVH_APP_KEY']      ?? ''));
+define('MCP_OVH_APP_SECRET',   (string)($__env['OVH_APP_SECRET']   ?? ''));
+define('MCP_OVH_CONSUMER_KEY', (string)($__env['OVH_CONSUMER_KEY'] ?? ''));
+
 // ============================================================================
 // Boilerplate: headers / CORS / method routing
 // ============================================================================
@@ -239,6 +246,74 @@ function mcp_send_mail(string $to, string $subject, string $html): array {
     $headers .= "Content-Type: text/html; charset=utf-8\r\n";
     $ok = @mail($to, $subjectEnc, $html, $headers, '-f' . MCP_MAIL_FROM);
     return [$ok, $ok ? 'inviata con mail()' : 'mail() ha restituito false'];
+}
+
+// ---- OVH API (signed REST calls) ---------------------------------------------
+// Region -> API base URL. Default ovh-eu (europe).
+function mcp_ovh_base(): string {
+    $map = [
+        'ovh-eu'        => 'https://eu.api.ovh.com/1.0',
+        'ovh-ca'        => 'https://ca.api.ovh.com/1.0',
+        'ovh-us'        => 'https://api.us.ovhcloud.com/1.0',
+        'kimsufi-eu'    => 'https://eu.api.kimsufi.com/1.0',
+        'kimsufi-ca'    => 'https://ca.api.kimsufi.com/1.0',
+        'soyoustart-eu' => 'https://eu.api.soyoustart.com/1.0',
+        'soyoustart-ca' => 'https://ca.api.soyoustart.com/1.0',
+    ];
+    return $map[MCP_OVH_ENDPOINT] ?? $map['ovh-eu'];
+}
+
+/**
+ * Perform a signed OVH API request. $path starts with '/', e.g. '/me'.
+ * Returns the decoded JSON (array/scalar) on success; throws McpError otherwise.
+ * Signature = "$1$" . sha1(AppSecret+ConsumerKey+METHOD+URL+BODY+TIMESTAMP).
+ */
+function mcp_ovh_request(string $method, string $path, ?array $body = null) {
+    if (MCP_OVH_APP_KEY === '' || MCP_OVH_APP_SECRET === '' || MCP_OVH_CONSUMER_KEY === '') {
+        throw new McpError('OVH API not configured (OVH_APP_KEY / OVH_APP_SECRET / OVH_CONSUMER_KEY missing from .env).');
+    }
+    $base    = mcp_ovh_base();
+    $url     = $base . $path;
+    $bodyStr = $body === null ? '' : json_encode($body, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+
+    // Use OVH server time to avoid local clock drift breaking the signature.
+    $ch = curl_init($base . '/auth/time');
+    curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 10]);
+    $t = curl_exec($ch);
+    curl_close($ch);
+    $timestamp = ($t !== false && is_numeric(trim((string)$t))) ? (int)trim((string)$t) : time();
+
+    $toSign = MCP_OVH_APP_SECRET . '+' . MCP_OVH_CONSUMER_KEY . '+' . $method . '+' . $url . '+' . $bodyStr . '+' . $timestamp;
+    $sig    = '$1$' . sha1($toSign);
+
+    $headers = [
+        'X-Ovh-Application: ' . MCP_OVH_APP_KEY,
+        'X-Ovh-Consumer: '    . MCP_OVH_CONSUMER_KEY,
+        'X-Ovh-Timestamp: '   . $timestamp,
+        'X-Ovh-Signature: '   . $sig,
+        'Content-Type: application/json',
+    ];
+
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_CUSTOMREQUEST  => $method,
+        CURLOPT_HTTPHEADER     => $headers,
+        CURLOPT_TIMEOUT        => 30,
+    ]);
+    if ($body !== null) curl_setopt($ch, CURLOPT_POSTFIELDS, $bodyStr);
+    $resp = curl_exec($ch);
+    $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $err  = curl_error($ch);
+    curl_close($ch);
+
+    if ($resp === false) throw new McpError("OVH request failed: $err");
+    $decoded = json_decode($resp, true);
+    if ($code >= 400) {
+        $msg = (is_array($decoded) && isset($decoded['message'])) ? $decoded['message'] : $resp;
+        throw new McpError("OVH API error $code on $method $path: $msg");
+    }
+    return $decoded;
 }
 
 // ---- Swimlane (= project) lookup ---------------------------------------------
@@ -477,6 +552,65 @@ function mcp_tool_defs(): array {
                 'subject' => ['type' => 'string', 'description' => 'Email subject line.'],
                 'html'    => ['type' => 'string', 'description' => 'HTML body content.'],
             ], 'required' => ['subject', 'html']],
+        ],
+        // -------- Phase 3: OVH control panel (signed API) --------
+        [
+            'name' => 'ovh_whoami',
+            'description' => 'Test the OVH API credentials. Returns the account (nichandle, name, email). Use this first to confirm the connection works.',
+            'inputSchema' => ['type' => 'object', 'properties' => (object)[]],
+        ],
+        [
+            'name' => 'list_dns_records',
+            'description' => 'List DNS records of a zone (id, type, subdomain, ttl, target). Optionally filter by subdomain and/or record type.',
+            'inputSchema' => ['type' => 'object', 'properties' => [
+                'zone'      => ['type' => 'string', 'description' => 'DNS zone name, e.g. "portale3d.it".'],
+                'subDomain' => ['type' => 'string', 'description' => 'Filter by subdomain (optional, e.g. "shop").'],
+                'fieldType' => ['type' => 'string', 'description' => 'Filter by record type (optional, e.g. "A", "CNAME", "MX", "TXT").'],
+            ], 'required' => ['zone']],
+        ],
+        [
+            'name' => 'add_dns_record',
+            'description' => 'Create a DNS record in a zone and refresh it so it goes live. Use for subdomains (A/AAAA/CNAME), mail (MX), verification (TXT), etc.',
+            'inputSchema' => ['type' => 'object', 'properties' => [
+                'zone'      => ['type' => 'string', 'description' => 'DNS zone name, e.g. "portale3d.it".'],
+                'fieldType' => ['type' => 'string', 'description' => 'Record type: A, AAAA, CNAME, MX, TXT, SRV, NS...'],
+                'target'    => ['type' => 'string', 'description' => 'Record value (IP for A, hostname for CNAME, etc.).'],
+                'subDomain' => ['type' => 'string', 'description' => 'Subdomain part (optional; empty = zone root).'],
+                'ttl'       => ['type' => 'integer', 'description' => 'TTL in seconds (optional, 0 = default).'],
+            ], 'required' => ['zone', 'fieldType', 'target']],
+        ],
+        [
+            'name' => 'delete_dns_record',
+            'description' => 'Delete a DNS record by its id (get it from list_dns_records) and refresh the zone.',
+            'inputSchema' => ['type' => 'object', 'properties' => [
+                'zone' => ['type' => 'string', 'description' => 'DNS zone name.'],
+                'id'   => ['type' => 'integer', 'description' => 'Record id to delete.'],
+            ], 'required' => ['zone', 'id']],
+        ],
+        [
+            'name' => 'create_email_redirect',
+            'description' => 'Create an email redirection on an OVH email domain (from -> to). Optionally keep a local copy.',
+            'inputSchema' => ['type' => 'object', 'properties' => [
+                'domain'    => ['type' => 'string', 'description' => 'Email domain, e.g. "portale3d.it".'],
+                'from'      => ['type' => 'string', 'description' => 'Source address, e.g. "info@portale3d.it".'],
+                'to'        => ['type' => 'string', 'description' => 'Destination address.'],
+                'localCopy' => ['type' => 'boolean', 'description' => 'Keep a copy in the source mailbox (default false).'],
+            ], 'required' => ['domain', 'from', 'to']],
+        ],
+        [
+            'name' => 'attach_subdomain',
+            'description' => 'Attach a (sub)domain to a folder on a shared hosting so Apache serves a site for it. Pair with add_dns_record (A/CNAME) for a full subdomain.',
+            'inputSchema' => ['type' => 'object', 'properties' => [
+                'service' => ['type' => 'string', 'description' => 'Hosting service name (from list_hostings), e.g. "portale3d.it".'],
+                'domain'  => ['type' => 'string', 'description' => 'Full (sub)domain to attach, e.g. "shop.portale3d.it".'],
+                'path'    => ['type' => 'string', 'description' => 'Folder to serve, relative to the hosting web root, e.g. "shop".'],
+                'ssl'     => ['type' => 'boolean', 'description' => 'Enable SSL for the domain (default true).'],
+            ], 'required' => ['service', 'domain', 'path']],
+        ],
+        [
+            'name' => 'list_hostings',
+            'description' => 'List your OVH shared hosting service names (use one as the "service" for attach_subdomain).',
+            'inputSchema' => ['type' => 'object', 'properties' => (object)[]],
         ],
     ];
 }
@@ -856,6 +990,95 @@ function mcp_run_tool(string $name, array $a): string {
             mcp_audit('send_digest_mail', ['to' => MCP_MAIL_TO, 'subject' => $subject, 'ok' => $ok]);
             if (!$ok) throw new McpError("Mail failed: $info");
             return "Mail sent to " . MCP_MAIL_TO . " — subject: $subject ($info)";
+        }
+
+        // ---------------- Phase 3: OVH control panel ----------------
+        case 'ovh_whoami': {
+            $me = mcp_ovh_request('GET', '/me');
+            if (!is_array($me)) throw new McpError('Unexpected response from /me.');
+            $name = trim(($me['firstname'] ?? '') . ' ' . ($me['name'] ?? ''));
+            return "OVH connection OK.\n"
+                 . 'Account: ' . ($me['nichandle'] ?? '?') . "\n"
+                 . 'Name: '    . ($name !== '' ? $name : '?') . "\n"
+                 . 'Email: '   . ($me['email'] ?? '?');
+        }
+
+        case 'list_dns_records': {
+            $zone = trim((string)($a['zone'] ?? ''));
+            if ($zone === '') throw new McpError('zone is required.');
+            $q = [];
+            if (!empty($a['subDomain'])) $q['subDomain'] = (string)$a['subDomain'];
+            if (!empty($a['fieldType'])) $q['fieldType'] = (string)$a['fieldType'];
+            $path = '/domain/zone/' . rawurlencode($zone) . '/record' . ($q ? '?' . http_build_query($q) : '');
+            $ids = mcp_ovh_request('GET', $path);
+            if (!is_array($ids) || !$ids) return "No records in '$zone' for the given filter.";
+            $out = [];
+            foreach (array_slice($ids, 0, 100) as $id) {
+                $r = mcp_ovh_request('GET', '/domain/zone/' . rawurlencode($zone) . '/record/' . (int)$id);
+                if (!is_array($r)) continue;
+                $sub = ($r['subDomain'] ?? '') === '' ? '@' : $r['subDomain'];
+                $out[] = sprintf('#%d  %-6s  %-20s  ttl=%s  ->  %s',
+                    (int)($r['id'] ?? $id), $r['fieldType'] ?? '?', $sub,
+                    (string)($r['ttl'] ?? 0), $r['target'] ?? '?');
+            }
+            $more = count($ids) > 100 ? "\n... (" . (count($ids) - 100) . ' more)' : '';
+            return "DNS records in '$zone':\n" . implode("\n", $out) . $more;
+        }
+
+        case 'add_dns_record': {
+            $zone      = trim((string)($a['zone'] ?? ''));
+            $fieldType = strtoupper(trim((string)($a['fieldType'] ?? '')));
+            $target    = trim((string)($a['target'] ?? ''));
+            if ($zone === '' || $fieldType === '' || $target === '') {
+                throw new McpError('zone, fieldType and target are required.');
+            }
+            $body = ['fieldType' => $fieldType, 'subDomain' => (string)($a['subDomain'] ?? ''), 'target' => $target];
+            if (isset($a['ttl'])) $body['ttl'] = (int)$a['ttl'];
+            $rec = mcp_ovh_request('POST', '/domain/zone/' . rawurlencode($zone) . '/record', $body);
+            mcp_ovh_request('POST', '/domain/zone/' . rawurlencode($zone) . '/refresh');
+            $id = is_array($rec) ? ($rec['id'] ?? '?') : '?';
+            $fqdn = ($body['subDomain'] !== '' ? $body['subDomain'] . '.' : '') . $zone;
+            mcp_audit('add_dns_record', ['zone' => $zone, 'type' => $fieldType, 'sub' => $body['subDomain'], 'target' => $target, 'id' => $id]);
+            return "Created $fieldType record #$id: $fqdn -> $target. Zone refreshed (live).";
+        }
+
+        case 'delete_dns_record': {
+            $zone = trim((string)($a['zone'] ?? ''));
+            $id   = (int)($a['id'] ?? 0);
+            if ($zone === '' || $id <= 0) throw new McpError('zone and a valid numeric id are required.');
+            mcp_ovh_request('DELETE', '/domain/zone/' . rawurlencode($zone) . '/record/' . $id);
+            mcp_ovh_request('POST', '/domain/zone/' . rawurlencode($zone) . '/refresh');
+            mcp_audit('delete_dns_record', ['zone' => $zone, 'id' => $id]);
+            return "Deleted DNS record #$id from '$zone'. Zone refreshed.";
+        }
+
+        case 'create_email_redirect': {
+            $domain = trim((string)($a['domain'] ?? ''));
+            $from   = trim((string)($a['from'] ?? ''));
+            $to     = trim((string)($a['to'] ?? ''));
+            if ($domain === '' || $from === '' || $to === '') throw new McpError('domain, from and to are required.');
+            $body = ['from' => $from, 'to' => $to, 'localCopy' => !empty($a['localCopy'])];
+            mcp_ovh_request('POST', '/email/domain/' . rawurlencode($domain) . '/redirection', $body);
+            mcp_audit('create_email_redirect', ['domain' => $domain, 'from' => $from, 'to' => $to]);
+            return "Created email redirection: $from -> $to" . (!empty($a['localCopy']) ? ' (local copy kept)' : '') . '.';
+        }
+
+        case 'attach_subdomain': {
+            $service = trim((string)($a['service'] ?? ''));
+            $domain  = trim((string)($a['domain'] ?? ''));
+            $path    = trim((string)($a['path'] ?? ''));
+            if ($service === '' || $domain === '' || $path === '') throw new McpError('service, domain and path are required.');
+            $body = ['domain' => $domain, 'path' => $path, 'ssl' => !array_key_exists('ssl', $a) ? true : (bool)$a['ssl']];
+            mcp_ovh_request('POST', '/hosting/web/' . rawurlencode($service) . '/attachedDomain', $body);
+            mcp_audit('attach_subdomain', ['service' => $service, 'domain' => $domain, 'path' => $path]);
+            return "Attached $domain -> folder '$path' on hosting '$service'"
+                 . ($body['ssl'] ? ' (SSL on)' : '') . ". Note: DNS must also point $domain here (use add_dns_record).";
+        }
+
+        case 'list_hostings': {
+            $svcs = mcp_ovh_request('GET', '/hosting/web');
+            if (!is_array($svcs) || !$svcs) return 'No shared hosting services found on this account.';
+            return "Shared hosting services:\n- " . implode("\n- ", $svcs);
         }
     }
     throw new McpError("Unknown tool: $name");
