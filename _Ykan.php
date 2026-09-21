@@ -180,6 +180,13 @@ function ykanEnv(string $key): string {
     return '';
 }
 
+// GitHub token: GITHUB_TOKEN in the server .env wins over the value saved in the board data,
+// so the secret can stay out of the data file (and out of the Settings screen).
+function ykanGithubToken(array $data): string {
+    $env = ykanEnv('GITHUB_TOKEN');
+    return $env !== '' ? $env : (string)($data['config']['github_token'] ?? '');
+}
+
 // === MCP project root + safe file browsing (shared model with mcp.php) ========
 // The swimlane 'path' is relative to MCP_ROOT, configured in the hosting .env
 // (same file mcp.php reads). We resolve it here so the board can browse a
@@ -1594,7 +1601,7 @@ PROMPT;
 
             // GitHub API - List Issues
             'github_issues' => (function() use ($data) {
-                $token = $data['config']['github_token'] ?? '';
+                $token = ykanGithubToken($data);
                 $repo = $data['config']['github_repo'] ?? '';
                 if (empty($token) || empty($repo)) {
                     return ['success' => false, 'error' => 'GitHub not configured. Go to Settings.'];
@@ -1630,7 +1637,7 @@ PROMPT;
 
             // GitHub API - List Pull Requests
             'github_prs' => (function() use ($data) {
-                $token = $data['config']['github_token'] ?? '';
+                $token = ykanGithubToken($data);
                 $repo = $data['config']['github_repo'] ?? '';
                 if (empty($token) || empty($repo)) {
                     return ['success' => false, 'error' => 'GitHub not configured'];
@@ -1660,7 +1667,7 @@ PROMPT;
 
             // GitHub API - List Commits
             'github_commits' => (function() use ($data) {
-                $token = $data['config']['github_token'] ?? '';
+                $token = ykanGithubToken($data);
                 $repo = $data['config']['github_repo'] ?? '';
                 if (empty($token) || empty($repo)) {
                     return ['success' => false, 'error' => 'GitHub not configured'];
@@ -1690,7 +1697,7 @@ PROMPT;
 
             // GitHub API - Create Issue from Card
             'github_create_issue' => (function() use ($data, $input) {
-                $token = $data['config']['github_token'] ?? '';
+                $token = ykanGithubToken($data);
                 $repo = $data['config']['github_repo'] ?? '';
                 if (empty($token) || empty($repo)) {
                     return ['success' => false, 'error' => 'GitHub not configured'];
@@ -1738,7 +1745,7 @@ PROMPT;
 
             // GitHub API - Close Issue
             'github_close_issue' => (function() use ($data, $input) {
-                $token = $data['config']['github_token'] ?? '';
+                $token = ykanGithubToken($data);
                 $repo = $data['config']['github_repo'] ?? '';
                 if (empty($token) || empty($repo)) {
                     return ['success' => false, 'error' => 'GitHub not configured'];
@@ -1778,7 +1785,7 @@ PROMPT;
 
             // GitHub API - Repo Info
             'github_repo_info' => (function() use ($data) {
-                $token = $data['config']['github_token'] ?? '';
+                $token = ykanGithubToken($data);
                 $repo = $data['config']['github_repo'] ?? '';
                 if (empty($token) || empty($repo)) {
                     return ['success' => false, 'error' => 'GitHub not configured'];
@@ -1809,7 +1816,7 @@ PROMPT;
             // Status of several GitHub repos at once (last push, visibility, open issues/PRs).
             // Uses the configured token when present; public repos also work without it.
             'github_repo_status' => (function() use ($data, $input) {
-                $token = $data['config']['github_token'] ?? '';
+                $token = ykanGithubToken($data);
                 $out = [];
                 foreach (array_slice((array)($input['repos'] ?? []), 0, 30) as $repo) {
                     $repo = (string)$repo;
@@ -3285,6 +3292,7 @@ $dataJson = json_encode($data);
                     <label>GitHub Token <span style="font-weight:normal;color:var(--text2)">(Personal Access Token)</span></label>
                     <input type="password" id="configGithubToken" placeholder="ghp_xxxxxxxxxxxx...">
                     <small style="color:var(--text2);font-size:11px">Generate from: GitHub → Settings → Developer settings → Personal access tokens</small>
+                    <small id="configGithubEnvNote" style="display:none;color:#16a34a;font-size:11px;margin-top:3px">Il server usa già <code>GITHUB_TOKEN</code> dalla <code>.env</code>: ha la precedenza e questo campo si può lasciare vuoto.</small>
                 </div>
                 <div class="form-group">
                     <label>GitHub Repository <span style="font-weight:normal;color:var(--text2)">(owner/repo)</span></label>
@@ -3462,6 +3470,8 @@ $dataJson = json_encode($data);
     <script>
     // === STATE ===
     let boardData = <?= $dataJson ?>;
+    // true when the server .env provides GITHUB_TOKEN (the value itself never reaches the browser)
+    const ykanGithubEnvToken = <?= ykanEnv('GITHUB_TOKEN') !== '' ? 'true' : 'false' ?>;
     let draggedCard = null;
     // Which swimlanes are collapsed, persisted across render() calls so moving/editing
     // a card doesn't reset every project back to "all collapsed".
@@ -5589,6 +5599,7 @@ $dataJson = json_encode($data);
         document.getElementById('configLanguage').value = boardData.config.ai_language || 'en';
         document.getElementById('configGeminiKey').value = boardData.config.gemini_api_key || '';
         document.getElementById('configGithubToken').value = boardData.config.github_token || '';
+        document.getElementById('configGithubEnvNote').style.display = ykanGithubEnvToken ? 'block' : 'none';
         document.getElementById('configGithubRepo').value = boardData.config.github_repo || '';
         renderLabelsManager();
         document.getElementById('configModal').classList.add('active');
@@ -5911,7 +5922,7 @@ Rules:
         pmCloseOthers();
         panel.classList.toggle('open', isOpening);
 
-        if (isOpening && boardData.config.github_token && boardData.config.github_repo) {
+        if (isOpening && (boardData.config.github_token || ykanGithubEnvToken) && boardData.config.github_repo) {
             loadGithubData('issues');
             loadGithubRepoInfo();
         }
@@ -6280,7 +6291,7 @@ ${epicRows}</div>`);
     async function loadGithubData(tab) {
         const content = document.getElementById('githubContent');
 
-        if (!boardData.config.github_token || !boardData.config.github_repo) {
+        if (!(boardData.config.github_token || ykanGithubEnvToken) || !boardData.config.github_repo) {
             content.innerHTML = `<div class="github-empty">
                 <p>Configure GitHub Token and Repository in Settings.</p>
                 <button class="btn btn-primary" onclick="openConfigModal()" style="margin-top:12px">⚙️ Settings</button>
