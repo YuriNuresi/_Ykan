@@ -2968,6 +2968,7 @@ $dataJson = json_encode($data);
             .git-row { flex-wrap: wrap; } .git-last { white-space: normal; }
             .dash-revbar .btn { flex: 1 1 auto; }
             .modal { width: 96%; padding: 14px; }
+            .focus-head { flex-wrap: wrap; row-gap: 4px; }
         }
         .sess-msg { margin: 6px 0; padding: 6px 10px; border-radius: 8px; border: 1px solid var(--border); }
         .sess-msg.user { background: var(--bg2); }
@@ -4483,6 +4484,17 @@ $dataJson = json_encode($data);
     function dashStableLabel() { return (boardData.labels || []).find(l => /stable/i.test(l.name || '')); }
     function dashLabelName(id) { const l = (boardData.labels || []).find(x => x.id === id); return l ? l.name : ''; }
 
+    // Ordinamento: "priorità" (punteggio attenzione, calcolato) oppure "manuale" (ordine delle
+    // swimlane, quello del Kanban — con le frecce ↑↓ qui sotto). In entrambi i casi i progetti
+    // al 100% restano sempre in fondo: non c'è nulla da decidere su cosa è già pronto.
+    let dashFocusSort = 'auto';
+    try { dashFocusSort = localStorage.getItem('ykan_focus_sort') === 'manual' ? 'manual' : 'auto'; } catch (_) {}
+    function dashFocusSetSort(mode) {
+        dashFocusSort = mode === 'manual' ? 'manual' : 'auto';
+        try { localStorage.setItem('ykan_focus_sort', dashFocusSort); } catch (_) {}
+        dashRender();
+    }
+
     function dashFocusData() {
         const { res, sd } = dashData;
         const stableLabel = dashStableLabel();
@@ -4536,7 +4548,26 @@ $dataJson = json_encode($data);
                 + (dirty ? 6 : 0);
 
             return { lane, pct, explicit, blockers, openBugs, openUrgent, dirty, ahead, openRemote, daysStale, attention };
-        }).sort((a, b) => b.attention - a.attention);
+        }).sort((a, b) => {
+            const tier = (a.pct === 100) - (b.pct === 100); // 100% sempre dopo tutto il resto
+            if (tier) return tier;
+            return dashFocusSort === 'manual' ? a.lane.position - b.lane.position : b.attention - a.attention;
+        });
+    }
+
+    // Sposta un progetto su/giù nell'ordine manuale (Focus), senza scavalcare il confine dei
+    // progetti al 100% — riusa moveSwimlane/reorder_swimlanes, quindi l'ordine è lo stesso del Kanban.
+    function dashFocusMove(laneId, dir) {
+        const rows = dashFocusData();
+        const i = rows.findIndex(r => r.lane.id === laneId);
+        const j = i + dir;
+        if (i === -1 || j < 0 || j >= rows.length) return;
+        if ((rows[i].pct === 100) !== (rows[j].pct === 100)) return;
+        const a = rows[i].lane, b = rows[j].lane;
+        const tmp = a.position; a.position = b.position; b.position = tmp;
+        render();
+        dashRender();
+        api('reorder_swimlanes', { order: boardData.swimlanes.slice().sort((x, y) => x.position - y.position).map(l => l.id) });
     }
 
     function dashFocusHtml() {
@@ -4557,7 +4588,18 @@ $dataJson = json_encode($data);
             Stima automatica (bug/urgent aperti, stato git, issue/PR). Per un conto alla rovescia preciso, crea una label <b>Stable</b> in
             <a href="#" onclick="openConfigModal();return false">⚙️ Settings</a> e taggaci i task che devono chiudersi prima del rilascio.</div>`;
 
-        return summary + hint + rows.map((r, idx) => {
+        const sortBar = `<div class="rv-filters">
+            <button type="button" class="${dashFocusSort === 'auto' ? 'active' : ''}" onclick="dashFocusSetSort('auto')" title="Per attenzione: readiness, quanto è fermo, urgenze">🎯 Per priorità</button>
+            <button type="button" class="${dashFocusSort === 'manual' ? 'active' : ''}" onclick="dashFocusSetSort('manual')" title="Ordina tu con le frecce ↑↓ (stesso ordine del Kanban)">↕ Manuale</button>
+        </div>`;
+
+        // I progetti al 100% stanno sempre in un unico blocco finale (vedi il sort in dashFocusData):
+        // serve per sapere dove finisce il "confine" e non far scavalcare le frecce su/giù da un blocco all'altro.
+        const firstReadyIdx = rows.findIndex(r => r.pct === 100);
+        const tierEnd = i => (rows[i].pct === 100 ? rows.length : (firstReadyIdx === -1 ? rows.length : firstReadyIdx)) - 1;
+        const tierStart = i => (rows[i].pct === 100 ? Math.max(firstReadyIdx, 0) : 0);
+
+        return summary + sortBar + hint + rows.map((r, idx) => {
             const key = 'f|' + r.lane.name;
             const open = dashExpanded.has(key) || idx === 0;
             const color = r.pct >= 90 ? '#16a34a' : r.pct >= 60 ? '#ea580c' : '#dc2626';
@@ -4574,8 +4616,17 @@ $dataJson = json_encode($data);
                     ${r.blockers.map(b => `<div class="dash-ev" onclick="dashOpenCard('${escHtml(b.id)}')"><b>${b.seq ? '#' + b.seq + ' ' : ''}${escHtml(b.title)}</b> — ${escHtml(b.detail)}</div>`).join('')}
                    </div>`
                 : '<div class="focus-blockers"><div class="dash-sub">Nessun blocco individuato — pronto per la stable. 🎉</div></div>';
+            const moveArrows = dashFocusSort !== 'manual' ? '' : `<span style="display:flex;flex-direction:column;gap:0">
+                    <button type="button" class="btn btn-icon" style="padding:0 4px;height:14px" title="Sposta su" ${idx === tierStart(idx) ? 'disabled style="opacity:.3"' : ''} onclick="event.stopPropagation();dashFocusMove('${escHtml(r.lane.id)}',-1)">
+                        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M18 15l-6-6-6 6"/></svg>
+                    </button>
+                    <button type="button" class="btn btn-icon" style="padding:0 4px;height:14px" title="Sposta giù" ${idx === tierEnd(idx) ? 'disabled style="opacity:.3"' : ''} onclick="event.stopPropagation();dashFocusMove('${escHtml(r.lane.id)}',1)">
+                        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M6 9l6 6 6-6"/></svg>
+                    </button>
+                </span>`;
             return `<div class="focus-row${idx === 0 ? ' focus-top' : ''}">
                 <div class="focus-head" onclick="dashToggleExpand('${key.replace(/'/g, '&#39;')}')">
+                    ${moveArrows}
                     <span class="wk-dot" style="background:${dashColor(r.lane.name)}"></span>
                     <b>${escHtml(r.lane.name)}</b>
                     ${idx === 0 ? '<span class="focus-pick">lavoraci ora</span>' : ''}
