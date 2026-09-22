@@ -3,7 +3,7 @@
  * _Ykan - Minimal Kanban Board
  * Single-file PHP Kanban for Scrum/Agile projects
  *
- * @version 1.8.0
+ * @version 1.9.0
  * @license MIT
  * @requires PHP 8.2+
  *
@@ -2548,7 +2548,8 @@ $dataJson = json_encode($data);
             --border: #475569; --shadow: 0 1px 3px rgba(0,0,0,0.3);
         }
         * { box-sizing: border-box; margin: 0; padding: 0; }
-        body { font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; font-size: var(--font-base); }
+        html { overflow-x: hidden; }
+        body { font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; font-size: var(--font-base); overflow-x: hidden; }
 
         /* Header */
         .header { display: flex; align-items: center; gap: 12px; padding: var(--header-pad); background: var(--header-bg); color: var(--header-text); border-bottom: 1px solid var(--border); }
@@ -2840,7 +2841,8 @@ $dataJson = json_encode($data);
         .dash-view { display: none; padding: 16px 20px 40px; max-width: 980px; margin: 0 auto; }
         body[data-view="dashboard"] .filters-bar, body[data-view="dashboard"] .board-container { display: none; }
         body[data-view="dashboard"] .dash-view { display: block; }
-        .dash-toolbar { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; }
+        .dash-toolbar { display: flex; align-items: center; gap: 8px 12px; margin-bottom: 14px; flex-wrap: wrap; }
+        .dash-count:empty { display: none; }
         .dash-toolbar h2 { font-size: 18px; margin: 0; }
         .dash-bridge { font-size: 11px; padding: 2px 8px; border-radius: 10px; background: var(--bg2); color: var(--text2); }
         .dash-bridge.ok { color: #16a34a; } .dash-bridge.ko { color: #dc2626; }
@@ -2852,11 +2854,16 @@ $dataJson = json_encode($data);
         .dash-row { display: flex; gap: 8px; align-items: baseline; }
         .dash-sub { font-size: 12px; color: var(--text2); margin-top: 2px; }
         .dash-chip { display: inline-block; font-size: 11px; padding: 0 6px; border-radius: 8px; background: var(--bg2); border: 1px solid var(--border); margin-left: 4px; cursor: pointer; }
+        .dash-chips { display: inline; }
+        .dash-chips:not(.open) .dash-chip-x { display: none; }
+        .dash-chips.open .dash-more i, .dash-chips:not(.open) .dash-more b { display: none; }
+        .dash-more { background: var(--bg2); color: var(--text2); font-weight: 600; }
+        .dash-more i { font-style: normal; } .dash-more b { font-weight: 600; }
         .dash-empty { padding: 12px; color: var(--text2); font-size: 13px; }
         .dash-day { font-size: 12px; font-weight: 600; margin: 10px 0 4px; }
         .dash-ev { font-size: 12px; color: var(--text2); padding: 1px 0; }
         .dash-ev b { color: var(--text); font-weight: 500; }
-        .dash-tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--border); margin-bottom: 14px; }
+        .dash-tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--border); margin-bottom: 14px; flex-wrap: wrap; }
         .dash-tabs button { background: transparent; border: none; border-bottom: 2px solid transparent; color: inherit; opacity: .65; padding: 8px 14px; font-size: 13px; font-weight: 500; cursor: pointer; margin-bottom: -1px; }
         .dash-tabs button:hover { opacity: 1; }
         .dash-tabs button.active { opacity: 1; border-bottom-color: var(--accent); }
@@ -2927,6 +2934,24 @@ $dataJson = json_encode($data);
         .git-tag.warn { background: #ea580c; border-color: #ea580c; color: #fff; }
         .git-tag.ok { color: #16a34a; border-color: #16a34a; }
         .git-tag.info { background: #2563eb; border-color: #2563eb; color: #fff; }
+        /* Telefono: intestazione e Dashboard vanno a capo invece di uscire dallo schermo */
+        @media (max-width: 720px) {
+            .header { flex-wrap: wrap; row-gap: 6px; }
+            .header-actions { margin-left: 0; width: 100%; flex-wrap: wrap; }
+            .view-tabs { margin-left: 8px; }
+            .dash-view { padding: 12px 10px 40px; }
+            .dash-tabs button { padding: 8px 8px; font-size: 12px; }
+            .dash-legend { width: 100%; margin-left: 0; padding: 4px 0 6px; flex-wrap: wrap; }
+            .dash-when { max-width: 100%; white-space: normal; }
+            .dash-projhead { flex-wrap: wrap; }
+            .wk-summary { gap: 12px; padding: 10px; }
+            .wk-stats { margin-left: 0; gap: 14px; }
+            .wk-day { gap: 8px; } .wk-date { width: 38px; } .wk-body { padding-left: 8px; }
+            .rv-row { flex-wrap: wrap; } .rv-actions { width: 100%; justify-content: flex-end; }
+            .git-row { flex-wrap: wrap; } .git-last { white-space: normal; }
+            .dash-revbar .btn { flex: 1 1 auto; }
+            .modal { width: 96%; padding: 14px; }
+        }
         .sess-msg { margin: 6px 0; padding: 6px 10px; border-radius: 8px; border: 1px solid var(--border); }
         .sess-msg.user { background: var(--bg2); }
         .sess-who { font-size: 11px; font-weight: 600; color: var(--text2); margin-bottom: 2px; }
@@ -4046,8 +4071,16 @@ $dataJson = json_encode($data);
         const col = boardData.columns.find(x => x.id === c.column_id);
         return /claude do|progress|doing|corso|lavor/i.test(col ? col.name : '') ? 'st-doing' : 'st-todo';
     }
-    function dashChips(cards) {
-        return cards.map(c => `<span class="dash-chip ${dashChipClass(c)}" title="${escHtml(c.title)}" onclick="event.stopPropagation();dashOpenCard('${escHtml(c.id)}')">#${c.seq}</span>`).join('');
+    // Task chips capped to `max`: open tasks first (in progress, then to do), done last; the rest sits behind "+N"
+    function dashCapChips(cards, max, render) {
+        const rank = { 'st-doing': 0, 'st-todo': 1, 'st-done': 2 };
+        const sorted = [...cards].sort((a, b) => rank[dashChipClass(a)] - rank[dashChipClass(b)] || (a.seq || 0) - (b.seq || 0));
+        const html = sorted.map((c, i) => render(c, i >= max ? ' dash-chip-x' : '')).join('');
+        if (sorted.length <= max) return html;
+        return `<span class="dash-chips">${html}<span class="dash-chip dash-more" title="Mostra tutti" onclick="event.stopPropagation();this.parentElement.classList.toggle('open')"><i>+${sorted.length - max}</i><b>meno</b></span></span>`;
+    }
+    function dashChips(cards, max = 8) {
+        return dashCapChips(cards, max, (c, x) => `<span class="dash-chip ${dashChipClass(c)}${x}" title="${escHtml(c.title)}" onclick="event.stopPropagation();dashOpenCard('${escHtml(c.id)}')">#${c.seq}</span>`);
     }
 
     // Last thing done per project: newest of card changes and session activity
@@ -4070,7 +4103,7 @@ $dataJson = json_encode($data);
             resume: [...res.items, ...sd.items].filter(i => dashInProject(i.project)).length,
             week: dashWeekEvents(res, sd).length,
             review: dashReviewRows(sd).length,
-            git: dashGit ? dashGitRows().filter(g => g.info.repo && (g.info.changed || g.info.untracked || g.info.ahead)).length : '…'
+            git: dashGit ? dashGitRows().filter(g => g.info.repo && (g.info.changed || g.info.untracked || g.info.ahead)).length : ''
         };
         document.querySelectorAll('#dashTabs button').forEach(b => {
             b.classList.toggle('active', b.dataset.tab === dashTabName);
@@ -4103,6 +4136,10 @@ $dataJson = json_encode($data);
 
         return head + projects.map(p => {
             const list = [...p.items].sort((a, b) => rank[a.severity] - rank[b.severity] || dashTs(b.since) - dashTs(a.since));
+            const open = dashExpanded.has('p|' + p.lane.name);
+            const shown = open ? list : list.slice(0, 6);
+            const more = list.length > 6
+                ? `<button class="btn" style="font-size:12px;margin-top:2px" onclick="dashToggleExpand('p|${escHtml(p.lane.name).replace(/'/g, '&#39;')}')">${open ? 'Mostra meno' : 'Mostra altre ' + (list.length - 6)}</button>` : '';
             return `<div class="dash-projcard">
                 <div class="dash-projhead">
                     <span class="wk-dot" style="background:${dashColor(p.lane.name)}"></span>
@@ -4111,10 +4148,13 @@ $dataJson = json_encode($data);
                     <span style="flex:1"></span>
                     ${p.act ? `<span class="dash-when" title="${escHtml(p.act.what)}">ultima attività ${dashAgo(p.act.ts)} · ${escHtml(p.act.what.slice(0, 50))}${p.act.what.length > 50 ? '…' : ''}</span>` : ''}
                 </div>
-                ${list.map(dashItemHtml).join('')}
+                ${shown.map(dashItemHtml).join('')}${more}
             </div>`;
         }).join('');
     }
+
+    const dashExpanded = new Set(); // sezioni aperte per intero ("p|Progetto" nella lista, "e|giorno|Progetto" nell'attività)
+    function dashToggleExpand(key) { if (dashExpanded.has(key)) dashExpanded.delete(key); else dashExpanded.add(key); dashRender(); }
 
     function dashItemHtml(i) {
         const [icon, label] = DASH_KINDS[i.kind] || ['•', i.kind];
@@ -4177,10 +4217,18 @@ $dataJson = json_encode($data);
             byDay[k].forEach(e => (byProj[e.project] = byProj[e.project] || []).push(e));
             return `<div class="wk-day">
                 <div class="wk-date"><b>${d.getDate()}</b><span>${escHtml(d.toLocaleDateString('it-IT', { weekday: 'short', month: 'short' }))}</span></div>
-                <div class="wk-body">${Object.entries(byProj).map(([proj, evs]) => `
+                <div class="wk-body">${Object.entries(byProj).map(([proj, evs]) => {
+                    // le sessioni si vedono sempre; degli eventi sui task ne mostro pochi finché non si espande
+                    const key = 'e|' + k + '|' + proj, isOpen = dashExpanded.has(key);
+                    const taskEvs = evs.filter(e => e.type !== 'session');
+                    const hidden = isOpen ? 0 : Math.max(0, taskEvs.length - 5);
+                    const shownEvs = isOpen ? evs : [...evs.filter(e => e.type === 'session'), ...taskEvs.slice(0, 5)].sort((a, b) => b.ts - a.ts);
+                    const toggle = taskEvs.length > 5
+                        ? `<div class="wk-ev"><span class="wk-time"></span><span class="wk-ic"></span><span class="wk-txt"><a href="#" style="color:var(--accent);font-size:12px" onclick="dashToggleExpand('${escHtml(key).replace(/'/g, '&#39;')}');return false">${isOpen ? 'mostra meno' : '+ ' + hidden + ' altri eventi'}</a></span></div>` : '';
+                    return `
                     <div class="wk-proj" style="border-left-color:${dashColor(proj)}">
                         <div class="wk-projname">${escHtml(proj)} <span>${evs.length}</span></div>
-                        ${evs.map(e => {
+                        ${shownEvs.map(e => {
                             const time = new Date(e.ts).toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit' });
                             let txt, act = '';
                             if (e.type === 'session') {
@@ -4191,8 +4239,9 @@ $dataJson = json_encode($data);
                                 if (e.card) act = `<a href="#" onclick="dashOpenCard('${escHtml(e.card.id)}');return false">apri</a>`;
                             }
                             return `<div class="wk-ev"><span class="wk-time">${time}</span><span class="wk-ic" title="${VERB[e.type]}">${ICON[e.type]}</span><span class="wk-txt">${txt}</span><span class="wk-act">${act}</span></div>`;
-                        }).join('')}
-                    </div>`).join('')}
+                        }).join('')}${toggle}
+                    </div>`;
+                }).join('')}
                 </div>
             </div>`;
         }).join('');
@@ -4359,7 +4408,7 @@ $dataJson = json_encode($data);
                             ? 'Su GitHub esiste un repository con questo progetto, ma la cartella locale non è un clone (è una semplice copia).'
                             : escHtml(info.note || 'Cartella senza Git.')}</div>
                     </div>
-                    <button class="btn btn-primary" style="padding:3px 10px;font-size:12px" onclick="openGitInit('${escHtml(lane.id)}')">🌱 Inizializza repository…</button>
+                    <button class="btn" style="padding:3px 10px;font-size:12px;white-space:nowrap" onclick="openGitInit('${escHtml(lane.id)}')">🌱 Inizializza repository…</button>
                 </div>`;
             }
 
@@ -4582,8 +4631,8 @@ $dataJson = json_encode($data);
 
     function sessTaskLine(label, cards) {
         if (!cards.length) return '';
-        return `<div style="font-size:12px;margin-top:3px"><b>${label}</b> ${cards.map(c =>
-            `<span class="dash-chip ${dashChipClass(c)}" title="${escHtml(c.title)}" onclick="sessOpenCard('${escHtml(c.id)}')">#${c.seq} ${escHtml(c.title.slice(0, 40))}${c.title.length > 40 ? '…' : ''}</span>`).join('')}</div>`;
+        return `<div style="font-size:12px;margin-top:3px"><b>${label}</b> ${dashCapChips(cards, 6, (c, x) =>
+            `<span class="dash-chip ${dashChipClass(c)}${x}" title="${escHtml(c.title)}" onclick="sessOpenCard('${escHtml(c.id)}')">#${c.seq} ${escHtml(c.title.slice(0, 40))}${c.title.length > 40 ? '…' : ''}</span>`)}</div>`;
     }
 
     function sessOpenCard(id) { closeSessionPanel(); openCardModal(id); }
@@ -6996,6 +7045,20 @@ ${epicRows}</div>`);
             <div class="changelog-header">
                 <span class="changelog-title">_Ykan Changelog</span>
                 <button class="changelog-close" onclick="toggleChangelog()">&times;</button>
+            </div>
+
+            <div class="changelog-version">
+                <h3>v1.9.0 - September 2026</h3>
+                <ul>
+                    <li>📊 <strong>Dashboard tab</strong> - cross-project view: Da riprendere, Attività, Revisione sessioni, Git</li>
+                    <li>🌉 <strong>Local Bridge</strong> - optional Node helper (<code>bridge/</code>) on <code>127.0.0.1</code> feeding real Claude Code session history and a live terminal</li>
+                    <li>🗄️ <strong>Database tools</strong> - <code>db_query</code>, <code>db_exec</code>, <code>db_schema</code>, <code>db_dump_table</code> exposed via <code>mcp.php</code></li>
+                    <li>✉️ <strong>Mail tool</strong> - <code>send_digest_mail</code> sends an HTML summary email</li>
+                    <li>🔁 <strong>Google Tasks sync</strong> - optional bidirectional sync (<code>sync_google_tasks</code>)</li>
+                    <li>🤖 <strong>Automated routines</strong> - "Claude Do" hourly queue and "Sistema Vacanze" nightly improvement scouting</li>
+                    <li>🏷️ <strong>Claude label</strong> - dedicated label marking AI-created tasks</li>
+                    <li>📱 <strong>Mobile layout fixes</strong> - header/Dashboard wrap instead of overflowing; side panels no longer cause horizontal scroll</li>
+                </ul>
             </div>
 
             <div class="changelog-version">
