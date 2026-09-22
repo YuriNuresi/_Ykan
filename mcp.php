@@ -453,6 +453,24 @@ function mcp_tool_defs(): array {
                 'project' => $projectArg,
             ]],
         ],
+        [
+            'name' => 'add_label',
+            'description' => 'Create a new label for the board (used to tag tasks). No-op if a label with this exact name already exists.',
+            'inputSchema' => ['type' => 'object', 'properties' => [
+                'name'  => ['type' => 'string', 'description' => 'Label name, e.g. "🎯 Stable".'],
+                'color' => ['type' => 'string', 'description' => 'Hex color, e.g. "#8b5cf6" (optional, defaults to purple).'],
+            ], 'required' => ['name']],
+        ],
+        [
+            'name' => 'set_task_label',
+            'description' => 'Set (or clear) the label on an existing task, matched by short id (e.g. "25") or by title.',
+            'inputSchema' => ['type' => 'object', 'properties' => [
+                'id'      => ['type' => 'string', 'description' => 'Short task id, e.g. "25" or "#25".'],
+                'title'   => ['type' => 'string', 'description' => 'Task title (partial match) — use if you do not have the id.'],
+                'project' => $projectArg,
+                'label'   => ['type' => 'string', 'description' => 'Label name (partial match, e.g. "Stable"). Empty string clears the label.'],
+            ], 'required' => ['label']],
+        ],
         // -------- Phase 2: Files (scoped to a linked project folder) --------
         [
             'name' => 'list_files',
@@ -724,6 +742,43 @@ function mcp_run_tool(string $name, array $a): string {
             mcp_save($data);
             mcp_audit('complete_task', ['seq' => $data['cards'][$i]['seq'] ?? null, 'title' => $data['cards'][$i]['title']]);
             return $msg;
+        }
+
+        case 'add_label': {
+            $name = trim((string)($a['name'] ?? ''));
+            if ($name === '') throw new McpError('Label name is required.');
+            foreach (($data['labels'] ?? []) as $lbl) {
+                if (mb_strtolower($lbl['name']) === mb_strtolower($name)) {
+                    return "Label '{$lbl['name']}' already exists (id {$lbl['id']}).";
+                }
+            }
+            $color = trim((string)($a['color'] ?? '')) ?: '#8b5cf6';
+            $label = ['id' => mcp_id('lbl'), 'name' => $name, 'color' => $color];
+            $data['labels'][] = $label;
+            mcp_save($data);
+            mcp_audit('add_label', ['name' => $name, 'color' => $color]);
+            return "Added label '$name' (id {$label['id']}).";
+        }
+
+        case 'set_task_label': {
+            $needle = trim((string)($a['id'] ?? $a['title'] ?? ''));
+            $filter = isset($a['project']) ? mcp_find_lane($data, $a['project']) : null;
+            $i = mcp_find_card_index($data, $needle, $filter);
+            if ($i === null) throw new McpError("Task '$needle' not found.");
+            $labelArg = trim((string)($a['label'] ?? ''));
+            $labelId = null; $labelName = '(nessuna)';
+            if ($labelArg !== '') {
+                foreach (($data['labels'] ?? []) as $lbl) {
+                    if (stripos($lbl['name'], $labelArg) !== false) { $labelId = $lbl['id']; $labelName = $lbl['name']; break; }
+                }
+                if ($labelId === null) throw new McpError("Label '$labelArg' not found. Available: " . implode(', ', array_column($data['labels'] ?? [], 'name')));
+            }
+            $data['cards'][$i]['label_id'] = $labelId;
+            $data['cards'][$i]['updated_at'] = date('Y-m-d H:i:s');
+            mcp_save($data);
+            $c = $data['cards'][$i];
+            mcp_audit('set_task_label', ['seq' => $c['seq'] ?? null, 'title' => $c['title'], 'label' => $labelName]);
+            return 'Set label on #' . ($c['seq'] ?? '?') . " '{$c['title']}' to $labelName.";
         }
 
         case 'get_task': {
