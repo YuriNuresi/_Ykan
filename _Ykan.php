@@ -7179,6 +7179,7 @@ ${epicRows}</div>`);
             <div class="changelog-version">
                 <h3>v1.9.0 - September 2026</h3>
                 <ul>
+                    <li>🎯 <strong>Focus tab</strong> - su cosa lavorare ora e quanto manca per la stable, progetto per progetto</li>
                     <li>📊 <strong>Dashboard tab</strong> - cross-project view: Da riprendere, Attività, Revisione sessioni, Git</li>
                     <li>🌉 <strong>Local Bridge</strong> - optional Node helper (<code>bridge/</code>) on <code>127.0.0.1</code> feeding real Claude Code session history and a live terminal</li>
                     <li>🗄️ <strong>Database tools</strong> - <code>db_query</code>, <code>db_exec</code>, <code>db_schema</code>, <code>db_dump_table</code> exposed via <code>mcp.php</code></li>
