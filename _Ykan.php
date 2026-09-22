@@ -4035,8 +4035,9 @@ $dataJson = json_encode($data);
                 const expSeqs = explicit.get(s.id) || new Set();
                 const seqs = new Set([...(s.tasks || []), ...expSeqs]);
                 const cards = [...seqs].map(q => bySeq.get(q)).filter(Boolean);
-                const ageDays = Math.floor((now - new Date(s.modified).getTime()) / 86400000);
-                all.push({ s, lane, cards, ageDays });
+                const ageMs = now - new Date(s.modified).getTime();
+                const ageDays = Math.floor(ageMs / 86400000);
+                all.push({ s, lane, cards, ageDays, ageMs });
                 if (s.auto || s.isArchived || ageDays > dashDays || sessState(s.id)) continue;
 
                 const label = s.title || s.preview || '(senza titolo)';
@@ -4529,25 +4530,42 @@ $dataJson = json_encode($data);
                 score -= Math.min(openRemote * 4, 20);
                 score -= Math.min(looseItems.filter(i => i.severity === 'high').length * 8, 24);
                 pct = Math.max(0, Math.min(100, Math.round(score)));
-                // La lista blocchi deve rispecchiare cosa ha abbassato il punteggio: prima i bug/urgent
-                // aperti (i segnali più concreti), poi le altre cose in sospeso viste dalle altre schede.
+                // La lista blocchi deve rispecchiare ESATTAMENTE cosa ha abbassato il punteggio, altrimenti
+                // il numero non si spiega da solo: prima i bug/urgent aperti (i segnali più concreti), poi le
+                // altre cose in sospeso viste dalle altre schede, infine lo stato git/GitHub (non è un task
+                // ma pesa comunque sul punteggio, quindi va detto — non clickabile, non c'è una card da aprire).
                 const seen = new Set();
                 const fromCards = [...openUrgent, ...openBugs]
                     .filter(c => (seen.has(c.id) ? false : (seen.add(c.id), true)))
                     .map(c => ({ id: c.id, seq: c.seq, title: c.title, detail: dashLabelName(c.label_id) + ' aperto' }));
                 const fromLoose = looseItems.filter(i => i.severity !== 'low' && !seen.has(i.id))
                     .map(i => { seen.add(i.id); return { id: i.id, seq: i.seq, title: i.title, detail: (DASH_KINDS[i.kind] || ['•', i.kind])[1] + ': ' + i.detail }; });
-                blockers = [...fromCards, ...fromLoose].slice(0, 6);
+                const fromGit = [
+                    dirty ? { id: null, title: 'Modifiche non committate', detail: 'git: file modificati o non tracciati nella cartella locale' } : null,
+                    ahead ? { id: null, title: ahead + ' commit da pushare', detail: 'git: non ancora su GitHub' } : null,
+                    openRemote ? { id: null, title: openRemote + ' issue/PR aperte', detail: ghRepo ? 'su ' + ghRepo : 'su GitHub' } : null,
+                ].filter(Boolean);
+                blockers = [...fromCards, ...fromLoose, ...fromGit].slice(0, 8);
             }
 
             const lastAct = act[lane.name];
             const daysStale = lastAct ? Math.floor((Date.now() - lastAct.ts) / 86400000) : null;
+
+            // "Attivo ora": una sessione Claude Code non conclusa, con un messaggio nelle ultime ore, su
+            // questo progetto — letta dal Bridge locale (sessioni di Claude Code sul PC, non le sessioni
+            // cloud/remote: quelle non sono visibili a Ykan, vedi la nota nella scheda "Revisione sessioni").
+            const ACTIVE_MS = 2 * 3600000;
+            const liveSessions = sd.all.filter(r => r.lane.id === lane.id && !r.s.auto && !r.s.isArchived && !sessState(r.s.id));
+            const activeMinAgeMs = liveSessions.length ? Math.min(...liveSessions.map(r => r.ageMs)) : null;
+            const activeNow = activeMinAgeMs !== null && activeMinAgeMs <= ACTIVE_MS;
+
             const attention = (100 - pct) * 0.7
                 + (daysStale != null ? Math.min(daysStale, 30) : 15) * 1.2
                 + openUrgent.length * 10
-                + (dirty ? 6 : 0);
+                + (dirty ? 6 : 0)
+                - (activeNow ? 200 : 0); // ci stai già lavorando: non serve segnalarlo come "prossimo da fare"
 
-            return { lane, pct, explicit, blockers, openBugs, openUrgent, dirty, ahead, openRemote, daysStale, attention };
+            return { lane, pct, explicit, blockers, openBugs, openUrgent, dirty, ahead, openRemote, daysStale, activeNow, activeMinAgeMs, attention };
         }).sort((a, b) => {
             const tier = (a.pct === 100) - (b.pct === 100); // 100% sempre dopo tutto il resto
             if (tier) return tier;
@@ -4610,12 +4628,18 @@ $dataJson = json_encode($data);
                 r.ahead ? `<span class="git-tag info">⬆ ${r.ahead} da pushare</span>` : '',
                 r.openRemote ? `<span class="git-tag">${r.openRemote} issue/PR</span>` : ''
             ].join('');
+            const blockLabel = r.explicit ? 'task da chiudere' : 'cose da sistemare (stima)';
             const blockersHtml = r.blockers.length
                 ? `<div class="focus-blockers">
-                    <div class="dash-sub" style="margin-bottom:4px">📦 Prossima PR — ${r.blockers.length} task da chiudere${r.explicit ? '' : ' (stima)'}</div>
-                    ${r.blockers.map(b => `<div class="dash-ev" onclick="dashOpenCard('${escHtml(b.id)}')"><b>${b.seq ? '#' + b.seq + ' ' : ''}${escHtml(b.title)}</b> — ${escHtml(b.detail)}</div>`).join('')}
+                    <div class="dash-sub" style="margin-bottom:4px">📦 Prossima PR — ${r.blockers.length} ${blockLabel}</div>
+                    ${r.blockers.map(b => b.id
+                        ? `<div class="dash-ev" onclick="dashOpenCard('${escHtml(b.id)}')"><b>${b.seq ? '#' + b.seq + ' ' : ''}${escHtml(b.title)}</b> — ${escHtml(b.detail)}</div>`
+                        : `<div class="dash-ev" style="cursor:default"><b>${escHtml(b.title)}</b> — ${escHtml(b.detail)}</div>`
+                    ).join('')}
                    </div>`
                 : '<div class="focus-blockers"><div class="dash-sub">Nessun blocco individuato — pronto per la stable. 🎉</div></div>';
+            const activeBadge = r.activeNow
+                ? `<span class="focus-pick" style="background:#16a34a" title="Sessione Claude Code locale non conclusa, attiva nelle ultime 2 ore (via Bridge)">🟢 ${idx === 0 ? 'in corso' : 'attivo ora'}</span>` : '';
             const moveArrows = dashFocusSort !== 'manual' ? '' : `<span style="display:flex;flex-direction:column;gap:0">
                     <button type="button" class="btn btn-icon" style="padding:0 4px;height:14px" title="Sposta su" ${idx === tierStart(idx) ? 'disabled style="opacity:.3"' : ''} onclick="event.stopPropagation();dashFocusMove('${escHtml(r.lane.id)}',-1)">
                         <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M18 15l-6-6-6 6"/></svg>
@@ -4629,7 +4653,7 @@ $dataJson = json_encode($data);
                     ${moveArrows}
                     <span class="wk-dot" style="background:${dashColor(r.lane.name)}"></span>
                     <b>${escHtml(r.lane.name)}</b>
-                    ${idx === 0 ? '<span class="focus-pick">lavoraci ora</span>' : ''}
+                    ${activeBadge || (idx === 0 ? '<span class="focus-pick">lavoraci ora</span>' : '')}
                     <span style="flex:1"></span>
                     ${badges}
                     ${r.daysStale != null ? `<span class="focus-stale">${r.daysStale === 0 ? 'attivo oggi' : 'fermo da ' + r.daysStale + 'g'}</span>` : ''}
