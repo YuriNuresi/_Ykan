@@ -2548,7 +2548,8 @@ $dataJson = json_encode($data);
             --border: #475569; --shadow: 0 1px 3px rgba(0,0,0,0.3);
         }
         * { box-sizing: border-box; margin: 0; padding: 0; }
-        body { font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; font-size: var(--font-base); }
+        html { overflow-x: hidden; }
+        body { font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; font-size: var(--font-base); overflow-x: hidden; }
 
         /* Header */
         .header { display: flex; align-items: center; gap: 12px; padding: var(--header-pad); background: var(--header-bg); color: var(--header-text); border-bottom: 1px solid var(--border); }
