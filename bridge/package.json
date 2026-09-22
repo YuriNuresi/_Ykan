@@ -1,0 +1,18 @@
+{
+  "name": "ykan-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Bridge locale per Ykan: legge lo storico sessioni Claude Code e apre un terminale via WebSocket, sola esecuzione locale (127.0.0.1).",
+  "main": "bridge-server.js",
+  "scripts": {
+    "start": "node bridge-server.js",
+    "build": "node build-dist.js"
+  },
+  "dependencies": {
+    "node-pty": "^1.0.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "postject": "^1.0.0-alpha.6"
+  }
+}

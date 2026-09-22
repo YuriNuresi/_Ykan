@@ -34,12 +34,14 @@ with these two keys:
 ```
 MCP_SECRET=a-long-random-string-that-is-the-password
 MCP_ROOT=/absolute/path/that/contains/your/project/folders
+ANTHROPIC_KEY=sk-ant-your-api-key-here
 ```
 
 | Key | What to put |
 |-----|-------------|
 | `MCP_SECRET` | A long random string. **It is the password** — the whole URL is a secret. |
 | `MCP_ROOT` | Absolute path to the folder that **contains** your project folders (usually your hosting web root). Ask OVH/your FTP client for the absolute path, e.g. `/homez.NNN/youruser/www`. |
+| `ANTHROPIC_KEY` | *(optional)* Anthropic API key for the **Claude Agent** feature — one-click autonomous task execution from the board. Without it, the "Claude Go" button opens claude.ai with a pre-built prompt instead. |
 
 A `.env` next to `mcp.php` takes precedence over one in the hosting root.
 Every project folder you link is resolved **relative to `MCP_ROOT`**.

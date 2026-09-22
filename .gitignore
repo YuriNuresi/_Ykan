@@ -16,3 +16,7 @@ _ykan_mcp_audit.log
 .claude/
 .DS_Store
 Thumbs.db
+
+# Bridge locale: dipendenze e pacchetto generato
+bridge/node_modules/
+bridge/dist/
