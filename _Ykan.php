@@ -2934,6 +2934,17 @@ $dataJson = json_encode($data);
         .git-tag.warn { background: #ea580c; border-color: #ea580c; color: #fff; }
         .git-tag.ok { color: #16a34a; border-color: #16a34a; }
         .git-tag.info { background: #2563eb; border-color: #2563eb; color: #fff; }
+        /* Scheda Focus */
+        .focus-row { border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; margin-bottom: 8px; background: var(--bg3, transparent); }
+        .focus-row.focus-top { border-color: var(--accent); }
+        .focus-head { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+        .focus-head b { font-size: 14px; }
+        .focus-pick { font-size: 10px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; background: var(--accent); color: #fff; padding: 1px 7px; border-radius: 8px; }
+        .focus-pct { font-size: 13px; font-weight: 700; }
+        .focus-stale { font-size: 11px; color: var(--text2); }
+        .focus-blockers { margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--border); }
+        .focus-blockers .dash-ev { cursor: pointer; }
+        .focus-blockers .dash-ev:hover b { text-decoration: underline; }
         /* Telefono: intestazione e Dashboard vanno a capo invece di uscire dallo schermo */
         @media (max-width: 720px) {
             .header { flex-wrap: wrap; row-gap: 6px; }
@@ -3068,6 +3079,7 @@ $dataJson = json_encode($data);
             <button class="btn" onclick="loadDashboard()">↻ Aggiorna</button>
         </div>
         <div id="dashTabs" class="dash-tabs">
+            <button data-tab="focus" onclick="dashTab('focus')">🎯 Focus <span class="dash-count"></span></button>
             <button data-tab="resume" onclick="dashTab('resume')">Da riprendere <span class="dash-count"></span></button>
             <button data-tab="week" onclick="dashTab('week')">Attività <span class="dash-count"></span></button>
             <button data-tab="review" onclick="dashTab('review')">Revisione sessioni <span class="dash-count"></span></button>
@@ -3890,8 +3902,8 @@ $dataJson = json_encode($data);
     const DASH_DONE_RE = /done|fatto|chius|completat/i;
     const DASH_DOING_RE = /progress|doing|corso|lavor/i;
     let dashData = null;
-    let dashTabName = 'resume';
-    try { dashTabName = localStorage.getItem('ykan_dash_tab') || 'resume'; } catch (_) {}
+    let dashTabName = 'focus';
+    try { dashTabName = localStorage.getItem('ykan_dash_tab') || 'focus'; } catch (_) {}
     // Filtro comune a tutte le schede: progetto + periodo
     let dashProject = '', dashDays = 14, dashStaleDays = 3;
     try {
@@ -4100,6 +4112,7 @@ $dataJson = json_encode($data);
         if (!dashData) return;
         const { res, sd } = dashData;
         const counts = {
+            focus: dashGit ? dashFocusData().filter(r => r.pct < 100).length : '',
             resume: [...res.items, ...sd.items].filter(i => dashInProject(i.project)).length,
             week: dashWeekEvents(res, sd).length,
             review: dashReviewRows(sd).length,
@@ -4110,7 +4123,8 @@ $dataJson = json_encode($data);
             b.querySelector('.dash-count').textContent = counts[b.dataset.tab];
         });
         const body = document.getElementById('dashboardBody');
-        if (dashTabName === 'week') body.innerHTML = dashWeekHtml(res, sd);
+        if (dashTabName === 'focus') { body.innerHTML = dashFocusHtml(); if (!dashGit) dashGitLoad(); }
+        else if (dashTabName === 'week') body.innerHTML = dashWeekHtml(res, sd);
         else if (dashTabName === 'review') body.innerHTML = dashReviewHtml(sd);
         else if (dashTabName === 'git') { body.innerHTML = dashGitHtml(); if (!dashGit) dashGitLoad(); }
         else body.innerHTML = dashResumeHtml(res, sd);
@@ -4433,6 +4447,121 @@ $dataJson = json_encode($data);
                     <div class="git-state">${tags.join('')}</div>
                 </div>
                 <button class="btn" style="padding:2px 8px;font-size:11px" onclick="openTerminalModal('${escHtml(lane.id)}')">🖥️ Terminale</button>
+            </div>`;
+        }).join('');
+    }
+
+    // ---- Tab "Focus": su cosa lavorare ora + quanto manca per una versione stable ----
+    // Se un progetto ha task taggati con una label il cui nome contiene "stable" (a scelta
+    // dell'utente, es. "🎯 Stable"), quella lista di task ancora aperti E' il conto alla rovescia
+    // verso la stable. Altrimenti si stima dai segnali già raccolti dalle altre schede (loose ends,
+    // bug/urgent aperti, stato git, issue/PR aperte).
+    function dashStableLabel() { return (boardData.labels || []).find(l => /stable/i.test(l.name || '')); }
+    function dashLabelName(id) { const l = (boardData.labels || []).find(x => x.id === id); return l ? l.name : ''; }
+
+    function dashFocusData() {
+        const { res, sd } = dashData;
+        const stableLabel = dashStableLabel();
+        const act = dashProjectActivity(sd);
+        return boardData.swimlanes.filter(l => dashInProject(l.name)).map(lane => {
+            const cards = boardData.cards.filter(c => c.swimlane_id === lane.id);
+            const openBugs = cards.filter(c => !dashCardDone(c) && /bug/i.test(dashLabelName(c.label_id)));
+            const openUrgent = cards.filter(c => !dashCardDone(c) && /urgent/i.test(dashLabelName(c.label_id)));
+            const looseItems = res.items.filter(i => i.project === lane.name);
+
+            const info = dashGit && dashGit.byLane[lane.id];
+            const dirty = !!(info && (info.changed || info.untracked));
+            const ahead = (info && info.ahead) || 0;
+            const ghRepo = dashGitRepoOf(lane, info);
+            const gh = ghRepo && dashGit && dashGit.gh[ghRepo];
+            const openRemote = (gh && gh.ok) ? (gh.open_issues || 0) : 0;
+
+            let explicit = false, pct, blockers;
+            const tagged = stableLabel ? cards.filter(c => c.label_id === stableLabel.id) : [];
+            if (tagged.length) {
+                explicit = true;
+                const done = tagged.filter(dashCardDone);
+                pct = Math.round(done.length / tagged.length * 100);
+                blockers = tagged.filter(c => !dashCardDone(c))
+                    .map(c => ({ id: c.id, seq: c.seq, title: c.title, detail: '🎯 tra i blocchi per la stable' }));
+            } else {
+                let score = 100;
+                score -= Math.min(openBugs.length * 15, 45);
+                score -= Math.min(openUrgent.length * 12, 36);
+                score -= dirty ? 10 : 0;
+                score -= Math.min(ahead * 4, 12);
+                score -= Math.min(openRemote * 4, 20);
+                score -= Math.min(looseItems.filter(i => i.severity === 'high').length * 8, 24);
+                pct = Math.max(0, Math.min(100, Math.round(score)));
+                // La lista blocchi deve rispecchiare cosa ha abbassato il punteggio: prima i bug/urgent
+                // aperti (i segnali più concreti), poi le altre cose in sospeso viste dalle altre schede.
+                const seen = new Set();
+                const fromCards = [...openUrgent, ...openBugs]
+                    .filter(c => (seen.has(c.id) ? false : (seen.add(c.id), true)))
+                    .map(c => ({ id: c.id, seq: c.seq, title: c.title, detail: dashLabelName(c.label_id) + ' aperto' }));
+                const fromLoose = looseItems.filter(i => i.severity !== 'low' && !seen.has(i.id))
+                    .map(i => { seen.add(i.id); return { id: i.id, seq: i.seq, title: i.title, detail: (DASH_KINDS[i.kind] || ['•', i.kind])[1] + ': ' + i.detail }; });
+                blockers = [...fromCards, ...fromLoose].slice(0, 6);
+            }
+
+            const lastAct = act[lane.name];
+            const daysStale = lastAct ? Math.floor((Date.now() - lastAct.ts) / 86400000) : null;
+            const attention = (100 - pct) * 0.7
+                + (daysStale != null ? Math.min(daysStale, 30) : 15) * 1.2
+                + openUrgent.length * 10
+                + (dirty ? 6 : 0);
+
+            return { lane, pct, explicit, blockers, openBugs, openUrgent, dirty, ahead, openRemote, daysStale, attention };
+        }).sort((a, b) => b.attention - a.attention);
+    }
+
+    function dashFocusHtml() {
+        if (!dashData) return '<div class="dash-empty">Carico…</div>';
+        if (dashGit === null) return '<div class="dash-empty">Leggo lo stato dei repository…</div>';
+        const rows = dashFocusData();
+        if (!rows.length) return '<div class="dash-empty">Nessun progetto. Aggiungine uno dalla Kanban. 🎉</div>';
+
+        const ready = rows.filter(r => r.pct >= 90).length;
+        const mid = rows.filter(r => r.pct >= 60 && r.pct < 90).length;
+        const far = rows.filter(r => r.pct < 60).length;
+        const summary = `<div class="git-summary">
+            <div><b>${ready}</b><span>pronti / quasi (≥90%)</span></div>
+            <div><b>${mid}</b><span>a buon punto (60–89%)</span></div>
+            <div><b>${far}</b><span>lontani (&lt;60%)</span></div></div>`;
+
+        const hint = dashStableLabel() ? '' : `<div class="dash-hint" style="padding:8px 12px;border:1px dashed var(--border);border-radius:8px;margin-bottom:12px;font-size:12px;color:var(--text2)">
+            Stima automatica (bug/urgent aperti, stato git, issue/PR). Per un conto alla rovescia preciso, crea una label <b>Stable</b> in
+            <a href="#" onclick="openConfigModal();return false">⚙️ Settings</a> e taggaci i task che devono chiudersi prima del rilascio.</div>`;
+
+        return summary + hint + rows.map((r, idx) => {
+            const key = 'f|' + r.lane.name;
+            const open = dashExpanded.has(key) || idx === 0;
+            const color = r.pct >= 90 ? '#16a34a' : r.pct >= 60 ? '#ea580c' : '#dc2626';
+            const badges = [
+                r.openBugs.length ? `<span class="git-tag warn">🐞 ${r.openBugs.length}</span>` : '',
+                r.openUrgent.length ? `<span class="git-tag warn">❗ ${r.openUrgent.length}</span>` : '',
+                r.dirty ? '<span class="git-tag">✎ non committato</span>' : '',
+                r.ahead ? `<span class="git-tag info">⬆ ${r.ahead} da pushare</span>` : '',
+                r.openRemote ? `<span class="git-tag">${r.openRemote} issue/PR</span>` : ''
+            ].join('');
+            const blockersHtml = r.blockers.length
+                ? `<div class="focus-blockers">
+                    <div class="dash-sub" style="margin-bottom:4px">📦 Prossima PR — ${r.blockers.length} task da chiudere${r.explicit ? '' : ' (stima)'}</div>
+                    ${r.blockers.map(b => `<div class="dash-ev" onclick="dashOpenCard('${escHtml(b.id)}')"><b>${b.seq ? '#' + b.seq + ' ' : ''}${escHtml(b.title)}</b> — ${escHtml(b.detail)}</div>`).join('')}
+                   </div>`
+                : '<div class="focus-blockers"><div class="dash-sub">Nessun blocco individuato — pronto per la stable. 🎉</div></div>';
+            return `<div class="focus-row${idx === 0 ? ' focus-top' : ''}">
+                <div class="focus-head" onclick="dashToggleExpand('${key.replace(/'/g, '&#39;')}')">
+                    <span class="wk-dot" style="background:${dashColor(r.lane.name)}"></span>
+                    <b>${escHtml(r.lane.name)}</b>
+                    ${idx === 0 ? '<span class="focus-pick">lavoraci ora</span>' : ''}
+                    <span style="flex:1"></span>
+                    ${badges}
+                    ${r.daysStale != null ? `<span class="focus-stale">${r.daysStale === 0 ? 'attivo oggi' : 'fermo da ' + r.daysStale + 'g'}</span>` : ''}
+                    <span class="focus-pct" style="color:${color}">${r.pct}%</span>
+                </div>
+                <div class="pm-prog"><i style="width:${r.pct}%;background:${color}"></i></div>
+                ${open ? blockersHtml : ''}
             </div>`;
         }).join('');
     }
