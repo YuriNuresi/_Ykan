@@ -2945,6 +2945,12 @@ $dataJson = json_encode($data);
         .focus-blockers { margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--border); }
         .focus-blockers .dash-ev { cursor: pointer; }
         .focus-blockers .dash-ev:hover b { text-decoration: underline; }
+        .focus-manage { font-size: 11px; padding: 2px 9px; }
+        .stable-scope-row { display: flex; align-items: center; gap: 8px; padding: 6px 4px; border-bottom: 1px solid var(--border); font-size: 13px; }
+        .stable-scope-row:last-child { border-bottom: none; }
+        .stable-scope-row input[type=checkbox] { width: auto; flex-shrink: 0; }
+        .stable-scope-title { flex: 1; cursor: pointer; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .stable-scope-title:hover { text-decoration: underline; color: var(--accent); }
         /* Telefono: intestazione e Dashboard vanno a capo invece di uscire dallo schermo */
         @media (max-width: 720px) {
             .header { flex-wrap: wrap; row-gap: 6px; }
@@ -3427,6 +3433,24 @@ $dataJson = json_encode($data);
             <div class="modal-actions">
                 <button type="button" class="btn" onclick="closeGitInit()">Chiudi</button>
                 <button type="button" class="btn btn-primary" id="gitInitGo" onclick="gitInitRun()">Inizializza</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Ambito Stable (Focus): scegli a mano quali task aperti mancano per la prossima versione stable -->
+    <div id="stableScopeModal" class="modal-overlay">
+        <div class="modal" style="max-width:560px;width:92vw;max-height:85vh;display:flex;flex-direction:column">
+            <h2>🎯 Ambito Stable — <span id="stableScopeName"></span></h2>
+            <div style="font-size:12px;color:var(--text2);margin-bottom:8px">
+                Seleziona i task ancora aperti che devono chiudersi prima della prossima stable. Deselezionali tutti per tornare alla stima automatica.</div>
+            <div style="display:flex;gap:6px;margin-bottom:8px">
+                <button type="button" class="btn" style="font-size:11px;padding:2px 9px" onclick="stableScopeSelectAll(true)">Seleziona tutti</button>
+                <button type="button" class="btn" style="font-size:11px;padding:2px 9px" onclick="stableScopeSelectAll(false)">Deseleziona tutti</button>
+            </div>
+            <div id="stableScopeBody" style="overflow-y:auto;flex:1;min-height:80px;border:1px solid var(--border);border-radius:8px;padding:2px 8px"></div>
+            <div class="modal-actions">
+                <button type="button" class="btn" onclick="closeStableScope()">Annulla</button>
+                <button type="button" class="btn btn-primary" id="stableScopeSaveBtn" onclick="stableScopeSave()">Salva</button>
             </div>
         </div>
     </div>
@@ -4558,12 +4582,99 @@ $dataJson = json_encode($data);
                     <span style="flex:1"></span>
                     ${badges}
                     ${r.daysStale != null ? `<span class="focus-stale">${r.daysStale === 0 ? 'attivo oggi' : 'fermo da ' + r.daysStale + 'g'}</span>` : ''}
+                    <button type="button" class="btn focus-manage" onclick="event.stopPropagation();openStableScope('${escHtml(r.lane.id)}')">🎯 Gestisci</button>
                     <span class="focus-pct" style="color:${color}">${r.pct}%</span>
                 </div>
                 <div class="pm-prog"><i style="width:${r.pct}%;background:${color}"></i></div>
                 ${open ? blockersHtml : ''}
             </div>`;
         }).join('');
+    }
+
+    // ---- Ambito Stable: scelta manuale dei task che mancano per la prossima versione ----
+    // Selezioni i task aperti di un progetto -> li tagga con la label Stable (dashStableLabel).
+    // Deselezionarli tutti torna alla stima automatica, perché dashFocusData usa la lista
+    // esplicita solo quando esiste almeno un task taggato per quel progetto.
+    let stableScopeLane = null;
+    let stableScopeCards = []; // [{ card, checked }] snapshot mentre il modal è aperto
+    let stableScopeReturnAfterCard = false;
+
+    async function ensureStableLabel() {
+        let lbl = dashStableLabel();
+        if (lbl) return lbl;
+        const r = await api('add_label', { name: '🎯 Stable', color: '#8b5cf6' });
+        if (r.success && r.label) { boardData.labels.push(r.label); return r.label; }
+        toast('Non sono riuscito a creare la label Stable', 'error');
+        return null;
+    }
+
+    async function openStableScope(laneId) {
+        const lane = boardData.swimlanes.find(l => l.id === laneId);
+        if (!lane) return;
+        const lbl = await ensureStableLabel();
+        if (!lbl) return;
+        stableScopeLane = lane;
+        const cards = boardData.cards.filter(c => c.swimlane_id === laneId && !dashCardDone(c));
+        stableScopeCards = cards.map(c => ({ card: c, checked: c.label_id === lbl.id }));
+        document.getElementById('stableScopeName').textContent = lane.name;
+        stableScopeRenderList();
+        document.getElementById('stableScopeModal').classList.add('active');
+    }
+
+    function stableScopeRenderList() {
+        const body = document.getElementById('stableScopeBody');
+        if (!stableScopeCards.length) {
+            body.innerHTML = '<div class="dash-empty">Nessun task aperto in questo progetto. 🎉</div>';
+            return;
+        }
+        const colName = id => (boardData.columns.find(c => c.id === id) || {}).name || '?';
+        const lblName = id => (boardData.labels.find(l => l.id === id) || {}).name || '';
+        body.innerHTML = stableScopeCards.map((row, i) => {
+            const c = row.card;
+            const otherLabel = c.label_id && !row.checked ? lblName(c.label_id) : '';
+            return `<label class="stable-scope-row">
+                <input type="checkbox" ${row.checked ? 'checked' : ''} onchange="stableScopeCards[${i}].checked=this.checked">
+                <span class="git-tag">${escHtml(colName(c.column_id))}</span>
+                <span class="stable-scope-title" title="Apri il task" onclick="event.preventDefault();stableScopeOpenCard('${escHtml(c.id)}')">${c.seq ? '#' + c.seq + ' ' : ''}${escHtml(c.title)}</span>
+                ${otherLabel ? `<span class="git-tag warn" title="Verrà sostituita dalla label Stable">era: ${escHtml(otherLabel)}</span>` : ''}
+            </label>`;
+        }).join('');
+    }
+
+    function stableScopeSelectAll(on) {
+        stableScopeCards.forEach(row => row.checked = on);
+        stableScopeRenderList();
+    }
+
+    function stableScopeOpenCard(id) {
+        stableScopeReturnAfterCard = true;
+        document.getElementById('stableScopeModal').classList.remove('active');
+        dashOpenCard(id);
+    }
+
+    async function stableScopeSave() {
+        const lbl = dashStableLabel();
+        if (!lbl) { closeStableScope(); return; }
+        const btn = document.getElementById('stableScopeSaveBtn');
+        btn.disabled = true; btn.textContent = 'Salvo…';
+        for (const row of stableScopeCards) {
+            const c = row.card;
+            const has = c.label_id === lbl.id;
+            if (row.checked === has) continue;
+            const newLabelId = row.checked ? lbl.id : null;
+            c.label_id = newLabelId;
+            await api('update_card', { id: c.id, label_id: newLabelId });
+        }
+        btn.disabled = false; btn.textContent = 'Salva';
+        closeStableScope();
+        render();
+        dashRender();
+        toast('Ambito stable aggiornato', 'success');
+    }
+
+    function closeStableScope() {
+        document.getElementById('stableScopeModal').classList.remove('active');
+        stableScopeLane = null; stableScopeCards = [];
     }
 
     // ---- Inizializza repository (git init + collegamento opzionale a GitHub) ----
@@ -5695,6 +5806,12 @@ $dataJson = json_encode($data);
 
     function closeCardModal() {
         document.getElementById('cardModal').classList.remove('active');
+        // Se il dettaglio è stato aperto dall'"Ambito Stable" (i due modal non possono stare
+        // aperti insieme: stesso z-index, l'ultimo nel DOM copre l'altro), ci si torna sopra.
+        if (stableScopeReturnAfterCard) {
+            stableScopeReturnAfterCard = false;
+            document.getElementById('stableScopeModal').classList.add('active');
+        }
     }
 
     document.getElementById('cardForm').addEventListener('submit', async (e) => {
