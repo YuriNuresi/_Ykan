@@ -2934,6 +2934,23 @@ $dataJson = json_encode($data);
         .git-tag.warn { background: #ea580c; border-color: #ea580c; color: #fff; }
         .git-tag.ok { color: #16a34a; border-color: #16a34a; }
         .git-tag.info { background: #2563eb; border-color: #2563eb; color: #fff; }
+        /* Scheda Focus */
+        .focus-row { border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; margin-bottom: 8px; background: var(--bg3, transparent); }
+        .focus-row.focus-top { border-color: var(--accent); }
+        .focus-head { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+        .focus-head b { font-size: 14px; }
+        .focus-pick { font-size: 10px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; background: var(--accent); color: #fff; padding: 1px 7px; border-radius: 8px; }
+        .focus-pct { font-size: 13px; font-weight: 700; }
+        .focus-stale { font-size: 11px; color: var(--text2); }
+        .focus-blockers { margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--border); }
+        .focus-blockers .dash-ev { cursor: pointer; }
+        .focus-blockers .dash-ev:hover b { text-decoration: underline; }
+        .focus-manage { font-size: 11px; padding: 2px 9px; }
+        .stable-scope-row { display: flex; align-items: center; gap: 8px; padding: 6px 4px; border-bottom: 1px solid var(--border); font-size: 13px; }
+        .stable-scope-row:last-child { border-bottom: none; }
+        .stable-scope-row input[type=checkbox] { width: auto; flex-shrink: 0; }
+        .stable-scope-title { flex: 1; cursor: pointer; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .stable-scope-title:hover { text-decoration: underline; color: var(--accent); }
         /* Telefono: intestazione e Dashboard vanno a capo invece di uscire dallo schermo */
         @media (max-width: 720px) {
             .header { flex-wrap: wrap; row-gap: 6px; }
@@ -2951,6 +2968,7 @@ $dataJson = json_encode($data);
             .git-row { flex-wrap: wrap; } .git-last { white-space: normal; }
             .dash-revbar .btn { flex: 1 1 auto; }
             .modal { width: 96%; padding: 14px; }
+            .focus-head { flex-wrap: wrap; row-gap: 4px; }
         }
         .sess-msg { margin: 6px 0; padding: 6px 10px; border-radius: 8px; border: 1px solid var(--border); }
         .sess-msg.user { background: var(--bg2); }
@@ -3068,6 +3086,7 @@ $dataJson = json_encode($data);
             <button class="btn" onclick="loadDashboard()">↻ Aggiorna</button>
         </div>
         <div id="dashTabs" class="dash-tabs">
+            <button data-tab="focus" onclick="dashTab('focus')">🎯 Focus <span class="dash-count"></span></button>
             <button data-tab="resume" onclick="dashTab('resume')">Da riprendere <span class="dash-count"></span></button>
             <button data-tab="week" onclick="dashTab('week')">Attività <span class="dash-count"></span></button>
             <button data-tab="review" onclick="dashTab('review')">Revisione sessioni <span class="dash-count"></span></button>
@@ -3415,6 +3434,24 @@ $dataJson = json_encode($data);
             <div class="modal-actions">
                 <button type="button" class="btn" onclick="closeGitInit()">Chiudi</button>
                 <button type="button" class="btn btn-primary" id="gitInitGo" onclick="gitInitRun()">Inizializza</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Ambito Stable (Focus): scegli a mano quali task aperti mancano per la prossima versione stable -->
+    <div id="stableScopeModal" class="modal-overlay">
+        <div class="modal" style="max-width:560px;width:92vw;max-height:85vh;display:flex;flex-direction:column">
+            <h2>🎯 Ambito Stable — <span id="stableScopeName"></span></h2>
+            <div style="font-size:12px;color:var(--text2);margin-bottom:8px">
+                Seleziona i task ancora aperti che devono chiudersi prima della prossima stable. Deselezionali tutti per tornare alla stima automatica.</div>
+            <div style="display:flex;gap:6px;margin-bottom:8px">
+                <button type="button" class="btn" style="font-size:11px;padding:2px 9px" onclick="stableScopeSelectAll(true)">Seleziona tutti</button>
+                <button type="button" class="btn" style="font-size:11px;padding:2px 9px" onclick="stableScopeSelectAll(false)">Deseleziona tutti</button>
+            </div>
+            <div id="stableScopeBody" style="overflow-y:auto;flex:1;min-height:80px;border:1px solid var(--border);border-radius:8px;padding:2px 8px"></div>
+            <div class="modal-actions">
+                <button type="button" class="btn" onclick="closeStableScope()">Annulla</button>
+                <button type="button" class="btn btn-primary" id="stableScopeSaveBtn" onclick="stableScopeSave()">Salva</button>
             </div>
         </div>
     </div>
@@ -3890,8 +3927,8 @@ $dataJson = json_encode($data);
     const DASH_DONE_RE = /done|fatto|chius|completat/i;
     const DASH_DOING_RE = /progress|doing|corso|lavor/i;
     let dashData = null;
-    let dashTabName = 'resume';
-    try { dashTabName = localStorage.getItem('ykan_dash_tab') || 'resume'; } catch (_) {}
+    let dashTabName = 'focus';
+    try { dashTabName = localStorage.getItem('ykan_dash_tab') || 'focus'; } catch (_) {}
     // Filtro comune a tutte le schede: progetto + periodo
     let dashProject = '', dashDays = 14, dashStaleDays = 3;
     try {
@@ -3998,8 +4035,9 @@ $dataJson = json_encode($data);
                 const expSeqs = explicit.get(s.id) || new Set();
                 const seqs = new Set([...(s.tasks || []), ...expSeqs]);
                 const cards = [...seqs].map(q => bySeq.get(q)).filter(Boolean);
-                const ageDays = Math.floor((now - new Date(s.modified).getTime()) / 86400000);
-                all.push({ s, lane, cards, ageDays });
+                const ageMs = now - new Date(s.modified).getTime();
+                const ageDays = Math.floor(ageMs / 86400000);
+                all.push({ s, lane, cards, ageDays, ageMs });
                 if (s.auto || s.isArchived || ageDays > dashDays || sessState(s.id)) continue;
 
                 const label = s.title || s.preview || '(senza titolo)';
@@ -4100,6 +4138,7 @@ $dataJson = json_encode($data);
         if (!dashData) return;
         const { res, sd } = dashData;
         const counts = {
+            focus: dashGit ? dashFocusData().filter(r => r.pct < 100).length : '',
             resume: [...res.items, ...sd.items].filter(i => dashInProject(i.project)).length,
             week: dashWeekEvents(res, sd).length,
             review: dashReviewRows(sd).length,
@@ -4110,7 +4149,8 @@ $dataJson = json_encode($data);
             b.querySelector('.dash-count').textContent = counts[b.dataset.tab];
         });
         const body = document.getElementById('dashboardBody');
-        if (dashTabName === 'week') body.innerHTML = dashWeekHtml(res, sd);
+        if (dashTabName === 'focus') { body.innerHTML = dashFocusHtml(); if (!dashGit) dashGitLoad(); }
+        else if (dashTabName === 'week') body.innerHTML = dashWeekHtml(res, sd);
         else if (dashTabName === 'review') body.innerHTML = dashReviewHtml(sd);
         else if (dashTabName === 'git') { body.innerHTML = dashGitHtml(); if (!dashGit) dashGitLoad(); }
         else body.innerHTML = dashResumeHtml(res, sd);
@@ -4435,6 +4475,281 @@ $dataJson = json_encode($data);
                 <button class="btn" style="padding:2px 8px;font-size:11px" onclick="openTerminalModal('${escHtml(lane.id)}')">🖥️ Terminale</button>
             </div>`;
         }).join('');
+    }
+
+    // ---- Tab "Focus": su cosa lavorare ora + quanto manca per una versione stable ----
+    // Se un progetto ha task taggati con una label il cui nome contiene "stable" (a scelta
+    // dell'utente, es. "🎯 Stable"), quella lista di task ancora aperti E' il conto alla rovescia
+    // verso la stable. Altrimenti si stima dai segnali già raccolti dalle altre schede (loose ends,
+    // bug/urgent aperti, stato git, issue/PR aperte).
+    function dashStableLabel() { return (boardData.labels || []).find(l => /stable/i.test(l.name || '')); }
+    function dashLabelName(id) { const l = (boardData.labels || []).find(x => x.id === id); return l ? l.name : ''; }
+
+    // Ordinamento: "priorità" (punteggio attenzione, calcolato) oppure "manuale" (ordine delle
+    // swimlane, quello del Kanban — con le frecce ↑↓ qui sotto). In entrambi i casi i progetti
+    // al 100% restano sempre in fondo: non c'è nulla da decidere su cosa è già pronto.
+    let dashFocusSort = 'auto';
+    try { dashFocusSort = localStorage.getItem('ykan_focus_sort') === 'manual' ? 'manual' : 'auto'; } catch (_) {}
+    function dashFocusSetSort(mode) {
+        dashFocusSort = mode === 'manual' ? 'manual' : 'auto';
+        try { localStorage.setItem('ykan_focus_sort', dashFocusSort); } catch (_) {}
+        dashRender();
+    }
+
+    function dashFocusData() {
+        const { res, sd } = dashData;
+        const stableLabel = dashStableLabel();
+        const act = dashProjectActivity(sd);
+        return boardData.swimlanes.filter(l => dashInProject(l.name)).map(lane => {
+            const cards = boardData.cards.filter(c => c.swimlane_id === lane.id);
+            const openBugs = cards.filter(c => !dashCardDone(c) && /bug/i.test(dashLabelName(c.label_id)));
+            const openUrgent = cards.filter(c => !dashCardDone(c) && /urgent/i.test(dashLabelName(c.label_id)));
+            const looseItems = res.items.filter(i => i.project === lane.name);
+
+            const info = dashGit && dashGit.byLane[lane.id];
+            const dirty = !!(info && (info.changed || info.untracked));
+            const ahead = (info && info.ahead) || 0;
+            const ghRepo = dashGitRepoOf(lane, info);
+            const gh = ghRepo && dashGit && dashGit.gh[ghRepo];
+            const openRemote = (gh && gh.ok) ? (gh.open_issues || 0) : 0;
+
+            let explicit = false, pct, blockers;
+            const tagged = stableLabel ? cards.filter(c => c.label_id === stableLabel.id) : [];
+            if (tagged.length) {
+                explicit = true;
+                const done = tagged.filter(dashCardDone);
+                pct = Math.round(done.length / tagged.length * 100);
+                blockers = tagged.filter(c => !dashCardDone(c))
+                    .map(c => ({ id: c.id, seq: c.seq, title: c.title, detail: '🎯 tra i blocchi per la stable' }));
+            } else {
+                let score = 100;
+                score -= Math.min(openBugs.length * 15, 45);
+                score -= Math.min(openUrgent.length * 12, 36);
+                score -= dirty ? 10 : 0;
+                score -= Math.min(ahead * 4, 12);
+                score -= Math.min(openRemote * 4, 20);
+                score -= Math.min(looseItems.filter(i => i.severity === 'high').length * 8, 24);
+                pct = Math.max(0, Math.min(100, Math.round(score)));
+                // La lista blocchi deve rispecchiare ESATTAMENTE cosa ha abbassato il punteggio, altrimenti
+                // il numero non si spiega da solo: prima i bug/urgent aperti (i segnali più concreti), poi le
+                // altre cose in sospeso viste dalle altre schede, infine lo stato git/GitHub (non è un task
+                // ma pesa comunque sul punteggio, quindi va detto — non clickabile, non c'è una card da aprire).
+                const seen = new Set();
+                const fromCards = [...openUrgent, ...openBugs]
+                    .filter(c => (seen.has(c.id) ? false : (seen.add(c.id), true)))
+                    .map(c => ({ id: c.id, seq: c.seq, title: c.title, detail: dashLabelName(c.label_id) + ' aperto' }));
+                const fromLoose = looseItems.filter(i => i.severity !== 'low' && !seen.has(i.id))
+                    .map(i => { seen.add(i.id); return { id: i.id, seq: i.seq, title: i.title, detail: (DASH_KINDS[i.kind] || ['•', i.kind])[1] + ': ' + i.detail }; });
+                const fromGit = [
+                    dirty ? { id: null, title: 'Modifiche non committate', detail: 'git: file modificati o non tracciati nella cartella locale' } : null,
+                    ahead ? { id: null, title: ahead + ' commit da pushare', detail: 'git: non ancora su GitHub' } : null,
+                    openRemote ? { id: null, title: openRemote + ' issue/PR aperte', detail: ghRepo ? 'su ' + ghRepo : 'su GitHub' } : null,
+                ].filter(Boolean);
+                blockers = [...fromCards, ...fromLoose, ...fromGit].slice(0, 8);
+            }
+
+            const lastAct = act[lane.name];
+            const daysStale = lastAct ? Math.floor((Date.now() - lastAct.ts) / 86400000) : null;
+
+            // "Attivo ora": una sessione Claude Code non conclusa, con un messaggio nelle ultime ore, su
+            // questo progetto — letta dal Bridge locale (sessioni di Claude Code sul PC, non le sessioni
+            // cloud/remote: quelle non sono visibili a Ykan, vedi la nota nella scheda "Revisione sessioni").
+            const ACTIVE_MS = 2 * 3600000;
+            const liveSessions = sd.all.filter(r => r.lane.id === lane.id && !r.s.auto && !r.s.isArchived && !sessState(r.s.id));
+            const activeMinAgeMs = liveSessions.length ? Math.min(...liveSessions.map(r => r.ageMs)) : null;
+            const activeNow = activeMinAgeMs !== null && activeMinAgeMs <= ACTIVE_MS;
+
+            const attention = (100 - pct) * 0.7
+                + (daysStale != null ? Math.min(daysStale, 30) : 15) * 1.2
+                + openUrgent.length * 10
+                + (dirty ? 6 : 0)
+                - (activeNow ? 200 : 0); // ci stai già lavorando: non serve segnalarlo come "prossimo da fare"
+
+            return { lane, pct, explicit, blockers, openBugs, openUrgent, dirty, ahead, openRemote, daysStale, activeNow, activeMinAgeMs, attention };
+        }).sort((a, b) => {
+            const tier = (a.pct === 100) - (b.pct === 100); // 100% sempre dopo tutto il resto
+            if (tier) return tier;
+            return dashFocusSort === 'manual' ? a.lane.position - b.lane.position : b.attention - a.attention;
+        });
+    }
+
+    // Sposta un progetto su/giù nell'ordine manuale (Focus), senza scavalcare il confine dei
+    // progetti al 100% — riusa moveSwimlane/reorder_swimlanes, quindi l'ordine è lo stesso del Kanban.
+    function dashFocusMove(laneId, dir) {
+        const rows = dashFocusData();
+        const i = rows.findIndex(r => r.lane.id === laneId);
+        const j = i + dir;
+        if (i === -1 || j < 0 || j >= rows.length) return;
+        if ((rows[i].pct === 100) !== (rows[j].pct === 100)) return;
+        const a = rows[i].lane, b = rows[j].lane;
+        const tmp = a.position; a.position = b.position; b.position = tmp;
+        render();
+        dashRender();
+        api('reorder_swimlanes', { order: boardData.swimlanes.slice().sort((x, y) => x.position - y.position).map(l => l.id) });
+    }
+
+    function dashFocusHtml() {
+        if (!dashData) return '<div class="dash-empty">Carico…</div>';
+        if (dashGit === null) return '<div class="dash-empty">Leggo lo stato dei repository…</div>';
+        const rows = dashFocusData();
+        if (!rows.length) return '<div class="dash-empty">Nessun progetto. Aggiungine uno dalla Kanban. 🎉</div>';
+
+        const ready = rows.filter(r => r.pct >= 90).length;
+        const mid = rows.filter(r => r.pct >= 60 && r.pct < 90).length;
+        const far = rows.filter(r => r.pct < 60).length;
+        const summary = `<div class="git-summary">
+            <div><b>${ready}</b><span>pronti / quasi (≥90%)</span></div>
+            <div><b>${mid}</b><span>a buon punto (60–89%)</span></div>
+            <div><b>${far}</b><span>lontani (&lt;60%)</span></div></div>`;
+
+        const hint = dashStableLabel() ? '' : `<div class="dash-hint" style="padding:8px 12px;border:1px dashed var(--border);border-radius:8px;margin-bottom:12px;font-size:12px;color:var(--text2)">
+            Stima automatica (bug/urgent aperti, stato git, issue/PR). Per un conto alla rovescia preciso, crea una label <b>Stable</b> in
+            <a href="#" onclick="openConfigModal();return false">⚙️ Settings</a> e taggaci i task che devono chiudersi prima del rilascio.</div>`;
+
+        const sortBar = `<div class="rv-filters">
+            <button type="button" class="${dashFocusSort === 'auto' ? 'active' : ''}" onclick="dashFocusSetSort('auto')" title="Per attenzione: readiness, quanto è fermo, urgenze">🎯 Per priorità</button>
+            <button type="button" class="${dashFocusSort === 'manual' ? 'active' : ''}" onclick="dashFocusSetSort('manual')" title="Ordina tu con le frecce ↑↓ (stesso ordine del Kanban)">↕ Manuale</button>
+        </div>`;
+
+        // I progetti al 100% stanno sempre in un unico blocco finale (vedi il sort in dashFocusData):
+        // serve per sapere dove finisce il "confine" e non far scavalcare le frecce su/giù da un blocco all'altro.
+        const firstReadyIdx = rows.findIndex(r => r.pct === 100);
+        const tierEnd = i => (rows[i].pct === 100 ? rows.length : (firstReadyIdx === -1 ? rows.length : firstReadyIdx)) - 1;
+        const tierStart = i => (rows[i].pct === 100 ? Math.max(firstReadyIdx, 0) : 0);
+
+        return summary + sortBar + hint + rows.map((r, idx) => {
+            const key = 'f|' + r.lane.name;
+            const open = dashExpanded.has(key) || idx === 0;
+            const color = r.pct >= 90 ? '#16a34a' : r.pct >= 60 ? '#ea580c' : '#dc2626';
+            const badges = [
+                r.openBugs.length ? `<span class="git-tag warn">🐞 ${r.openBugs.length}</span>` : '',
+                r.openUrgent.length ? `<span class="git-tag warn">❗ ${r.openUrgent.length}</span>` : '',
+                r.dirty ? '<span class="git-tag">✎ non committato</span>' : '',
+                r.ahead ? `<span class="git-tag info">⬆ ${r.ahead} da pushare</span>` : '',
+                r.openRemote ? `<span class="git-tag">${r.openRemote} issue/PR</span>` : ''
+            ].join('');
+            const blockLabel = r.explicit ? 'task da chiudere' : 'cose da sistemare (stima)';
+            const blockersHtml = r.blockers.length
+                ? `<div class="focus-blockers">
+                    <div class="dash-sub" style="margin-bottom:4px">📦 Prossima PR — ${r.blockers.length} ${blockLabel}</div>
+                    ${r.blockers.map(b => b.id
+                        ? `<div class="dash-ev" onclick="dashOpenCard('${escHtml(b.id)}')"><b>${b.seq ? '#' + b.seq + ' ' : ''}${escHtml(b.title)}</b> — ${escHtml(b.detail)}</div>`
+                        : `<div class="dash-ev" style="cursor:default"><b>${escHtml(b.title)}</b> — ${escHtml(b.detail)}</div>`
+                    ).join('')}
+                   </div>`
+                : '<div class="focus-blockers"><div class="dash-sub">Nessun blocco individuato — pronto per la stable. 🎉</div></div>';
+            const activeBadge = r.activeNow
+                ? `<span class="focus-pick" style="background:#16a34a" title="Sessione Claude Code locale non conclusa, attiva nelle ultime 2 ore (via Bridge)">🟢 ${idx === 0 ? 'in corso' : 'attivo ora'}</span>` : '';
+            const moveArrows = dashFocusSort !== 'manual' ? '' : `<span style="display:flex;flex-direction:column;gap:0">
+                    <button type="button" class="btn btn-icon" style="padding:0 4px;height:14px" title="Sposta su" ${idx === tierStart(idx) ? 'disabled style="opacity:.3"' : ''} onclick="event.stopPropagation();dashFocusMove('${escHtml(r.lane.id)}',-1)">
+                        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M18 15l-6-6-6 6"/></svg>
+                    </button>
+                    <button type="button" class="btn btn-icon" style="padding:0 4px;height:14px" title="Sposta giù" ${idx === tierEnd(idx) ? 'disabled style="opacity:.3"' : ''} onclick="event.stopPropagation();dashFocusMove('${escHtml(r.lane.id)}',1)">
+                        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M6 9l6 6 6-6"/></svg>
+                    </button>
+                </span>`;
+            return `<div class="focus-row${idx === 0 ? ' focus-top' : ''}">
+                <div class="focus-head" onclick="dashToggleExpand('${key.replace(/'/g, '&#39;')}')">
+                    ${moveArrows}
+                    <span class="wk-dot" style="background:${dashColor(r.lane.name)}"></span>
+                    <b>${escHtml(r.lane.name)}</b>
+                    ${activeBadge || (idx === 0 ? '<span class="focus-pick">lavoraci ora</span>' : '')}
+                    <span style="flex:1"></span>
+                    ${badges}
+                    ${r.daysStale != null ? `<span class="focus-stale">${r.daysStale === 0 ? 'attivo oggi' : 'fermo da ' + r.daysStale + 'g'}</span>` : ''}
+                    <button type="button" class="btn focus-manage" onclick="event.stopPropagation();openStableScope('${escHtml(r.lane.id)}')">🎯 Gestisci</button>
+                    <span class="focus-pct" style="color:${color}">${r.pct}%</span>
+                </div>
+                <div class="pm-prog"><i style="width:${r.pct}%;background:${color}"></i></div>
+                ${open ? blockersHtml : ''}
+            </div>`;
+        }).join('');
+    }
+
+    // ---- Ambito Stable: scelta manuale dei task che mancano per la prossima versione ----
+    // Selezioni i task aperti di un progetto -> li tagga con la label Stable (dashStableLabel).
+    // Deselezionarli tutti torna alla stima automatica, perché dashFocusData usa la lista
+    // esplicita solo quando esiste almeno un task taggato per quel progetto.
+    let stableScopeLane = null;
+    let stableScopeCards = []; // [{ card, checked }] snapshot mentre il modal è aperto
+    let stableScopeReturnAfterCard = false;
+
+    async function ensureStableLabel() {
+        let lbl = dashStableLabel();
+        if (lbl) return lbl;
+        const r = await api('add_label', { name: '🎯 Stable', color: '#8b5cf6' });
+        if (r.success && r.label) { boardData.labels.push(r.label); return r.label; }
+        toast('Non sono riuscito a creare la label Stable', 'error');
+        return null;
+    }
+
+    async function openStableScope(laneId) {
+        const lane = boardData.swimlanes.find(l => l.id === laneId);
+        if (!lane) return;
+        const lbl = await ensureStableLabel();
+        if (!lbl) return;
+        stableScopeLane = lane;
+        const cards = boardData.cards.filter(c => c.swimlane_id === laneId && !dashCardDone(c));
+        stableScopeCards = cards.map(c => ({ card: c, checked: c.label_id === lbl.id }));
+        document.getElementById('stableScopeName').textContent = lane.name;
+        stableScopeRenderList();
+        document.getElementById('stableScopeModal').classList.add('active');
+    }
+
+    function stableScopeRenderList() {
+        const body = document.getElementById('stableScopeBody');
+        if (!stableScopeCards.length) {
+            body.innerHTML = '<div class="dash-empty">Nessun task aperto in questo progetto. 🎉</div>';
+            return;
+        }
+        const colName = id => (boardData.columns.find(c => c.id === id) || {}).name || '?';
+        const lblName = id => (boardData.labels.find(l => l.id === id) || {}).name || '';
+        body.innerHTML = stableScopeCards.map((row, i) => {
+            const c = row.card;
+            const otherLabel = c.label_id && !row.checked ? lblName(c.label_id) : '';
+            return `<label class="stable-scope-row">
+                <input type="checkbox" ${row.checked ? 'checked' : ''} onchange="stableScopeCards[${i}].checked=this.checked">
+                <span class="git-tag">${escHtml(colName(c.column_id))}</span>
+                <span class="stable-scope-title" title="Apri il task" onclick="event.preventDefault();stableScopeOpenCard('${escHtml(c.id)}')">${c.seq ? '#' + c.seq + ' ' : ''}${escHtml(c.title)}</span>
+                ${otherLabel ? `<span class="git-tag warn" title="Verrà sostituita dalla label Stable">era: ${escHtml(otherLabel)}</span>` : ''}
+            </label>`;
+        }).join('');
+    }
+
+    function stableScopeSelectAll(on) {
+        stableScopeCards.forEach(row => row.checked = on);
+        stableScopeRenderList();
+    }
+
+    function stableScopeOpenCard(id) {
+        stableScopeReturnAfterCard = true;
+        document.getElementById('stableScopeModal').classList.remove('active');
+        dashOpenCard(id);
+    }
+
+    async function stableScopeSave() {
+        const lbl = dashStableLabel();
+        if (!lbl) { closeStableScope(); return; }
+        const btn = document.getElementById('stableScopeSaveBtn');
+        btn.disabled = true; btn.textContent = 'Salvo…';
+        for (const row of stableScopeCards) {
+            const c = row.card;
+            const has = c.label_id === lbl.id;
+            if (row.checked === has) continue;
+            const newLabelId = row.checked ? lbl.id : null;
+            c.label_id = newLabelId;
+            await api('update_card', { id: c.id, label_id: newLabelId });
+        }
+        btn.disabled = false; btn.textContent = 'Salva';
+        closeStableScope();
+        render();
+        dashRender();
+        toast('Ambito stable aggiornato', 'success');
+    }
+
+    function closeStableScope() {
+        document.getElementById('stableScopeModal').classList.remove('active');
+        stableScopeLane = null; stableScopeCards = [];
     }
 
     // ---- Inizializza repository (git init + collegamento opzionale a GitHub) ----
@@ -5566,6 +5881,12 @@ $dataJson = json_encode($data);
 
     function closeCardModal() {
         document.getElementById('cardModal').classList.remove('active');
+        // Se il dettaglio è stato aperto dall'"Ambito Stable" (i due modal non possono stare
+        // aperti insieme: stesso z-index, l'ultimo nel DOM copre l'altro), ci si torna sopra.
+        if (stableScopeReturnAfterCard) {
+            stableScopeReturnAfterCard = false;
+            document.getElementById('stableScopeModal').classList.add('active');
+        }
     }
 
     document.getElementById('cardForm').addEventListener('submit', async (e) => {
@@ -7050,6 +7371,7 @@ ${epicRows}</div>`);
             <div class="changelog-version">
                 <h3>v1.9.0 - September 2026</h3>
                 <ul>
+                    <li>🎯 <strong>Focus tab</strong> - su cosa lavorare ora e quanto manca per la stable, progetto per progetto</li>
                     <li>📊 <strong>Dashboard tab</strong> - cross-project view: Da riprendere, Attività, Revisione sessioni, Git</li>
                     <li>🌉 <strong>Local Bridge</strong> - optional Node helper (<code>bridge/</code>) on <code>127.0.0.1</code> feeding real Claude Code session history and a live terminal</li>
                     <li>🗄️ <strong>Database tools</strong> - <code>db_query</code>, <code>db_exec</code>, <code>db_schema</code>, <code>db_dump_table</code> exposed via <code>mcp.php</code></li>

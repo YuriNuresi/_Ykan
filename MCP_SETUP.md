@@ -99,3 +99,30 @@ Try, in order:
 
 > Tip: start by linking **one** project folder. Widen once you trust the flow.
 > Anyone who obtains the URL gets the same access — rotate `MCP_SECRET` if leaked.
+
+---
+
+## Local Bridge (Dashboard → Git / session review / terminal)
+
+The Dashboard's *Revisione sessioni*, *Git* and terminal panel need a small Node
+helper running **on your own PC** — it reads your local Claude Code session
+history and opens a real shell, so it can't live on the OVH host. It only binds
+to `127.0.0.1`; nothing outside your machine can reach it. Without it, those
+views just say "Bridge locale non raggiungibile" and the rest of the board
+works normally.
+
+**One-time setup** (Windows, needs [Node.js](https://nodejs.org) installed):
+1. Double-click `bridge/start-bridge.bat` — it installs its dependencies on
+   first run, then starts the Bridge (keep the window open while you use Ykan).
+
+**Start it automatically at every Windows login** (so it's already running
+when you open the board):
+1. Run `start-bridge.bat` once first (step above).
+2. Double-click `bridge/install-autostart.bat` — it adds a shortcut to your
+   Windows Startup folder that launches the Bridge silently, in the
+   background, every time you log in. To undo it, run
+   `bridge/uninstall-autostart.bat`.
+
+**Standalone .exe** (no Node.js needed to *run* it, only to build it once):
+`npm run build` inside `bridge/` produces `dist/ykan-bridge/ykan-bridge.exe` —
+a self-contained double-click launcher you can pin to the Desktop or taskbar.
