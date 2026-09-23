@@ -21,9 +21,10 @@ incollare) — e lo mostra:
 4. Assicurati di essere loggato su https://claude.ai in quel browser — l'estensione
    riusa la sessione già attiva, non chiede credenziali
 
-Si aggiorna da sola ogni 10 minuti (throttle minimo 30s anche sui refresh manuali,
-per non martellare claude.ai). Aprendo il popup o il badge su Ykan forza un
-refresh se il dato in cache ha più di un minuto.
+Si aggiorna da sola ogni minuto (il minimo che Chrome permette per un alarm —
+è il "come se cliccassi aggiorna ogni 60 secondi" chiesto esplicitamente).
+Un throttle di 45s protegge comunque da doppie chiamate se un refresh manuale
+capita a ridosso di quello automatico.
 
 ## File
 

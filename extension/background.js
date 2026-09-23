@@ -13,8 +13,8 @@
 //      sessione ad ogni risposta, ascoltarlo crea un loop infinito fetch→rotazione→fetch.
 
 const ALARM_NAME = 'ykan-usage-refresh';
-const REFRESH_MINUTES = 10;
-const MIN_FETCH_INTERVAL_MS = 30 * 1000;
+const REFRESH_MINUTES = 1; // minimo consentito da chrome.alarms — non si può andare più frequenti
+const MIN_FETCH_INTERVAL_MS = 45 * 1000; // margine di sicurezza sotto il minuto, evita doppie chiamate se un refresh manuale capita vicino all'alarm
 const STORAGE_KEY = 'ykanUsageData';
 const ORG_STORAGE_KEY = 'ykanUsageOrgId';
 const LAST_FETCH_KEY = 'ykanUsageLastFetch';
@@ -124,7 +124,11 @@ async function refreshAndUpdateBadge({ force = false } = {}) {
 
 function ensureAlarm() {
   chrome.alarms.get(ALARM_NAME, existing => {
-    if (!existing) chrome.alarms.create(ALARM_NAME, { periodInMinutes: REFRESH_MINUTES, delayInMinutes: 0 });
+    // Ricrea l'alarm anche se esiste già ma con un periodo diverso (es. installazioni
+    // precedenti a quando REFRESH_MINUTES è cambiato) — altrimenti resta bloccato al vecchio.
+    if (!existing || existing.periodInMinutes !== REFRESH_MINUTES) {
+      chrome.alarms.create(ALARM_NAME, { periodInMinutes: REFRESH_MINUTES, delayInMinutes: 0 });
+    }
   });
 }
 
