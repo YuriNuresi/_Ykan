@@ -2840,9 +2840,11 @@ $dataJson = json_encode($data);
         .view-tabs button.active { opacity: 1; border-bottom-color: var(--accent); }
         .dash-view { display: none; padding: 16px 20px 40px; max-width: 980px; margin: 0 auto; }
         body[data-view="dashboard"] .filters-bar, body[data-view="dashboard"] .board-container,
-        body[data-view="settings"] .filters-bar, body[data-view="settings"] .board-container { display: none; }
+        body[data-view="settings"] .filters-bar, body[data-view="settings"] .board-container,
+        body[data-view="claude"] .filters-bar, body[data-view="claude"] .board-container { display: none; }
         body[data-view="dashboard"] #dashboardView { display: block; }
         body[data-view="settings"] #settingsView { display: block; }
+        body[data-view="claude"] #claudeView { display: block; }
         .dash-toolbar { display: flex; align-items: center; gap: 8px 12px; margin-bottom: 14px; flex-wrap: wrap; }
         .dash-count:empty { display: none; }
         .dash-toolbar h2 { font-size: 18px; margin: 0; }
@@ -3020,6 +3022,7 @@ $dataJson = json_encode($data);
             <button id="tabKanban" class="active" onclick="showView('kanban')">Kanban</button>
             <button id="tabDash" onclick="showView('dashboard')">Dashboard</button>
             <button id="tabSettings" onclick="showView('settings')">⚙️ Settings</button>
+            <button id="tabClaude" onclick="showView('claude')">🤖 Claude</button>
         </nav>
         <div class="header-actions">
             <button class="btn btn-icon" onclick="toggleGemini()" title="Gemini AI">
@@ -3380,6 +3383,24 @@ $dataJson = json_encode($data);
                     <button type="submit" class="btn btn-primary">💾 Save</button>
                 </div>
             </form>
+    </section>
+
+    <!-- Pannello Claude: skill installate + memoria auto per progetto, lette in sola lettura
+         dal Bridge locale (~/.claude/skills, ~/.claude/projects/*/memory) -->
+    <section id="claudeView" class="dash-view">
+        <div class="dash-toolbar">
+            <h2>🤖 Claude</h2>
+            <span id="claudeBridge" class="dash-bridge"></span>
+            <span style="flex:1"></span>
+            <label style="font-size:12px;color:var(--text2)">Progetto (memoria)
+                <select id="claudeMemProject" onchange="claudeFetchMemory()" style="width:auto;padding:2px 4px;max-width:200px"></select></label>
+            <button class="btn" onclick="loadClaudeView()">↻ Aggiorna</button>
+        </div>
+        <div class="dash-tabs">
+            <button data-tab="skills" class="active" onclick="claudeTab('skills')">Skills <span class="dash-count"></span></button>
+            <button data-tab="memory" onclick="claudeTab('memory')">Memoria <span class="dash-count"></span></button>
+        </div>
+        <div id="claudeBody"></div>
     </section>
 
     <!-- Projects Modal (link swimlanes to hosting folders for mobile/MCP editing) -->
@@ -4007,14 +4028,16 @@ $dataJson = json_encode($data);
     }
 
     function showView(view) {
-        if (view !== 'dashboard' && view !== 'settings') view = 'kanban';
+        if (!['dashboard', 'settings', 'claude'].includes(view)) view = 'kanban';
         document.body.dataset.view = view;
         document.getElementById('tabKanban').classList.toggle('active', view === 'kanban');
         document.getElementById('tabDash').classList.toggle('active', view === 'dashboard');
         document.getElementById('tabSettings').classList.toggle('active', view === 'settings');
+        document.getElementById('tabClaude').classList.toggle('active', view === 'claude');
         try { localStorage.setItem('ykan_view', view); } catch (_) {}
         if (view === 'dashboard') loadDashboard();
         if (view === 'settings') loadSettingsView();
+        if (view === 'claude') loadClaudeView();
     }
 
     const dashTs = v => { const t = new Date(String(v).replace(' ', 'T')).getTime(); return isNaN(t) ? 0 : t; };
@@ -6127,6 +6150,131 @@ $dataJson = json_encode($data);
         document.title = `_Ykan - ${config.project_name}`;
         await api('save_config', config);
     });
+
+    // === PANNELLO CLAUDE (skills + memoria, sola lettura via Bridge) ===
+    let claudeSkills = null; // null = non ancora caricato/non raggiungibile, [] = caricato ma vuoto
+    let claudeMemory = {}; // laneId -> { exists, files } | null (bridge irraggiungibile)
+    let claudeTabName = 'skills';
+    const claudeExpanded = new Set(); // chiavi "skill|id" o "mem|laneId|file" con contenuto già mostrato
+
+    function claudeTab(name) {
+        claudeTabName = name;
+        document.querySelectorAll('#claudeView .dash-tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
+        claudeRenderBody();
+    }
+
+    async function loadClaudeView() {
+        const sel = document.getElementById('claudeMemProject');
+        const projects = boardData.swimlanes.filter(l => l.local_path);
+        const prevVal = sel.value;
+        sel.innerHTML = projects.length
+            ? projects.map(l => `<option value="${escHtml(l.id)}">${escHtml(l.name)}</option>`).join('')
+            : '<option value="">Nessun progetto collegato a una cartella</option>';
+        if (prevVal && projects.some(l => l.id === prevVal)) sel.value = prevVal;
+
+        document.querySelectorAll('#claudeView .dash-tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === claudeTabName));
+        claudeRenderBody();
+        await Promise.all([claudeFetchSkills(), claudeFetchMemory()]);
+    }
+
+    async function claudeFetchSkills() {
+        try {
+            const r = await fetch(BRIDGE_URL + '/claude/skills');
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            claudeSkills = (await r.json()).skills || [];
+        } catch (_) { claudeSkills = null; }
+        claudeUpdateBridgeBadge();
+        claudeRenderBody();
+    }
+
+    async function claudeFetchMemory() {
+        const laneId = document.getElementById('claudeMemProject').value;
+        const lane = boardData.swimlanes.find(l => l.id === laneId);
+        if (!lane || !lane.local_path) { claudeRenderBody(); return; }
+        try {
+            const r = await fetch(BRIDGE_URL + '/claude/memory?dir=' + encodeURIComponent(lane.local_path));
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            claudeMemory[laneId] = await r.json();
+        } catch (_) { claudeMemory[laneId] = null; }
+        claudeUpdateBridgeBadge();
+        claudeRenderBody();
+    }
+
+    function claudeUpdateBridgeBadge() {
+        const badge = document.getElementById('claudeBridge');
+        if (claudeSkills === null) { badge.className = 'dash-bridge ko'; badge.textContent = '● Bridge non raggiungibile'; }
+        else { badge.className = 'dash-bridge ok'; badge.textContent = '● Bridge connesso'; }
+    }
+
+    function claudeCard(key, badgeHtml, title, subtitle, whenIso) {
+        const open = claudeExpanded.has(key);
+        const safeId = 'claudeContent_' + key.replace(/[^\w]/g, '_');
+        return `<div class="dash-projcard">
+            <div class="dash-projhead" style="cursor:pointer" onclick="claudeToggle('${escHtml(key)}')">
+                ${badgeHtml}
+                <b>${escHtml(title)}</b>
+                <span style="flex:1"></span>
+                ${whenIso ? `<span class="dash-when">${escHtml(new Date(whenIso).toLocaleDateString('it-IT'))}</span>` : ''}
+            </div>
+            ${subtitle ? `<div class="dash-sub">${escHtml(subtitle)}</div>` : ''}
+            ${open ? `<div class="focus-blockers" id="${safeId}"><div class="dash-empty">Carico…</div></div>` : ''}
+        </div>`;
+    }
+
+    function claudeRenderBody() {
+        const body = document.getElementById('claudeBody');
+        const counts = { skills: claudeSkills ? claudeSkills.length : '', memory: 0 };
+        if (claudeTabName === 'skills') {
+            if (claudeSkills === null) body.innerHTML = '<div class="dash-empty">Bridge locale non raggiungibile: avvialo per vedere le skill installate.</div>';
+            else if (!claudeSkills.length) body.innerHTML = '<div class="dash-empty">Nessuna skill trovata in ~/.claude/skills.</div>';
+            else body.innerHTML = claudeSkills.map(s => claudeCard('skill|' + s.id, '', s.name, s.description, s.modified)).join('');
+        } else {
+            const laneId = document.getElementById('claudeMemProject').value;
+            const mem = claudeMemory[laneId];
+            if (!laneId) body.innerHTML = '<div class="dash-empty">Collega un progetto a una cartella locale per vedere la sua memoria (Kanban → 🔗 Projects).</div>';
+            else if (mem === undefined) body.innerHTML = '<div class="dash-empty">Carico…</div>';
+            else if (mem === null) body.innerHTML = '<div class="dash-empty">Bridge locale non raggiungibile.</div>';
+            else if (!mem.exists || !mem.files.length) body.innerHTML = '<div class="dash-empty">Nessuna memoria per questo progetto — Claude non ha ancora salvato nulla qui.</div>';
+            else {
+                counts.memory = mem.files.length;
+                body.innerHTML = mem.files.map(f => claudeCard(
+                    'mem|' + laneId + '|' + f.file,
+                    f.type ? `<span class="git-tag">${escHtml(f.type)}</span>` : '',
+                    f.name, f.description, f.modified
+                )).join('');
+            }
+        }
+        document.querySelectorAll('#claudeView .dash-tabs button').forEach(b => {
+            const c = b.dataset.tab === 'skills' ? counts.skills : counts.memory;
+            b.querySelector('.dash-count').textContent = c === '' ? '' : c;
+        });
+    }
+
+    async function claudeToggle(key) {
+        if (claudeExpanded.has(key)) { claudeExpanded.delete(key); claudeRenderBody(); return; }
+        claudeExpanded.add(key);
+        claudeRenderBody();
+        const safeId = 'claudeContent_' + key.replace(/[^\w]/g, '_');
+        const parts = key.split('|');
+        try {
+            let url;
+            if (parts[0] === 'skill') {
+                url = BRIDGE_URL + '/claude/skill?id=' + encodeURIComponent(parts[1]);
+            } else {
+                const lane = boardData.swimlanes.find(l => l.id === parts[1]);
+                if (!lane) throw new Error('progetto non trovato');
+                url = BRIDGE_URL + '/claude/memory/file?dir=' + encodeURIComponent(lane.local_path) + '&file=' + encodeURIComponent(parts[2]);
+            }
+            const r = await fetch(url);
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            const { content } = await r.json();
+            const el = document.getElementById(safeId);
+            if (el) el.innerHTML = `<div style="white-space:pre-wrap;font-family:ui-monospace,Consolas,monospace;font-size:12px;max-height:420px;overflow-y:auto">${escHtml(content.replace(/^---[\s\S]*?---\r?\n/, ''))}</div>`;
+        } catch (e) {
+            const el = document.getElementById(safeId);
+            if (el) el.innerHTML = '<div class="dash-empty">Errore nel caricamento: ' + escHtml(e.message) + '</div>';
+        }
+    }
 
     // === LABELS ===
     async function addLabel() {
