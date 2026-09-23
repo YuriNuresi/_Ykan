@@ -2839,8 +2839,10 @@ $dataJson = json_encode($data);
         .view-tabs button:hover { opacity: 1; }
         .view-tabs button.active { opacity: 1; border-bottom-color: var(--accent); }
         .dash-view { display: none; padding: 16px 20px 40px; max-width: 980px; margin: 0 auto; }
-        body[data-view="dashboard"] .filters-bar, body[data-view="dashboard"] .board-container { display: none; }
-        body[data-view="dashboard"] .dash-view { display: block; }
+        body[data-view="dashboard"] .filters-bar, body[data-view="dashboard"] .board-container,
+        body[data-view="settings"] .filters-bar, body[data-view="settings"] .board-container { display: none; }
+        body[data-view="dashboard"] #dashboardView { display: block; }
+        body[data-view="settings"] #settingsView { display: block; }
         .dash-toolbar { display: flex; align-items: center; gap: 8px 12px; margin-bottom: 14px; flex-wrap: wrap; }
         .dash-count:empty { display: none; }
         .dash-toolbar h2 { font-size: 18px; margin: 0; }
@@ -3017,6 +3019,7 @@ $dataJson = json_encode($data);
         <nav class="view-tabs">
             <button id="tabKanban" class="active" onclick="showView('kanban')">Kanban</button>
             <button id="tabDash" onclick="showView('dashboard')">Dashboard</button>
+            <button id="tabSettings" onclick="showView('settings')">⚙️ Settings</button>
         </nav>
         <div class="header-actions">
             <button class="btn btn-icon" onclick="toggleGemini()" title="Gemini AI">
@@ -3318,8 +3321,7 @@ $dataJson = json_encode($data);
     </div>
 
     <!-- Config Modal -->
-    <div id="configModal" class="modal-overlay">
-        <div class="modal">
+    <section id="settingsView" class="dash-view" style="max-width:720px">
             <h2>Settings</h2>
             <form id="configForm">
                 <div class="form-group">
@@ -3375,12 +3377,10 @@ $dataJson = json_encode($data);
                     <button type="button" class="btn" onclick="addLabel()" style="margin-top:8px">+ Add Label</button>
                 </div>
                 <div class="modal-actions">
-                    <button type="button" class="btn" onclick="closeConfigModal()">Cancel</button>
-                    <button type="submit" class="btn btn-primary">Save</button>
+                    <button type="submit" class="btn btn-primary">💾 Save</button>
                 </div>
             </form>
-        </div>
-    </div>
+    </section>
 
     <!-- Projects Modal (link swimlanes to hosting folders for mobile/MCP editing) -->
     <div id="projectsModal" class="modal-overlay">
@@ -4007,12 +4007,14 @@ $dataJson = json_encode($data);
     }
 
     function showView(view) {
-        if (view !== 'dashboard') view = 'kanban';
+        if (view !== 'dashboard' && view !== 'settings') view = 'kanban';
         document.body.dataset.view = view;
         document.getElementById('tabKanban').classList.toggle('active', view === 'kanban');
         document.getElementById('tabDash').classList.toggle('active', view === 'dashboard');
+        document.getElementById('tabSettings').classList.toggle('active', view === 'settings');
         try { localStorage.setItem('ykan_view', view); } catch (_) {}
         if (view === 'dashboard') loadDashboard();
+        if (view === 'settings') loadSettingsView();
     }
 
     const dashTs = v => { const t = new Date(String(v).replace(' ', 'T')).getTime(); return isNaN(t) ? 0 : t; };
@@ -6078,7 +6080,12 @@ $dataJson = json_encode($data);
     }
 
     // === CONFIG ===
-    async function openConfigModal() {
+    // Settings è una scheda (showView('settings')), non più un popup: openConfigModal() resta
+    // come alias per i ~10 punti del codice che ci saltano dentro da fuori (link "→ Settings",
+    // onboarding al primo avvio, ecc.), così non li ho dovuti toccare uno per uno.
+    function openConfigModal() { showView('settings'); }
+
+    async function loadSettingsView() {
         document.getElementById('configProjectName').value = boardData.config.project_name || '';
         document.getElementById('configLanguage').value = boardData.config.ai_language || 'en';
         document.getElementById('configGeminiKey').value = boardData.config.gemini_api_key || '';
@@ -6087,7 +6094,6 @@ $dataJson = json_encode($data);
         document.getElementById('configGithubRepo').value = boardData.config.github_repo || '';
         document.getElementById('configSessionMode').value = boardData.config.session_open_mode || 'terminal';
         renderLabelsManager();
-        document.getElementById('configModal').classList.add('active');
 
         const badge = document.getElementById('claudeKeyBadge');
         badge.textContent = '...';
@@ -6105,10 +6111,6 @@ $dataJson = json_encode($data);
         }
     }
 
-    function closeConfigModal() {
-        document.getElementById('configModal').classList.remove('active');
-    }
-
     document.getElementById('configForm').addEventListener('submit', async (e) => {
         e.preventDefault();
         const config = {
@@ -6123,7 +6125,6 @@ $dataJson = json_encode($data);
         boardData.config = config;
         document.getElementById('projectName').textContent = config.project_name;
         document.title = `_Ykan - ${config.project_name}`;
-        closeConfigModal();
         await api('save_config', config);
     });
 
