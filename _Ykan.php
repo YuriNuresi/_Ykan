@@ -2978,6 +2978,23 @@ $dataJson = json_encode($data);
         .sess-tool { font-size: 11px; color: var(--text2); padding: 1px 10px; }
         .sess-badge { font-size: 11px; padding: 1px 8px; border-radius: 10px; background: var(--bg2); border: 1px solid var(--border); }
         .sess-badge.done { color: #16a34a; border-color: #16a34a; }
+        /* Terminale: pannello persistente in fondo alla pagina, con tab multiple. Minimizzare
+           nasconde solo il corpo (.term-body): le WebSocket/PTY restano vive in background.
+           Chiudere una scheda invece termina davvero il processo (niente da recuperare). */
+        .term-footer { position: fixed; left: 0; right: 0; bottom: 0; z-index: 500; background: #0b0b0b; border-top: 1px solid var(--border); box-shadow: 0 -4px 16px rgba(0,0,0,.25); display: none; }
+        .term-footer.active { display: block; }
+        .term-tabbar { display: flex; align-items: center; gap: 4px; padding: 4px 6px; background: var(--bg2); border-bottom: 1px solid var(--border); }
+        .term-tabs { display: flex; gap: 2px; overflow-x: auto; flex: 1; min-width: 0; }
+        .term-tab { display: flex; align-items: center; gap: 7px; padding: 5px 8px 5px 12px; font-size: 12px; border-radius: 6px 6px 0 0; background: var(--bg); color: var(--text2); cursor: pointer; white-space: nowrap; flex-shrink: 0; }
+        .term-tab.active { background: #000; color: #fff; }
+        .term-tab.dead { opacity: .55; }
+        .term-tab-x { opacity: .6; padding: 0 4px; border-radius: 4px; line-height: 1.4; }
+        .term-tab-x:hover { opacity: 1; background: rgba(255,255,255,.18); }
+        .term-body { height: 340px; }
+        .term-footer.minimized .term-body { display: none; }
+        .term-pane { display: none; height: 100%; background: #000; padding: 4px; box-sizing: border-box; }
+        .term-pane.active { display: block; }
+        @media (max-width: 720px) { .term-body { height: 260px; } }
     </style>
     <!-- Custom theme overrides (populated on load + when switching themes) -->
     <style id="customThemeStyle"><?= !empty($data['config']['theme_file']) ? ykanThemeCss($data['config']['theme_file']) : '' ?></style>
@@ -3331,6 +3348,15 @@ $dataJson = json_encode($data);
                     </label>
                     <small style="color:var(--text2);font-size:11px;display:block;margin-top:4px">Aggiungi <code>ANTHROPIC_KEY=sk-ant-...</code> nel file <code>.env</code> per abilitare l'esecuzione automatica dei task.</small>
                 </div>
+                <div class="form-group">
+                    <label>Dove aprire le sessioni Claude</label>
+                    <select id="configSessionMode">
+                        <option value="terminal">Terminale locale (nella board, via Bridge)</option>
+                        <option value="desktop">Claude Desktop (locale, richiede l'app installata)</option>
+                        <option value="cloud">Cloud (claude.ai, nel browser)</option>
+                    </select>
+                    <small style="color:var(--text2);font-size:11px">Vale per "▶️ Lavora ora" e per aprire una sessione nuova. "↩️ Riprendi" una sessione esistente resta sempre nel terminale: né Claude Desktop né claude.ai supportano il resume di una sessione locale via link.</small>
+                </div>
                 <hr style="margin:16px 0;border:none;border-top:1px solid var(--border)">
                 <div class="form-group">
                     <label>GitHub Token <span style="font-weight:normal;color:var(--text2)">(Personal Access Token)</span></label>
@@ -3482,17 +3508,15 @@ $dataJson = json_encode($data);
     </div>
 
     <!-- Terminal Modal (live shell via local Bridge, xterm.js) -->
-    <div id="terminalModal" class="modal-overlay">
-        <div class="modal" style="max-width:820px">
-            <h2 style="display:flex;align-items:center;gap:8px">🖥️ Terminale — <span id="terminalProjName"></span></h2>
-            <p style="color:var(--text2);font-size:13px;margin-bottom:8px">
-                Shell reale sul tuo PC, nella cartella locale del progetto, via Bridge locale.
-            </p>
-            <div id="terminalContainer" style="height:420px;background:#000;border-radius:8px;overflow:hidden;padding:4px"></div>
-            <div class="modal-actions">
-                <button type="button" class="btn" onclick="closeTerminalModal()">Chiudi</button>
-            </div>
+    <!-- Terminale: pannello persistente in fondo alla pagina, non un modal — minimizzare non
+         chiude le WebSocket (i processi restano vivi), solo la × su una scheda li termina. -->
+    <div id="termFooter" class="term-footer">
+        <div class="term-tabbar">
+            <div id="termTabs" class="term-tabs"></div>
+            <span style="flex:1"></span>
+            <button type="button" class="btn btn-icon" onclick="termToggleMinimize()" id="termMinBtn" title="Riduci a icona">⌄</button>
         </div>
+        <div id="termBody" class="term-body"></div>
     </div>
 
     <!-- Themes Modal -->
@@ -4588,6 +4612,19 @@ $dataJson = json_encode($data);
         api('reorder_swimlanes', { order: boardData.swimlanes.slice().sort((x, y) => x.position - y.position).map(l => l.id) });
     }
 
+    // "▶️ Lavora ora": apre una sessione nuova (nella modalità scelta in Settings) col contesto
+    // dei blocchi di questo progetto già nel prompt, così Claude sa da dove ripartire.
+    function dashFocusLaunch(laneId) {
+        const r = dashFocusData().find(x => x.lane.id === laneId);
+        if (!r) return;
+        const withId = r.blockers.filter(b => b.id).slice(0, 5);
+        const lines = withId.map(b => `- #${b.seq} ${b.title} (${b.detail})`);
+        const prompt = `Lavora sul progetto "${r.lane.name}".` + (lines.length
+            ? ` Prossimi task da chiudere per la prossima stable:\n${lines.join('\n')}`
+            : ' Nessun blocco esplicito individuato: controlla lo stato del progetto e proponi i prossimi passi.');
+        launchSession(r.lane, { launch: 'claude', prompt });
+    }
+
     function dashFocusHtml() {
         if (!dashData) return '<div class="dash-empty">Carico…</div>';
         if (dashGit === null) return '<div class="dash-empty">Leggo lo stato dei repository…</div>';
@@ -4657,6 +4694,7 @@ $dataJson = json_encode($data);
                     <span style="flex:1"></span>
                     ${badges}
                     ${r.daysStale != null ? `<span class="focus-stale">${r.daysStale === 0 ? 'attivo oggi' : 'fermo da ' + r.daysStale + 'g'}</span>` : ''}
+                    <button type="button" class="btn btn-primary focus-manage" onclick="event.stopPropagation();dashFocusLaunch('${escHtml(r.lane.id)}')">▶️ Lavora ora</button>
                     <button type="button" class="btn focus-manage" onclick="event.stopPropagation();openStableScope('${escHtml(r.lane.id)}')">🎯 Gestisci</button>
                     <span class="focus-pct" style="color:${color}">${r.pct}%</span>
                 </div>
@@ -5220,63 +5258,139 @@ $dataJson = json_encode($data);
     }
 
     // === TERMINAL (live shell via local Bridge, xterm.js) ===
-    let termInstance = null, termFitAddon = null, termSocket = null, termResizeHandler = null;
+    // Pannello persistente in fondo alla pagina, con una scheda per sessione: aprirne una nuova
+    // non chiude le altre. Minimizzare (⌄) nasconde solo il corpo, le WebSocket restano aperte
+    // e i processi vivi in background. Solo la × su una scheda chiude davvero quella sessione
+    // (il Bridge termina il processo alla chiusura della WebSocket, vedi bridge-server.js).
+    let termSessions = []; // { id, laneId, term, fitAddon, socket, tabEl, paneEl }
+    let termActiveId = null;
 
+    window.addEventListener('resize', () => {
+        const sess = termSessions.find(s => s.id === termActiveId);
+        if (!sess) return;
+        sess.fitAddon.fit();
+        if (sess.socket && sess.socket.readyState === WebSocket.OPEN) {
+            sess.socket.send(JSON.stringify({ type: 'resize', cols: sess.term.cols, rows: sess.term.rows }));
+        }
+    });
+
+    // Apre una nuova sessione Claude nella modalità scelta in Settings (session_open_mode):
+    // terminale locale (default, via Bridge), Claude Desktop (deep link claude://code/new) o
+    // cloud (claude://claude.ai/new). Il resume di una sessione esistente NON passa da qui:
+    // né Claude Desktop né claude.ai sanno riagganciare una sessione CLI locale via link, quindi
+    // sessResume() continua a usare sempre openTerminalModal direttamente.
+    function launchSession(lane, context) {
+        context = context || {};
+        const mode = boardData.config.session_open_mode || 'terminal';
+        if (mode === 'terminal') { openTerminalModal(lane.id, context); return; }
+        if (mode === 'desktop') {
+            let url = 'claude://code/new?q=' + encodeURIComponent(context.prompt || '');
+            if (lane.local_path) url += '&folder=' + encodeURIComponent(lane.local_path);
+            window.location.href = url;
+            return;
+        }
+        // cloud: claude.ai non ha accesso al filesystem locale, il contesto va tutto nel prompt
+        const cloudPrompt = (lane.name ? `Progetto "${lane.name}". ` : '') + (context.prompt || '');
+        window.location.href = 'claude://claude.ai/new?q=' + encodeURIComponent(cloudPrompt);
+    }
+
+    // Apre sempre una scheda NUOVA (mai riusa/chiude quelle esistenti): lanciare più cose in
+    // parallelo deve dare più terminali distinti, non sostituire quello che stava girando.
     function openTerminalModal(laneId, context) {
         const lane = boardData.swimlanes.find(l => l.id === laneId);
         if (!lane || !lane.local_path) return;
         context = context || {}; // { launch: 'claude', prompt: '...' } to seed Claude Code with a task's context
-        document.getElementById('terminalProjName').textContent = lane.name;
-        closeTerminalModal(); // tear down any previous instance first
-        document.getElementById('terminalModal').classList.add('active');
 
-        const container = document.getElementById('terminalContainer');
-        termInstance = new Terminal({ convertEol: true, fontSize: 13, theme: { background: '#000000' } });
-        termFitAddon = new FitAddon.FitAddon();
-        termInstance.loadAddon(termFitAddon);
-        termInstance.open(container);
-        termFitAddon.fit();
+        const id = 'term_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7);
+        const footer = document.getElementById('termFooter');
+        footer.classList.add('active');
+        footer.classList.remove('minimized');
 
-        termInstance.onData(data => {
-            if (termSocket && termSocket.readyState === WebSocket.OPEN) {
-                termSocket.send(JSON.stringify({ type: 'input', data }));
-            }
+        const tabEl = document.createElement('div');
+        tabEl.className = 'term-tab';
+        tabEl.innerHTML = `<span>🖥️ ${escHtml(lane.name)}</span><span class="term-tab-x" title="Chiudi (termina il processo)">&times;</span>`;
+        tabEl.addEventListener('click', e => { if (!e.target.classList.contains('term-tab-x')) termSwitchTab(id); });
+        tabEl.querySelector('.term-tab-x').addEventListener('click', e => { e.stopPropagation(); termCloseTab(id); });
+        document.getElementById('termTabs').appendChild(tabEl);
+
+        const paneEl = document.createElement('div');
+        paneEl.className = 'term-pane';
+        document.getElementById('termBody').appendChild(paneEl);
+
+        const sess = { id, laneId, term: null, fitAddon: null, socket: null, tabEl, paneEl };
+        termSessions.push(sess);
+
+        const term = new Terminal({ convertEol: true, fontSize: 13, theme: { background: '#000000' } });
+        const fitAddon = new FitAddon.FitAddon();
+        term.loadAddon(fitAddon);
+        term.open(paneEl);
+        sess.term = term;
+        sess.fitAddon = fitAddon;
+
+        term.onData(data => {
+            if (sess.socket && sess.socket.readyState === WebSocket.OPEN) sess.socket.send(JSON.stringify({ type: 'input', data }));
         });
-
-        termResizeHandler = () => {
-            if (!termFitAddon) return;
-            termFitAddon.fit();
-            if (termSocket && termSocket.readyState === WebSocket.OPEN) {
-                termSocket.send(JSON.stringify({ type: 'resize', cols: termInstance.cols, rows: termInstance.rows }));
-            }
-        };
-        window.addEventListener('resize', termResizeHandler);
 
         let wsUrl = 'ws://127.0.0.1:51820/pty?dir=' + encodeURIComponent(lane.local_path);
         if (context.launch) wsUrl += '&launch=' + encodeURIComponent(context.launch);
         if (context.prompt) wsUrl += '&prompt=' + encodeURIComponent(context.prompt);
         if (context.sessionId) wsUrl += '&sessionId=' + encodeURIComponent(context.sessionId);
-        termSocket = new WebSocket(wsUrl);
-        termSocket.onopen = () => {
-            termFitAddon.fit();
-            termSocket.send(JSON.stringify({ type: 'resize', cols: termInstance.cols, rows: termInstance.rows }));
+        const socket = new WebSocket(wsUrl);
+        sess.socket = socket;
+        socket.onopen = () => {
+            fitAddon.fit();
+            socket.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
         };
-        termSocket.onmessage = ev => {
+        socket.onmessage = ev => {
             const msg = JSON.parse(ev.data);
-            if (msg.type === 'data') termInstance.write(msg.data);
-            else if (msg.type === 'exit') termInstance.writeln('\r\n[processo terminato, codice ' + msg.code + ']');
+            if (msg.type === 'data') term.write(msg.data);
+            else if (msg.type === 'exit') { term.writeln('\r\n[processo terminato, codice ' + msg.code + ']'); tabEl.classList.add('dead'); }
         };
-        termSocket.onerror = () => {
-            termInstance.writeln('\r\nBridge locale non raggiungibile su ws://127.0.0.1:51820. Avvialo con: node bridge/bridge-server.js');
+        socket.onerror = () => {
+            term.writeln('\r\nBridge locale non raggiungibile su ws://127.0.0.1:51820. Avvialo con: node bridge/bridge-server.js');
         };
+
+        termSwitchTab(id);
     }
 
-    function closeTerminalModal() {
-        document.getElementById('terminalModal').classList.remove('active');
-        if (termResizeHandler) { window.removeEventListener('resize', termResizeHandler); termResizeHandler = null; }
-        if (termSocket) { try { termSocket.close(); } catch (_) {} termSocket = null; }
-        if (termInstance) { termInstance.dispose(); termInstance = null; }
-        document.getElementById('terminalContainer').innerHTML = '';
+    function termSwitchTab(id) {
+        termActiveId = id;
+        termSessions.forEach(s => {
+            s.tabEl.classList.toggle('active', s.id === id);
+            s.paneEl.classList.toggle('active', s.id === id);
+        });
+        const sess = termSessions.find(s => s.id === id);
+        if (!sess) return;
+        setTimeout(() => { // il pane deve essere visibile (display:block) prima che fit() misuri le dimensioni
+            sess.fitAddon.fit();
+            if (sess.socket && sess.socket.readyState === WebSocket.OPEN) {
+                sess.socket.send(JSON.stringify({ type: 'resize', cols: sess.term.cols, rows: sess.term.rows }));
+            }
+            sess.term.focus();
+        }, 0);
+    }
+
+    function termCloseTab(id) {
+        const idx = termSessions.findIndex(s => s.id === id);
+        if (idx === -1) return;
+        const sess = termSessions[idx];
+        try { sess.socket.close(); } catch (_) {}
+        try { sess.term.dispose(); } catch (_) {}
+        sess.tabEl.remove();
+        sess.paneEl.remove();
+        termSessions.splice(idx, 1);
+        if (termActiveId !== id) return;
+        const next = termSessions[termSessions.length - 1];
+        if (next) termSwitchTab(next.id);
+        else { termActiveId = null; document.getElementById('termFooter').classList.remove('active'); }
+    }
+
+    function termToggleMinimize() {
+        const footer = document.getElementById('termFooter');
+        const min = footer.classList.toggle('minimized');
+        document.getElementById('termMinBtn').textContent = min ? '⌃' : '⌄';
+        document.getElementById('termMinBtn').title = min ? 'Espandi' : 'Riduci a icona';
+        if (!min) termSwitchTab(termActiveId); // torna visibile: rifai il fit
     }
 
     // === PROJECT DOCS (files the AI studies before working) ===
@@ -5971,6 +6085,7 @@ $dataJson = json_encode($data);
         document.getElementById('configGithubToken').value = boardData.config.github_token || '';
         document.getElementById('configGithubEnvNote').style.display = ykanGithubEnvToken ? 'block' : 'none';
         document.getElementById('configGithubRepo').value = boardData.config.github_repo || '';
+        document.getElementById('configSessionMode').value = boardData.config.session_open_mode || 'terminal';
         renderLabelsManager();
         document.getElementById('configModal').classList.add('active');
 
@@ -6002,6 +6117,7 @@ $dataJson = json_encode($data);
             gemini_api_key: document.getElementById('configGeminiKey').value,
             github_token: document.getElementById('configGithubToken').value,
             github_repo: document.getElementById('configGithubRepo').value,
+            session_open_mode: document.getElementById('configSessionMode').value,
             theme: boardData.config.theme
         };
         boardData.config = config;
