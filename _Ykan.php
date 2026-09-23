@@ -3025,6 +3025,7 @@ $dataJson = json_encode($data);
             <button id="tabClaude" onclick="showView('claude')">🤖 Claude</button>
         </nav>
         <div class="header-actions">
+            <span id="claudeUsageBadge" class="dash-bridge" style="display:none;cursor:pointer" title="Consumo Claude — clic per aggiornare. Richiede l'estensione Chrome Ykan Usage Badge (extension/)." onclick="claudeUsageRefresh()"></span>
             <button class="btn btn-icon" onclick="toggleGemini()" title="Gemini AI">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
             </button>
@@ -3043,9 +3044,6 @@ $dataJson = json_encode($data);
             <button class="btn btn-icon" onclick="openThemesModal()" title="Gestisci temi">🎨</button>
             <button class="btn btn-icon" onclick="toggleTheme()" title="Toggle light/dark">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
-            </button>
-            <button class="btn btn-icon" onclick="openConfigModal()" title="Settings">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
             </button>
         </div>
     </header>
@@ -6274,6 +6272,35 @@ $dataJson = json_encode($data);
             const el = document.getElementById(safeId);
             if (el) el.innerHTML = '<div class="dash-empty">Errore nel caricamento: ' + escHtml(e.message) + '</div>';
         }
+    }
+
+    // === BADGE CONSUMO CLAUDE (via estensione Chrome "Ykan Usage Badge", vedi extension/) ===
+    // Ykan non fa alcuna chiamata: è il content-script dell'estensione (se installata) a
+    // spingere qui i dati con postMessage, letti da claude.ai col cookie del browser.
+    // Senza estensione il badge resta semplicemente nascosto (comportamento di default).
+    window.addEventListener('message', e => {
+        if (e.source !== window || e.origin !== window.location.origin) return;
+        if (!e.data || e.data.source !== 'ykan-usage-ext' || e.data.type !== 'usage') return;
+        const badge = document.getElementById('claudeUsageBadge');
+        if (!badge) return;
+        if (e.data.errorKind === 'auth') {
+            badge.style.display = '';
+            badge.className = 'dash-bridge ko';
+            badge.textContent = '🔑 Claude: accedi a claude.ai';
+            return;
+        }
+        const u = e.data.usage;
+        if (!u) { badge.style.display = 'none'; return; }
+        const fh = Math.round(u.fiveHour?.utilization ?? NaN);
+        const wk = Math.round(u.weekly?.utilization ?? NaN);
+        const worst = Math.max(Number.isFinite(fh) ? fh : 0, Number.isFinite(wk) ? wk : 0);
+        badge.style.display = '';
+        badge.className = 'dash-bridge' + (worst >= 90 ? ' ko' : worst >= 70 ? '' : ' ok');
+        badge.textContent = `🔋 5h ${Number.isFinite(fh) ? fh + '%' : '—'} · Sett ${Number.isFinite(wk) ? wk + '%' : '—'}`;
+    });
+
+    function claudeUsageRefresh() {
+        window.postMessage({ source: 'ykan-usage-page', type: 'refresh' }, window.location.origin);
     }
 
     // === LABELS ===

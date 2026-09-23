@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<title>Ykan Usage</title>
+<style>
+  body { width: 220px; margin: 0; padding: 14px; font: 13px/1.4 -apple-system, Segoe UI, sans-serif; background: #1a1d24; color: #e6e6e6; }
+  h1 { font-size: 13px; margin: 0 0 10px; display: flex; align-items: center; justify-content: space-between; }
+  .row { margin-bottom: 10px; }
+  .row .label { display: flex; justify-content: space-between; font-size: 11px; color: #9aa1ad; margin-bottom: 3px; }
+  .bar { height: 6px; border-radius: 3px; background: #2a2e38; overflow: hidden; }
+  .bar-fill { height: 100%; background: #3A6FD9; border-radius: 3px; }
+  .bar-fill.warn { background: #D98639; }
+  .bar-fill.danger { background: #C8533C; }
+  .meta { font-size: 11px; color: #6b7280; margin-top: 10px; }
+  button { background: #2a2e38; border: none; color: #e6e6e6; border-radius: 6px; padding: 4px 8px; font-size: 11px; cursor: pointer; }
+  button:hover { background: #363b47; }
+  a { color: #7aa2ff; }
+  #errorBox { display: none; font-size: 11px; color: #f0a; margin-bottom: 8px; }
+</style>
+</head>
+<body>
+  <h1>Ykan Usage <button id="refreshBtn" title="Aggiorna">↻</button></h1>
+  <div id="errorBox"></div>
+  <div class="row">
+    <div class="label"><span>5 ore</span><span id="fiveHourPct">—</span></div>
+    <div class="bar"><div class="bar-fill" id="fiveHourFill" style="width:0%"></div></div>
+    <div class="meta" id="fiveHourReset"></div>
+  </div>
+  <div class="row">
+    <div class="label"><span>Settimanale</span><span id="weeklyPct">—</span></div>
+    <div class="bar"><div class="bar-fill" id="weeklyFill" style="width:0%"></div></div>
+    <div class="meta" id="weeklyReset"></div>
+  </div>
+  <div class="meta" id="lastUpdated"></div>
+  <div class="meta"><a href="https://claude.ai/new#settings/usage" target="_blank" rel="noopener">Apri il dettaglio su claude.ai →</a></div>
+  <script src="popup.js"></script>
+</body>
+</html>
