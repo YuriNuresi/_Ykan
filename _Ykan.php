@@ -2850,6 +2850,14 @@ $dataJson = json_encode($data);
         .dash-toolbar h2 { font-size: 18px; margin: 0; }
         .dash-bridge { font-size: 11px; padding: 2px 8px; border-radius: 10px; background: var(--bg2); color: var(--text2); }
         .dash-bridge.ok { color: #16a34a; } .dash-bridge.ko { color: #dc2626; }
+        /* Badge consumo Claude in header (popolato dall'estensione via postMessage, vedi extension/) */
+        .usage-mini { display: flex; flex-direction: column; gap: 2px; padding: 3px 8px; border-radius: 8px; background: var(--bg2); cursor: pointer; }
+        .usage-row { display: flex; align-items: center; gap: 5px; font-size: 10px; color: var(--text2); white-space: nowrap; }
+        .usage-label { width: 22px; flex-shrink: 0; }
+        .usage-bar { width: 46px; height: 5px; border-radius: 3px; background: var(--border); overflow: hidden; flex-shrink: 0; }
+        .usage-bar i { display: block; height: 100%; border-radius: 3px; background: #3A6FD9; }
+        .usage-bar i.warn { background: #D98639; } .usage-bar i.danger { background: #C8533C; }
+        .usage-pct { width: 28px; text-align: right; flex-shrink: 0; font-weight: 600; }
         .dash-h { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; color: var(--text2); margin: 22px 0 8px; }
         .dash-proj { font-weight: 600; font-size: 13px; margin: 12px 0 6px; }
         .dash-item { border: 1px solid var(--border); border-left: 3px solid var(--medium, #f59e0b); border-radius: 6px; padding: 8px 10px; margin-bottom: 5px; background: var(--bg3, transparent); }
@@ -3025,7 +3033,7 @@ $dataJson = json_encode($data);
             <button id="tabClaude" onclick="showView('claude')">🤖 Claude</button>
         </nav>
         <div class="header-actions">
-            <span id="claudeUsageBadge" class="dash-bridge" style="display:none;cursor:pointer" title="Consumo Claude — clic per aggiornare. Richiede l'estensione Chrome Ykan Usage Badge (extension/)." onclick="claudeUsageRefresh()"></span>
+            <div id="claudeUsageBadge" class="usage-mini" style="display:none" title="Consumo Claude — clic per aggiornare. Richiede l'estensione Chrome Ykan Usage Badge (extension/)." onclick="claudeUsageRefresh()"></div>
             <button class="btn btn-icon" onclick="toggleGemini()" title="Gemini AI">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
             </button>
@@ -6285,18 +6293,20 @@ $dataJson = json_encode($data);
         if (!badge) return;
         if (e.data.errorKind === 'auth') {
             badge.style.display = '';
-            badge.className = 'dash-bridge ko';
-            badge.textContent = '🔑 Claude: accedi a claude.ai';
+            badge.innerHTML = '<div class="usage-row" style="color:#dc2626">🔑 accedi a claude.ai</div>';
             return;
         }
         const u = e.data.usage;
         if (!u) { badge.style.display = 'none'; return; }
-        const fh = Math.round(u.fiveHour?.utilization ?? NaN);
-        const wk = Math.round(u.weekly?.utilization ?? NaN);
-        const worst = Math.max(Number.isFinite(fh) ? fh : 0, Number.isFinite(wk) ? wk : 0);
+        const bar = (label, pct) => {
+            const p = Math.round(pct ?? NaN);
+            const ok = Number.isFinite(p);
+            const cls = !ok ? '' : p >= 90 ? 'danger' : p >= 70 ? 'warn' : '';
+            const width = ok ? Math.max(0, Math.min(100, p)) : 0;
+            return `<div class="usage-row"><span class="usage-label">${label}</span><span class="usage-bar"><i class="${cls}" style="width:${width}%"></i></span><span class="usage-pct">${ok ? p + '%' : '—'}</span></div>`;
+        };
         badge.style.display = '';
-        badge.className = 'dash-bridge' + (worst >= 90 ? ' ko' : worst >= 70 ? '' : ' ok');
-        badge.textContent = `🔋 5h ${Number.isFinite(fh) ? fh + '%' : '—'} · Sett ${Number.isFinite(wk) ? wk + '%' : '—'}`;
+        badge.innerHTML = bar('5h', u.fiveHour?.utilization) + bar('Sett', u.weekly?.utilization);
     });
 
     function claudeUsageRefresh() {
