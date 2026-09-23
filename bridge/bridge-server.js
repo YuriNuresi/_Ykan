@@ -3,6 +3,10 @@
 
 // Bridge locale per Ykan.
 // - GET  /sessions?dir=<cartella_locale_progetto>  -> storico sessioni Claude Code (sola lettura)
+// - GET  /claude/skills                            -> elenco skill installate (~/.claude/skills)
+// - GET  /claude/skill?id=<nome>                    -> contenuto di una SKILL.md
+// - GET  /claude/memory?dir=<cartella_locale_progetto>        -> memoria auto del progetto
+// - GET  /claude/memory/file?dir=<...>&file=<nome>.md         -> contenuto di un file di memoria
 // - WS   /pty?dir=<cartella_locale_progetto>        -> shell interattiva reale (node-pty)
 //
 // Gira SOLO sul tuo PC, bindato su 127.0.0.1 (non raggiungibile da altri dispositivi
@@ -38,6 +42,68 @@ function isAllowedOrigin(origin) {
 
 function claudeProjectDirName(localPath) {
     return localPath.replace(/[^a-zA-Z0-9]/g, '-');
+}
+
+// === CLAUDE SKILLS & MEMORIA (pannello Claude, sola lettura da ~/.claude) ===
+// Skills sono globali (~/.claude/skills/<nome>/SKILL.md, alcune sono symlink verso
+// ~/.agents/skills — le seguiamo). La memoria e' per-progetto: stessa cartella
+// (~/.claude/projects/<claudeProjectDirName(local_path)>/memory/) gia' usata per le
+// sessioni, quindi riusa lo stesso ?dir= dei progetti Ykan.
+
+function claudeHome() { return path.join(os.homedir(), '.claude'); }
+
+// Frontmatter YAML minimale: solo le chiavi semplici che ci servono (name/description,
+// + "type" anche annidato sotto metadata:, tipico dei file di memoria). Non e' un parser
+// YAML completo, ma questi file li scriviamo sempre nello stesso formato prevedibile.
+function parseFrontmatter(raw) {
+    const m = raw.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+    if (!m) return {};
+    const block = m[1];
+    const get = re => { const mm = block.match(re); return mm ? mm[1].trim().replace(/^["']|["']$/g, '') : ''; };
+    return {
+        name: get(/^name:\s*(.+)$/m),
+        description: get(/^description:\s*(.+)$/m),
+        type: get(/^\s*type:\s*(.+)$/m)
+    };
+}
+
+function listSkills() {
+    const dir = path.join(claudeHome(), 'skills');
+    if (!fs.existsSync(dir)) return [];
+    const out = [];
+    for (const name of fs.readdirSync(dir)) {
+        const file = path.join(dir, name, 'SKILL.md');
+        let raw, stat;
+        try { raw = fs.readFileSync(file, 'utf8'); stat = fs.statSync(file); } catch (_) { continue; }
+        const meta = parseFrontmatter(raw);
+        out.push({ id: name, name: meta.name || name, description: meta.description || '', modified: stat.mtime.toISOString() });
+    }
+    return out.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function readSkill(id) {
+    if (!/^[\w.-]+$/.test(id)) throw new Error('nome non valido');
+    return fs.readFileSync(path.join(claudeHome(), 'skills', id, 'SKILL.md'), 'utf8');
+}
+
+function listProjectMemory(localPath) {
+    const dir = path.join(claudeHome(), 'projects', claudeProjectDirName(localPath), 'memory');
+    if (!fs.existsSync(dir)) return { exists: false, files: [] };
+    const files = fs.readdirSync(dir).filter(f => f.endsWith('.md') && f !== 'MEMORY.md');
+    const out = files.map(f => {
+        try {
+            const raw = fs.readFileSync(path.join(dir, f), 'utf8');
+            const stat = fs.statSync(path.join(dir, f));
+            const meta = parseFrontmatter(raw);
+            return { file: f, name: meta.name || f.replace(/\.md$/, ''), description: meta.description || '', type: meta.type || '', modified: stat.mtime.toISOString() };
+        } catch (_) { return null; }
+    }).filter(Boolean);
+    return { exists: true, files: out.sort((a, b) => b.modified.localeCompare(a.modified)) };
+}
+
+function readMemoryFile(localPath, file) {
+    if (!/^[\w.-]+\.md$/.test(file)) throw new Error('nome file non valido');
+    return fs.readFileSync(path.join(claudeHome(), 'projects', claudeProjectDirName(localPath), 'memory', file), 'utf8');
 }
 
 function buildTitleIndex() {
@@ -637,6 +703,26 @@ const server = http.createServer((req, res) => {
             json(200, result);
         }).catch(e => json(500, { error: String((e && e.message) || e) }));
         return;
+    }
+
+    if (req.method === 'GET' && parsed.pathname === '/claude/skills') {
+        try { return json(200, { skills: listSkills() }); }
+        catch (e) { return json(500, { error: String((e && e.message) || e) }); }
+    }
+
+    if (req.method === 'GET' && parsed.pathname === '/claude/skill') {
+        try { return json(200, { content: readSkill(String(parsed.query.id || '')) }); }
+        catch (e) { return json(404, { error: String((e && e.message) || e) }); }
+    }
+
+    if (req.method === 'GET' && parsed.pathname === '/claude/memory') {
+        try { return json(200, listProjectMemory(String(parsed.query.dir || ''))); }
+        catch (e) { return json(500, { error: String((e && e.message) || e) }); }
+    }
+
+    if (req.method === 'GET' && parsed.pathname === '/claude/memory/file') {
+        try { return json(200, { content: readMemoryFile(String(parsed.query.dir || ''), String(parsed.query.file || '')) }); }
+        catch (e) { return json(404, { error: String((e && e.message) || e) }); }
     }
 
     if (req.method === 'GET' && parsed.pathname === '/sessions') {

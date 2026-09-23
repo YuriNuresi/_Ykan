@@ -2839,13 +2839,25 @@ $dataJson = json_encode($data);
         .view-tabs button:hover { opacity: 1; }
         .view-tabs button.active { opacity: 1; border-bottom-color: var(--accent); }
         .dash-view { display: none; padding: 16px 20px 40px; max-width: 980px; margin: 0 auto; }
-        body[data-view="dashboard"] .filters-bar, body[data-view="dashboard"] .board-container { display: none; }
-        body[data-view="dashboard"] .dash-view { display: block; }
+        body[data-view="dashboard"] .filters-bar, body[data-view="dashboard"] .board-container,
+        body[data-view="settings"] .filters-bar, body[data-view="settings"] .board-container,
+        body[data-view="claude"] .filters-bar, body[data-view="claude"] .board-container { display: none; }
+        body[data-view="dashboard"] #dashboardView { display: block; }
+        body[data-view="settings"] #settingsView { display: block; }
+        body[data-view="claude"] #claudeView { display: block; }
         .dash-toolbar { display: flex; align-items: center; gap: 8px 12px; margin-bottom: 14px; flex-wrap: wrap; }
         .dash-count:empty { display: none; }
         .dash-toolbar h2 { font-size: 18px; margin: 0; }
         .dash-bridge { font-size: 11px; padding: 2px 8px; border-radius: 10px; background: var(--bg2); color: var(--text2); }
         .dash-bridge.ok { color: #16a34a; } .dash-bridge.ko { color: #dc2626; }
+        /* Badge consumo Claude in header (popolato dall'estensione via postMessage, vedi extension/) */
+        .usage-mini { display: flex; flex-direction: column; gap: 2px; padding: 3px 8px; border-radius: 8px; background: var(--bg2); cursor: pointer; }
+        .usage-row { display: flex; align-items: center; gap: 5px; font-size: 10px; color: var(--text2); white-space: nowrap; }
+        .usage-label { width: 22px; flex-shrink: 0; }
+        .usage-bar { width: 46px; height: 5px; border-radius: 3px; background: var(--border); overflow: hidden; flex-shrink: 0; }
+        .usage-bar i { display: block; height: 100%; border-radius: 3px; background: #3A6FD9; }
+        .usage-bar i.warn { background: #D98639; } .usage-bar i.danger { background: #C8533C; }
+        .usage-pct { width: 28px; text-align: right; flex-shrink: 0; font-weight: 600; }
         .dash-h { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; color: var(--text2); margin: 22px 0 8px; }
         .dash-proj { font-weight: 600; font-size: 13px; margin: 12px 0 6px; }
         .dash-item { border: 1px solid var(--border); border-left: 3px solid var(--medium, #f59e0b); border-radius: 6px; padding: 8px 10px; margin-bottom: 5px; background: var(--bg3, transparent); }
@@ -2978,6 +2990,23 @@ $dataJson = json_encode($data);
         .sess-tool { font-size: 11px; color: var(--text2); padding: 1px 10px; }
         .sess-badge { font-size: 11px; padding: 1px 8px; border-radius: 10px; background: var(--bg2); border: 1px solid var(--border); }
         .sess-badge.done { color: #16a34a; border-color: #16a34a; }
+        /* Terminale: pannello persistente in fondo alla pagina, con tab multiple. Minimizzare
+           nasconde solo il corpo (.term-body): le WebSocket/PTY restano vive in background.
+           Chiudere una scheda invece termina davvero il processo (niente da recuperare). */
+        .term-footer { position: fixed; left: 0; right: 0; bottom: 0; z-index: 500; background: #0b0b0b; border-top: 1px solid var(--border); box-shadow: 0 -4px 16px rgba(0,0,0,.25); display: none; }
+        .term-footer.active { display: block; }
+        .term-tabbar { display: flex; align-items: center; gap: 4px; padding: 4px 6px; background: var(--bg2); border-bottom: 1px solid var(--border); }
+        .term-tabs { display: flex; gap: 2px; overflow-x: auto; flex: 1; min-width: 0; }
+        .term-tab { display: flex; align-items: center; gap: 7px; padding: 5px 8px 5px 12px; font-size: 12px; border-radius: 6px 6px 0 0; background: var(--bg); color: var(--text2); cursor: pointer; white-space: nowrap; flex-shrink: 0; }
+        .term-tab.active { background: #000; color: #fff; }
+        .term-tab.dead { opacity: .55; }
+        .term-tab-x { opacity: .6; padding: 0 4px; border-radius: 4px; line-height: 1.4; }
+        .term-tab-x:hover { opacity: 1; background: rgba(255,255,255,.18); }
+        .term-body { height: 340px; }
+        .term-footer.minimized .term-body { display: none; }
+        .term-pane { display: none; height: 100%; background: #000; padding: 4px; box-sizing: border-box; }
+        .term-pane.active { display: block; }
+        @media (max-width: 720px) { .term-body { height: 260px; } }
     </style>
     <!-- Custom theme overrides (populated on load + when switching themes) -->
     <style id="customThemeStyle"><?= !empty($data['config']['theme_file']) ? ykanThemeCss($data['config']['theme_file']) : '' ?></style>
@@ -3000,8 +3029,11 @@ $dataJson = json_encode($data);
         <nav class="view-tabs">
             <button id="tabKanban" class="active" onclick="showView('kanban')">Kanban</button>
             <button id="tabDash" onclick="showView('dashboard')">Dashboard</button>
+            <button id="tabSettings" onclick="showView('settings')">⚙️ Settings</button>
+            <button id="tabClaude" onclick="showView('claude')">🤖 Claude</button>
         </nav>
         <div class="header-actions">
+            <div id="claudeUsageBadge" class="usage-mini" style="display:none" title="Consumo Claude — clic per aggiornare. Richiede l'estensione Chrome Ykan Usage Badge (extension/)." onclick="claudeUsageRefresh()"></div>
             <button class="btn btn-icon" onclick="toggleGemini()" title="Gemini AI">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
             </button>
@@ -3020,9 +3052,6 @@ $dataJson = json_encode($data);
             <button class="btn btn-icon" onclick="openThemesModal()" title="Gestisci temi">🎨</button>
             <button class="btn btn-icon" onclick="toggleTheme()" title="Toggle light/dark">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
-            </button>
-            <button class="btn btn-icon" onclick="openConfigModal()" title="Settings">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
             </button>
         </div>
     </header>
@@ -3301,8 +3330,7 @@ $dataJson = json_encode($data);
     </div>
 
     <!-- Config Modal -->
-    <div id="configModal" class="modal-overlay">
-        <div class="modal">
+    <section id="settingsView" class="dash-view" style="max-width:720px">
             <h2>Settings</h2>
             <form id="configForm">
                 <div class="form-group">
@@ -3331,6 +3359,15 @@ $dataJson = json_encode($data);
                     </label>
                     <small style="color:var(--text2);font-size:11px;display:block;margin-top:4px">Aggiungi <code>ANTHROPIC_KEY=sk-ant-...</code> nel file <code>.env</code> per abilitare l'esecuzione automatica dei task.</small>
                 </div>
+                <div class="form-group">
+                    <label>Dove aprire le sessioni Claude</label>
+                    <select id="configSessionMode">
+                        <option value="terminal">Terminale locale (nella board, via Bridge)</option>
+                        <option value="desktop">Claude Desktop (locale, richiede l'app installata)</option>
+                        <option value="cloud">Cloud (claude.ai, nel browser)</option>
+                    </select>
+                    <small style="color:var(--text2);font-size:11px">Vale per "▶️ Lavora ora" e per aprire una sessione nuova. "↩️ Riprendi" una sessione esistente resta sempre nel terminale: né Claude Desktop né claude.ai supportano il resume di una sessione locale via link.</small>
+                </div>
                 <hr style="margin:16px 0;border:none;border-top:1px solid var(--border)">
                 <div class="form-group">
                     <label>GitHub Token <span style="font-weight:normal;color:var(--text2)">(Personal Access Token)</span></label>
@@ -3349,12 +3386,28 @@ $dataJson = json_encode($data);
                     <button type="button" class="btn" onclick="addLabel()" style="margin-top:8px">+ Add Label</button>
                 </div>
                 <div class="modal-actions">
-                    <button type="button" class="btn" onclick="closeConfigModal()">Cancel</button>
-                    <button type="submit" class="btn btn-primary">Save</button>
+                    <button type="submit" class="btn btn-primary">💾 Save</button>
                 </div>
             </form>
+    </section>
+
+    <!-- Pannello Claude: skill installate + memoria auto per progetto, lette in sola lettura
+         dal Bridge locale (~/.claude/skills, ~/.claude/projects/*/memory) -->
+    <section id="claudeView" class="dash-view">
+        <div class="dash-toolbar">
+            <h2>🤖 Claude</h2>
+            <span id="claudeBridge" class="dash-bridge"></span>
+            <span style="flex:1"></span>
+            <label style="font-size:12px;color:var(--text2)">Progetto (memoria)
+                <select id="claudeMemProject" onchange="claudeFetchMemory()" style="width:auto;padding:2px 4px;max-width:200px"></select></label>
+            <button class="btn" onclick="loadClaudeView()">↻ Aggiorna</button>
         </div>
-    </div>
+        <div class="dash-tabs">
+            <button data-tab="skills" class="active" onclick="claudeTab('skills')">Skills <span class="dash-count"></span></button>
+            <button data-tab="memory" onclick="claudeTab('memory')">Memoria <span class="dash-count"></span></button>
+        </div>
+        <div id="claudeBody"></div>
+    </section>
 
     <!-- Projects Modal (link swimlanes to hosting folders for mobile/MCP editing) -->
     <div id="projectsModal" class="modal-overlay">
@@ -3482,17 +3535,15 @@ $dataJson = json_encode($data);
     </div>
 
     <!-- Terminal Modal (live shell via local Bridge, xterm.js) -->
-    <div id="terminalModal" class="modal-overlay">
-        <div class="modal" style="max-width:820px">
-            <h2 style="display:flex;align-items:center;gap:8px">🖥️ Terminale — <span id="terminalProjName"></span></h2>
-            <p style="color:var(--text2);font-size:13px;margin-bottom:8px">
-                Shell reale sul tuo PC, nella cartella locale del progetto, via Bridge locale.
-            </p>
-            <div id="terminalContainer" style="height:420px;background:#000;border-radius:8px;overflow:hidden;padding:4px"></div>
-            <div class="modal-actions">
-                <button type="button" class="btn" onclick="closeTerminalModal()">Chiudi</button>
-            </div>
+    <!-- Terminale: pannello persistente in fondo alla pagina, non un modal — minimizzare non
+         chiude le WebSocket (i processi restano vivi), solo la × su una scheda li termina. -->
+    <div id="termFooter" class="term-footer">
+        <div class="term-tabbar">
+            <div id="termTabs" class="term-tabs"></div>
+            <span style="flex:1"></span>
+            <button type="button" class="btn btn-icon" onclick="termToggleMinimize()" id="termMinBtn" title="Riduci a icona">⌄</button>
         </div>
+        <div id="termBody" class="term-body"></div>
     </div>
 
     <!-- Themes Modal -->
@@ -3983,12 +4034,16 @@ $dataJson = json_encode($data);
     }
 
     function showView(view) {
-        if (view !== 'dashboard') view = 'kanban';
+        if (!['dashboard', 'settings', 'claude'].includes(view)) view = 'kanban';
         document.body.dataset.view = view;
         document.getElementById('tabKanban').classList.toggle('active', view === 'kanban');
         document.getElementById('tabDash').classList.toggle('active', view === 'dashboard');
+        document.getElementById('tabSettings').classList.toggle('active', view === 'settings');
+        document.getElementById('tabClaude').classList.toggle('active', view === 'claude');
         try { localStorage.setItem('ykan_view', view); } catch (_) {}
         if (view === 'dashboard') loadDashboard();
+        if (view === 'settings') loadSettingsView();
+        if (view === 'claude') loadClaudeView();
     }
 
     const dashTs = v => { const t = new Date(String(v).replace(' ', 'T')).getTime(); return isNaN(t) ? 0 : t; };
@@ -4588,6 +4643,19 @@ $dataJson = json_encode($data);
         api('reorder_swimlanes', { order: boardData.swimlanes.slice().sort((x, y) => x.position - y.position).map(l => l.id) });
     }
 
+    // "▶️ Lavora ora": apre una sessione nuova (nella modalità scelta in Settings) col contesto
+    // dei blocchi di questo progetto già nel prompt, così Claude sa da dove ripartire.
+    function dashFocusLaunch(laneId) {
+        const r = dashFocusData().find(x => x.lane.id === laneId);
+        if (!r) return;
+        const withId = r.blockers.filter(b => b.id).slice(0, 5);
+        const lines = withId.map(b => `- #${b.seq} ${b.title} (${b.detail})`);
+        const prompt = `Lavora sul progetto "${r.lane.name}".` + (lines.length
+            ? ` Prossimi task da chiudere per la prossima stable:\n${lines.join('\n')}`
+            : ' Nessun blocco esplicito individuato: controlla lo stato del progetto e proponi i prossimi passi.');
+        launchSession(r.lane, { launch: 'claude', prompt });
+    }
+
     function dashFocusHtml() {
         if (!dashData) return '<div class="dash-empty">Carico…</div>';
         if (dashGit === null) return '<div class="dash-empty">Leggo lo stato dei repository…</div>';
@@ -4657,6 +4725,7 @@ $dataJson = json_encode($data);
                     <span style="flex:1"></span>
                     ${badges}
                     ${r.daysStale != null ? `<span class="focus-stale">${r.daysStale === 0 ? 'attivo oggi' : 'fermo da ' + r.daysStale + 'g'}</span>` : ''}
+                    <button type="button" class="btn btn-primary focus-manage" onclick="event.stopPropagation();dashFocusLaunch('${escHtml(r.lane.id)}')">▶️ Lavora ora</button>
                     <button type="button" class="btn focus-manage" onclick="event.stopPropagation();openStableScope('${escHtml(r.lane.id)}')">🎯 Gestisci</button>
                     <span class="focus-pct" style="color:${color}">${r.pct}%</span>
                 </div>
@@ -5220,63 +5289,139 @@ $dataJson = json_encode($data);
     }
 
     // === TERMINAL (live shell via local Bridge, xterm.js) ===
-    let termInstance = null, termFitAddon = null, termSocket = null, termResizeHandler = null;
+    // Pannello persistente in fondo alla pagina, con una scheda per sessione: aprirne una nuova
+    // non chiude le altre. Minimizzare (⌄) nasconde solo il corpo, le WebSocket restano aperte
+    // e i processi vivi in background. Solo la × su una scheda chiude davvero quella sessione
+    // (il Bridge termina il processo alla chiusura della WebSocket, vedi bridge-server.js).
+    let termSessions = []; // { id, laneId, term, fitAddon, socket, tabEl, paneEl }
+    let termActiveId = null;
 
+    window.addEventListener('resize', () => {
+        const sess = termSessions.find(s => s.id === termActiveId);
+        if (!sess) return;
+        sess.fitAddon.fit();
+        if (sess.socket && sess.socket.readyState === WebSocket.OPEN) {
+            sess.socket.send(JSON.stringify({ type: 'resize', cols: sess.term.cols, rows: sess.term.rows }));
+        }
+    });
+
+    // Apre una nuova sessione Claude nella modalità scelta in Settings (session_open_mode):
+    // terminale locale (default, via Bridge), Claude Desktop (deep link claude://code/new) o
+    // cloud (claude://claude.ai/new). Il resume di una sessione esistente NON passa da qui:
+    // né Claude Desktop né claude.ai sanno riagganciare una sessione CLI locale via link, quindi
+    // sessResume() continua a usare sempre openTerminalModal direttamente.
+    function launchSession(lane, context) {
+        context = context || {};
+        const mode = boardData.config.session_open_mode || 'terminal';
+        if (mode === 'terminal') { openTerminalModal(lane.id, context); return; }
+        if (mode === 'desktop') {
+            let url = 'claude://code/new?q=' + encodeURIComponent(context.prompt || '');
+            if (lane.local_path) url += '&folder=' + encodeURIComponent(lane.local_path);
+            window.location.href = url;
+            return;
+        }
+        // cloud: claude.ai non ha accesso al filesystem locale, il contesto va tutto nel prompt
+        const cloudPrompt = (lane.name ? `Progetto "${lane.name}". ` : '') + (context.prompt || '');
+        window.location.href = 'claude://claude.ai/new?q=' + encodeURIComponent(cloudPrompt);
+    }
+
+    // Apre sempre una scheda NUOVA (mai riusa/chiude quelle esistenti): lanciare più cose in
+    // parallelo deve dare più terminali distinti, non sostituire quello che stava girando.
     function openTerminalModal(laneId, context) {
         const lane = boardData.swimlanes.find(l => l.id === laneId);
         if (!lane || !lane.local_path) return;
         context = context || {}; // { launch: 'claude', prompt: '...' } to seed Claude Code with a task's context
-        document.getElementById('terminalProjName').textContent = lane.name;
-        closeTerminalModal(); // tear down any previous instance first
-        document.getElementById('terminalModal').classList.add('active');
 
-        const container = document.getElementById('terminalContainer');
-        termInstance = new Terminal({ convertEol: true, fontSize: 13, theme: { background: '#000000' } });
-        termFitAddon = new FitAddon.FitAddon();
-        termInstance.loadAddon(termFitAddon);
-        termInstance.open(container);
-        termFitAddon.fit();
+        const id = 'term_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7);
+        const footer = document.getElementById('termFooter');
+        footer.classList.add('active');
+        footer.classList.remove('minimized');
 
-        termInstance.onData(data => {
-            if (termSocket && termSocket.readyState === WebSocket.OPEN) {
-                termSocket.send(JSON.stringify({ type: 'input', data }));
-            }
+        const tabEl = document.createElement('div');
+        tabEl.className = 'term-tab';
+        tabEl.innerHTML = `<span>🖥️ ${escHtml(lane.name)}</span><span class="term-tab-x" title="Chiudi (termina il processo)">&times;</span>`;
+        tabEl.addEventListener('click', e => { if (!e.target.classList.contains('term-tab-x')) termSwitchTab(id); });
+        tabEl.querySelector('.term-tab-x').addEventListener('click', e => { e.stopPropagation(); termCloseTab(id); });
+        document.getElementById('termTabs').appendChild(tabEl);
+
+        const paneEl = document.createElement('div');
+        paneEl.className = 'term-pane';
+        document.getElementById('termBody').appendChild(paneEl);
+
+        const sess = { id, laneId, term: null, fitAddon: null, socket: null, tabEl, paneEl };
+        termSessions.push(sess);
+
+        const term = new Terminal({ convertEol: true, fontSize: 13, theme: { background: '#000000' } });
+        const fitAddon = new FitAddon.FitAddon();
+        term.loadAddon(fitAddon);
+        term.open(paneEl);
+        sess.term = term;
+        sess.fitAddon = fitAddon;
+
+        term.onData(data => {
+            if (sess.socket && sess.socket.readyState === WebSocket.OPEN) sess.socket.send(JSON.stringify({ type: 'input', data }));
         });
-
-        termResizeHandler = () => {
-            if (!termFitAddon) return;
-            termFitAddon.fit();
-            if (termSocket && termSocket.readyState === WebSocket.OPEN) {
-                termSocket.send(JSON.stringify({ type: 'resize', cols: termInstance.cols, rows: termInstance.rows }));
-            }
-        };
-        window.addEventListener('resize', termResizeHandler);
 
         let wsUrl = 'ws://127.0.0.1:51820/pty?dir=' + encodeURIComponent(lane.local_path);
         if (context.launch) wsUrl += '&launch=' + encodeURIComponent(context.launch);
         if (context.prompt) wsUrl += '&prompt=' + encodeURIComponent(context.prompt);
         if (context.sessionId) wsUrl += '&sessionId=' + encodeURIComponent(context.sessionId);
-        termSocket = new WebSocket(wsUrl);
-        termSocket.onopen = () => {
-            termFitAddon.fit();
-            termSocket.send(JSON.stringify({ type: 'resize', cols: termInstance.cols, rows: termInstance.rows }));
+        const socket = new WebSocket(wsUrl);
+        sess.socket = socket;
+        socket.onopen = () => {
+            fitAddon.fit();
+            socket.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
         };
-        termSocket.onmessage = ev => {
+        socket.onmessage = ev => {
             const msg = JSON.parse(ev.data);
-            if (msg.type === 'data') termInstance.write(msg.data);
-            else if (msg.type === 'exit') termInstance.writeln('\r\n[processo terminato, codice ' + msg.code + ']');
+            if (msg.type === 'data') term.write(msg.data);
+            else if (msg.type === 'exit') { term.writeln('\r\n[processo terminato, codice ' + msg.code + ']'); tabEl.classList.add('dead'); }
         };
-        termSocket.onerror = () => {
-            termInstance.writeln('\r\nBridge locale non raggiungibile su ws://127.0.0.1:51820. Avvialo con: node bridge/bridge-server.js');
+        socket.onerror = () => {
+            term.writeln('\r\nBridge locale non raggiungibile su ws://127.0.0.1:51820. Avvialo con: node bridge/bridge-server.js');
         };
+
+        termSwitchTab(id);
     }
 
-    function closeTerminalModal() {
-        document.getElementById('terminalModal').classList.remove('active');
-        if (termResizeHandler) { window.removeEventListener('resize', termResizeHandler); termResizeHandler = null; }
-        if (termSocket) { try { termSocket.close(); } catch (_) {} termSocket = null; }
-        if (termInstance) { termInstance.dispose(); termInstance = null; }
-        document.getElementById('terminalContainer').innerHTML = '';
+    function termSwitchTab(id) {
+        termActiveId = id;
+        termSessions.forEach(s => {
+            s.tabEl.classList.toggle('active', s.id === id);
+            s.paneEl.classList.toggle('active', s.id === id);
+        });
+        const sess = termSessions.find(s => s.id === id);
+        if (!sess) return;
+        setTimeout(() => { // il pane deve essere visibile (display:block) prima che fit() misuri le dimensioni
+            sess.fitAddon.fit();
+            if (sess.socket && sess.socket.readyState === WebSocket.OPEN) {
+                sess.socket.send(JSON.stringify({ type: 'resize', cols: sess.term.cols, rows: sess.term.rows }));
+            }
+            sess.term.focus();
+        }, 0);
+    }
+
+    function termCloseTab(id) {
+        const idx = termSessions.findIndex(s => s.id === id);
+        if (idx === -1) return;
+        const sess = termSessions[idx];
+        try { sess.socket.close(); } catch (_) {}
+        try { sess.term.dispose(); } catch (_) {}
+        sess.tabEl.remove();
+        sess.paneEl.remove();
+        termSessions.splice(idx, 1);
+        if (termActiveId !== id) return;
+        const next = termSessions[termSessions.length - 1];
+        if (next) termSwitchTab(next.id);
+        else { termActiveId = null; document.getElementById('termFooter').classList.remove('active'); }
+    }
+
+    function termToggleMinimize() {
+        const footer = document.getElementById('termFooter');
+        const min = footer.classList.toggle('minimized');
+        document.getElementById('termMinBtn').textContent = min ? '⌃' : '⌄';
+        document.getElementById('termMinBtn').title = min ? 'Espandi' : 'Riduci a icona';
+        if (!min) termSwitchTab(termActiveId); // torna visibile: rifai il fit
     }
 
     // === PROJECT DOCS (files the AI studies before working) ===
@@ -5964,15 +6109,20 @@ $dataJson = json_encode($data);
     }
 
     // === CONFIG ===
-    async function openConfigModal() {
+    // Settings è una scheda (showView('settings')), non più un popup: openConfigModal() resta
+    // come alias per i ~10 punti del codice che ci saltano dentro da fuori (link "→ Settings",
+    // onboarding al primo avvio, ecc.), così non li ho dovuti toccare uno per uno.
+    function openConfigModal() { showView('settings'); }
+
+    async function loadSettingsView() {
         document.getElementById('configProjectName').value = boardData.config.project_name || '';
         document.getElementById('configLanguage').value = boardData.config.ai_language || 'en';
         document.getElementById('configGeminiKey').value = boardData.config.gemini_api_key || '';
         document.getElementById('configGithubToken').value = boardData.config.github_token || '';
         document.getElementById('configGithubEnvNote').style.display = ykanGithubEnvToken ? 'block' : 'none';
         document.getElementById('configGithubRepo').value = boardData.config.github_repo || '';
+        document.getElementById('configSessionMode').value = boardData.config.session_open_mode || 'terminal';
         renderLabelsManager();
-        document.getElementById('configModal').classList.add('active');
 
         const badge = document.getElementById('claudeKeyBadge');
         badge.textContent = '...';
@@ -5990,10 +6140,6 @@ $dataJson = json_encode($data);
         }
     }
 
-    function closeConfigModal() {
-        document.getElementById('configModal').classList.remove('active');
-    }
-
     document.getElementById('configForm').addEventListener('submit', async (e) => {
         e.preventDefault();
         const config = {
@@ -6002,14 +6148,170 @@ $dataJson = json_encode($data);
             gemini_api_key: document.getElementById('configGeminiKey').value,
             github_token: document.getElementById('configGithubToken').value,
             github_repo: document.getElementById('configGithubRepo').value,
+            session_open_mode: document.getElementById('configSessionMode').value,
             theme: boardData.config.theme
         };
         boardData.config = config;
         document.getElementById('projectName').textContent = config.project_name;
         document.title = `_Ykan - ${config.project_name}`;
-        closeConfigModal();
         await api('save_config', config);
     });
+
+    // === PANNELLO CLAUDE (skills + memoria, sola lettura via Bridge) ===
+    let claudeSkills = null; // null = non ancora caricato/non raggiungibile, [] = caricato ma vuoto
+    let claudeMemory = {}; // laneId -> { exists, files } | null (bridge irraggiungibile)
+    let claudeTabName = 'skills';
+    const claudeExpanded = new Set(); // chiavi "skill|id" o "mem|laneId|file" con contenuto già mostrato
+
+    function claudeTab(name) {
+        claudeTabName = name;
+        document.querySelectorAll('#claudeView .dash-tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
+        claudeRenderBody();
+    }
+
+    async function loadClaudeView() {
+        const sel = document.getElementById('claudeMemProject');
+        const projects = boardData.swimlanes.filter(l => l.local_path);
+        const prevVal = sel.value;
+        sel.innerHTML = projects.length
+            ? projects.map(l => `<option value="${escHtml(l.id)}">${escHtml(l.name)}</option>`).join('')
+            : '<option value="">Nessun progetto collegato a una cartella</option>';
+        if (prevVal && projects.some(l => l.id === prevVal)) sel.value = prevVal;
+
+        document.querySelectorAll('#claudeView .dash-tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === claudeTabName));
+        claudeRenderBody();
+        await Promise.all([claudeFetchSkills(), claudeFetchMemory()]);
+    }
+
+    async function claudeFetchSkills() {
+        try {
+            const r = await fetch(BRIDGE_URL + '/claude/skills');
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            claudeSkills = (await r.json()).skills || [];
+        } catch (_) { claudeSkills = null; }
+        claudeUpdateBridgeBadge();
+        claudeRenderBody();
+    }
+
+    async function claudeFetchMemory() {
+        const laneId = document.getElementById('claudeMemProject').value;
+        const lane = boardData.swimlanes.find(l => l.id === laneId);
+        if (!lane || !lane.local_path) { claudeRenderBody(); return; }
+        try {
+            const r = await fetch(BRIDGE_URL + '/claude/memory?dir=' + encodeURIComponent(lane.local_path));
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            claudeMemory[laneId] = await r.json();
+        } catch (_) { claudeMemory[laneId] = null; }
+        claudeUpdateBridgeBadge();
+        claudeRenderBody();
+    }
+
+    function claudeUpdateBridgeBadge() {
+        const badge = document.getElementById('claudeBridge');
+        if (claudeSkills === null) { badge.className = 'dash-bridge ko'; badge.textContent = '● Bridge non raggiungibile'; }
+        else { badge.className = 'dash-bridge ok'; badge.textContent = '● Bridge connesso'; }
+    }
+
+    function claudeCard(key, badgeHtml, title, subtitle, whenIso) {
+        const open = claudeExpanded.has(key);
+        const safeId = 'claudeContent_' + key.replace(/[^\w]/g, '_');
+        return `<div class="dash-projcard">
+            <div class="dash-projhead" style="cursor:pointer" onclick="claudeToggle('${escHtml(key)}')">
+                ${badgeHtml}
+                <b>${escHtml(title)}</b>
+                <span style="flex:1"></span>
+                ${whenIso ? `<span class="dash-when">${escHtml(new Date(whenIso).toLocaleDateString('it-IT'))}</span>` : ''}
+            </div>
+            ${subtitle ? `<div class="dash-sub">${escHtml(subtitle)}</div>` : ''}
+            ${open ? `<div class="focus-blockers" id="${safeId}"><div class="dash-empty">Carico…</div></div>` : ''}
+        </div>`;
+    }
+
+    function claudeRenderBody() {
+        const body = document.getElementById('claudeBody');
+        const counts = { skills: claudeSkills ? claudeSkills.length : '', memory: 0 };
+        if (claudeTabName === 'skills') {
+            if (claudeSkills === null) body.innerHTML = '<div class="dash-empty">Bridge locale non raggiungibile: avvialo per vedere le skill installate.</div>';
+            else if (!claudeSkills.length) body.innerHTML = '<div class="dash-empty">Nessuna skill trovata in ~/.claude/skills.</div>';
+            else body.innerHTML = claudeSkills.map(s => claudeCard('skill|' + s.id, '', s.name, s.description, s.modified)).join('');
+        } else {
+            const laneId = document.getElementById('claudeMemProject').value;
+            const mem = claudeMemory[laneId];
+            if (!laneId) body.innerHTML = '<div class="dash-empty">Collega un progetto a una cartella locale per vedere la sua memoria (Kanban → 🔗 Projects).</div>';
+            else if (mem === undefined) body.innerHTML = '<div class="dash-empty">Carico…</div>';
+            else if (mem === null) body.innerHTML = '<div class="dash-empty">Bridge locale non raggiungibile.</div>';
+            else if (!mem.exists || !mem.files.length) body.innerHTML = '<div class="dash-empty">Nessuna memoria per questo progetto — Claude non ha ancora salvato nulla qui.</div>';
+            else {
+                counts.memory = mem.files.length;
+                body.innerHTML = mem.files.map(f => claudeCard(
+                    'mem|' + laneId + '|' + f.file,
+                    f.type ? `<span class="git-tag">${escHtml(f.type)}</span>` : '',
+                    f.name, f.description, f.modified
+                )).join('');
+            }
+        }
+        document.querySelectorAll('#claudeView .dash-tabs button').forEach(b => {
+            const c = b.dataset.tab === 'skills' ? counts.skills : counts.memory;
+            b.querySelector('.dash-count').textContent = c === '' ? '' : c;
+        });
+    }
+
+    async function claudeToggle(key) {
+        if (claudeExpanded.has(key)) { claudeExpanded.delete(key); claudeRenderBody(); return; }
+        claudeExpanded.add(key);
+        claudeRenderBody();
+        const safeId = 'claudeContent_' + key.replace(/[^\w]/g, '_');
+        const parts = key.split('|');
+        try {
+            let url;
+            if (parts[0] === 'skill') {
+                url = BRIDGE_URL + '/claude/skill?id=' + encodeURIComponent(parts[1]);
+            } else {
+                const lane = boardData.swimlanes.find(l => l.id === parts[1]);
+                if (!lane) throw new Error('progetto non trovato');
+                url = BRIDGE_URL + '/claude/memory/file?dir=' + encodeURIComponent(lane.local_path) + '&file=' + encodeURIComponent(parts[2]);
+            }
+            const r = await fetch(url);
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            const { content } = await r.json();
+            const el = document.getElementById(safeId);
+            if (el) el.innerHTML = `<div style="white-space:pre-wrap;font-family:ui-monospace,Consolas,monospace;font-size:12px;max-height:420px;overflow-y:auto">${escHtml(content.replace(/^---[\s\S]*?---\r?\n/, ''))}</div>`;
+        } catch (e) {
+            const el = document.getElementById(safeId);
+            if (el) el.innerHTML = '<div class="dash-empty">Errore nel caricamento: ' + escHtml(e.message) + '</div>';
+        }
+    }
+
+    // === BADGE CONSUMO CLAUDE (via estensione Chrome "Ykan Usage Badge", vedi extension/) ===
+    // Ykan non fa alcuna chiamata: è il content-script dell'estensione (se installata) a
+    // spingere qui i dati con postMessage, letti da claude.ai col cookie del browser.
+    // Senza estensione il badge resta semplicemente nascosto (comportamento di default).
+    window.addEventListener('message', e => {
+        if (e.source !== window || e.origin !== window.location.origin) return;
+        if (!e.data || e.data.source !== 'ykan-usage-ext' || e.data.type !== 'usage') return;
+        const badge = document.getElementById('claudeUsageBadge');
+        if (!badge) return;
+        if (e.data.errorKind === 'auth') {
+            badge.style.display = '';
+            badge.innerHTML = '<div class="usage-row" style="color:#dc2626">🔑 accedi a claude.ai</div>';
+            return;
+        }
+        const u = e.data.usage;
+        if (!u) { badge.style.display = 'none'; return; }
+        const bar = (label, pct) => {
+            const p = Math.round(pct ?? NaN);
+            const ok = Number.isFinite(p);
+            const cls = !ok ? '' : p >= 90 ? 'danger' : p >= 70 ? 'warn' : '';
+            const width = ok ? Math.max(0, Math.min(100, p)) : 0;
+            return `<div class="usage-row"><span class="usage-label">${label}</span><span class="usage-bar"><i class="${cls}" style="width:${width}%"></i></span><span class="usage-pct">${ok ? p + '%' : '—'}</span></div>`;
+        };
+        badge.style.display = '';
+        badge.innerHTML = bar('5h', u.fiveHour?.utilization) + bar('Sett', u.weekly?.utilization);
+    });
+
+    function claudeUsageRefresh() {
+        window.postMessage({ source: 'ykan-usage-page', type: 'refresh' }, window.location.origin);
+    }
 
     // === LABELS ===
     async function addLabel() {
