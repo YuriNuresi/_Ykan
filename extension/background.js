@@ -199,7 +199,12 @@ chrome.webRequest.onBeforeRequest.addListener(
 // un'anteprima — così si capisce dal popup, senza aprire DevTools, se è quella giusta.
 async function probeUrl(url) {
   try {
-    const res = await fetch(url, { credentials: 'include', headers: { 'Accept': 'application/json' } });
+    // Gli endpoint /v1/... (a differenza di /api/...) vogliono l'header anthropic-version,
+    // altrimenti rispondono 400 "anthropic-version: header is required".
+    const res = await fetch(url, {
+      credentials: 'include',
+      headers: { 'Accept': 'application/json', 'anthropic-version': '2023-06-01' }
+    });
     const text = await res.text();
     let preview = text.slice(0, 4000);
     try { preview = JSON.stringify(JSON.parse(text), null, 2).slice(0, 4000); } catch (_) { /* non JSON, va bene il testo grezzo */ }
