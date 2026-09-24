@@ -3034,29 +3034,13 @@ $dataJson = json_encode($data);
         </nav>
         <div class="header-actions">
             <div id="claudeUsageBadge" class="usage-mini" style="display:none" title="Consumo Claude — clic per aggiornare. Richiede l'estensione Chrome Ykan Usage Badge (extension/)." onclick="claudeUsageRefresh()"></div>
-            <button class="btn btn-icon" onclick="toggleGemini()" title="Gemini AI">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
-            </button>
-            <button class="btn btn-icon" onclick="toggleArchive()" title="Archive">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 8v13H3V8M1 3h22v5H1zM10 12h4"/></svg>
-            </button>
-            <button class="btn btn-icon" onclick="toggleGithub()" title="GitHub">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg>
-            </button>
-            <button class="btn btn-icon" onclick="togglePm()" title="PM — PRD / epic / breakdown">📋</button>
-            <button class="btn btn-icon" onclick="pmQuickIdea()" title="Cattura un'idea → PRD">📝</button>
-            <select id="themeSelect" class="filter-select" onchange="onThemeSelect(this.value)" title="Tema attivo" style="max-width:150px">
-                <option value="light">☀️ Light</option>
-                <option value="dark">🌙 Dark</option>
-            </select>
-            <button class="btn btn-icon" onclick="openThemesModal()" title="Gestisci temi">🎨</button>
             <button class="btn btn-icon" onclick="toggleTheme()" title="Toggle light/dark">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
             </button>
         </div>
     </header>
 
-    <!-- Search & Filters Bar -->
+    <!-- Kanban sub-header: search, filtri e azioni sulla board (visibile solo in vista Kanban) -->
     <div class="filters-bar">
         <input type="text" id="searchInput" class="search-input" placeholder="🔍 Search..." oninput="applyFilters()">
         <select id="filterLabel" class="filter-select" onchange="applyFilters()">
@@ -3083,10 +3067,11 @@ $dataJson = json_encode($data);
         </select>
         <button class="btn btn-icon" onclick="clearFilters()" title="Reset filters">✕</button>
         <span style="flex:1"></span>
-        <button class="btn" onclick="openProjectsModal()" title="Link swimlanes to project folders (for mobile/MCP)">🔗 Projects</button>
-        <button class="btn" onclick="generateStandup()" title="Daily Standup AI">📋 Standup</button>
-        <button class="btn" onclick="scanTodos()" title="Scan TODO in files">🔍 TODO</button>
-        <button class="btn" onclick="showBurndown()" title="Burndown Chart">📈 Burndown</button>
+        <button class="btn btn-primary" onclick="quickAddCard()" title="Aggiungi una card rapidamente">＋ Nuova card</button>
+        <button class="btn" onclick="toggleArchive()" title="Card archiviate">📦 Archive</button>
+        <button class="btn" onclick="toggleGithub()" title="Issues, PR e commit di GitHub">🐙 GitHub</button>
+        <button class="btn" onclick="toggleGemini()" title="Analisi del progetto con Gemini AI">🔷 Gemini</button>
+        <button class="btn" onclick="togglePm()" title="PM — PRD / epic / breakdown">📋 PM</button>
         <button class="btn" onclick="exportJSON()" title="Export JSON">📥 JSON</button>
         <button class="btn" onclick="exportCSV()" title="Export CSV">📊 CSV</button>
     </div>
@@ -3112,6 +3097,9 @@ $dataJson = json_encode($data);
                 </select></label>
             <label style="font-size:12px;color:var(--text2);display:flex;align-items:center;gap:4px" title="Quando concludi o riapri una sessione, aggiorna anche l'archivio di Claude Desktop (con backup dei file toccati)">
                 <input type="checkbox" id="dashDesk" onchange="deskSetting(this.checked)" style="width:auto"> archivia anche in Claude Desktop</label>
+            <button class="btn" onclick="generateStandup()" title="Daily Standup AI">📋 Standup</button>
+            <button class="btn" onclick="scanTodos()" title="Scansiona i TODO nei file del progetto collegato">🔍 TODO</button>
+            <button class="btn" onclick="showBurndown()" title="Burndown Chart">📈 Burndown</button>
             <button class="btn" onclick="loadDashboard()">↻ Aggiorna</button>
         </div>
         <div id="dashTabs" class="dash-tabs">
@@ -3329,10 +3317,22 @@ $dataJson = json_encode($data);
         </div>
     </div>
 
-    <!-- Config Modal -->
-    <section id="settingsView" class="dash-view" style="max-width:720px">
+    <!-- Settings: tutte le configurazioni/setup dell'app, divise a schede -->
+    <section id="settingsView" class="dash-view">
+        <div class="dash-toolbar">
             <h2>Settings</h2>
-            <form id="configForm">
+        </div>
+        <div class="dash-tabs">
+            <button data-tab="generale" class="active" onclick="settingsTab('generale')">Generale</button>
+            <button data-tab="api-ai" onclick="settingsTab('api-ai')">API AI</button>
+            <button data-tab="claude-code" onclick="settingsTab('claude-code')">Claude Code</button>
+            <button data-tab="github" onclick="settingsTab('github')">GitHub</button>
+            <button data-tab="progetti" onclick="settingsTab('progetti')">Progetti</button>
+            <button data-tab="aspetto" onclick="settingsTab('aspetto')">Aspetto</button>
+        </div>
+
+        <form id="configForm" style="max-width:720px">
+            <div class="settings-panel" data-panel="generale">
                 <div class="form-group">
                     <label>Project Name</label>
                     <input type="text" id="configProjectName">
@@ -3349,9 +3349,21 @@ $dataJson = json_encode($data);
                     </select>
                 </div>
                 <div class="form-group">
+                    <label>Labels</label>
+                    <div id="labelsManager"></div>
+                    <button type="button" class="btn" onclick="addLabel()" style="margin-top:8px">+ Add Label</button>
+                </div>
+            </div>
+
+            <div class="settings-panel" data-panel="api-ai" style="display:none">
+                <div class="form-group">
                     <label>Gemini API Key</label>
                     <input type="password" id="configGeminiKey" placeholder="Enter your API key...">
                 </div>
+                <button type="button" class="btn" onclick="testGeminiKey()">🧪 Verifica chiave</button>
+            </div>
+
+            <div class="settings-panel" data-panel="claude-code" style="display:none">
                 <div class="form-group" id="claudeKeyStatus" style="background:var(--bg2);padding:10px 12px;border-radius:8px">
                     <label style="display:flex;align-items:center;gap:8px;margin-bottom:0">
                         <span>🏖️ Claude Agent</span>
@@ -3368,7 +3380,9 @@ $dataJson = json_encode($data);
                     </select>
                     <small style="color:var(--text2);font-size:11px">Vale per "▶️ Lavora ora" e per aprire una sessione nuova. "↩️ Riprendi" una sessione esistente resta sempre nel terminale: né Claude Desktop né claude.ai supportano il resume di una sessione locale via link.</small>
                 </div>
-                <hr style="margin:16px 0;border:none;border-top:1px solid var(--border)">
+            </div>
+
+            <div class="settings-panel" data-panel="github" style="display:none">
                 <div class="form-group">
                     <label>GitHub Token <span style="font-weight:normal;color:var(--text2)">(Personal Access Token)</span></label>
                     <input type="password" id="configGithubToken" placeholder="ghp_xxxxxxxxxxxx...">
@@ -3379,16 +3393,36 @@ $dataJson = json_encode($data);
                     <label>GitHub Repository <span style="font-weight:normal;color:var(--text2)">(owner/repo)</span></label>
                     <input type="text" id="configGithubRepo" placeholder="e.g. yourusername/_Ykan">
                 </div>
-                <hr style="margin:16px 0;border:none;border-top:1px solid var(--border)">
-                <div class="form-group">
-                    <label>Labels</label>
-                    <div id="labelsManager"></div>
-                    <button type="button" class="btn" onclick="addLabel()" style="margin-top:8px">+ Add Label</button>
-                </div>
-                <div class="modal-actions">
-                    <button type="submit" class="btn btn-primary">💾 Save</button>
-                </div>
-            </form>
+                <button type="button" class="btn" onclick="testGithubConnection()">🧪 Testa connessione</button>
+            </div>
+
+            <div class="modal-actions">
+                <button type="submit" class="btn btn-primary">💾 Save</button>
+            </div>
+        </form>
+
+        <div class="settings-panel" data-panel="progetti" style="display:none;max-width:720px">
+            <p style="color:var(--text2);font-size:13px;margin-bottom:12px">
+                Ogni swimlane può essere collegata a una cartella sul tuo hosting. Una volta collegata,
+                l'endpoint mobile/MCP (<code>mcp.php</code>) può leggere e modificare i file dentro quella
+                cartella — limitato a quella, nient'altro.
+                <strong>Folder</strong> è relativa alla MCP root configurata in <code>mcp.php</code>
+                (es. <code>clienteA</code> o <code>sites/shopX</code>).
+            </p>
+            <div id="projectsFilterNote" style="display:none;margin-bottom:10px;font-size:12px;color:var(--text2)"></div>
+            <div id="projectsManager"></div>
+        </div>
+
+        <div class="settings-panel" data-panel="aspetto" style="display:none;max-width:720px">
+            <div class="form-group">
+                <label>Tema attivo</label>
+                <select id="themeSelect" onchange="onThemeSelect(this.value)">
+                    <option value="light">☀️ Light</option>
+                    <option value="dark">🌙 Dark</option>
+                </select>
+            </div>
+            <button type="button" class="btn" onclick="openThemesModal()">🎨 Gestisci temi</button>
+        </div>
     </section>
 
     <!-- Pannello Claude: skill installate + memoria auto per progetto, lette in sola lettura
@@ -3409,23 +3443,6 @@ $dataJson = json_encode($data);
         <div id="claudeBody"></div>
     </section>
 
-    <!-- Projects Modal (link swimlanes to hosting folders for mobile/MCP editing) -->
-    <div id="projectsModal" class="modal-overlay">
-        <div class="modal">
-            <h2>🔗 Projects</h2>
-            <p style="color:var(--text2);font-size:13px;margin-bottom:12px">
-                Each swimlane can be linked to a folder on your hosting. Once linked, the
-                mobile/MCP endpoint (<code>mcp.php</code>) can read and edit files inside that
-                folder — scoped to it, nothing else.
-                <strong>Folder</strong> is relative to the MCP root configured in <code>mcp.php</code>
-                (e.g. <code>clienteA</code> or <code>sites/shopX</code>).
-            </p>
-            <div id="projectsManager"></div>
-            <div class="modal-actions">
-                <button type="button" class="btn btn-primary" onclick="closeProjectsModal()">Done</button>
-            </div>
-        </div>
-    </div>
 
     <!-- Project Docs Modal (tag files/folders the AI should study for a project) -->
     <div id="docsModal" class="modal-overlay">
@@ -3917,23 +3934,28 @@ $dataJson = json_encode($data);
     }
 
     // === PROJECTS (swimlane <-> hosting folder links, used by mcp.php) ===
-    // When a laneId is given (e.g. the 🔗 in a swimlane header) the modal is
-    // scoped to that single project; with no arg (toolbar button) it shows all.
+    // Quando arriva un laneId (es. dal 🔗 nell'header di una swimlane) la scheda Progetti
+    // si apre filtrata su quel solo progetto; senza arg (bottone di Settings) li mostra tutti.
     let projectsFilterLaneId = null;
     function openProjectsModal(laneId) {
         projectsFilterLaneId = laneId || null;
-        renderProjectsManager();
-        document.getElementById('projectsModal').classList.add('active');
-    }
-
-    function closeProjectsModal() {
-        document.getElementById('projectsModal').classList.remove('active');
+        showView('settings');
+        settingsTab('progetti');
     }
 
     function renderProjectsManager() {
         const container = document.getElementById('projectsManager');
+        const note = document.getElementById('projectsFilterNote');
         let lanes = [...boardData.swimlanes].sort((a, b) => a.position - b.position);
-        if (projectsFilterLaneId) lanes = lanes.filter(l => l.id === projectsFilterLaneId);
+        if (projectsFilterLaneId) {
+            const lane = boardData.swimlanes.find(l => l.id === projectsFilterLaneId);
+            lanes = lanes.filter(l => l.id === projectsFilterLaneId);
+            note.style.display = 'block';
+            note.innerHTML = `Filtrato su <strong>${escHtml(lane ? lane.name : '')}</strong> — <a href="#" onclick="projectsFilterLaneId=null;renderProjectsManager();return false">mostra tutti i progetti</a>`;
+        } else {
+            note.style.display = 'none';
+            note.innerHTML = '';
+        }
         container.innerHTML = lanes.map(lane => `
             <div class="project-row" style="border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:8px">
                 <div style="font-weight:600;margin-bottom:6px">${escHtml(lane.name)} ${lane.path ? '🔗' : ''}</div>
@@ -3949,7 +3971,10 @@ $dataJson = json_encode($data);
                     <label style="font-size:11px">Local folder (on this machine, e.g. for the local Bridge)</label>
                     <input type="text" id="proj-local-${lane.id}" value="${escHtml(lane.local_path || '')}" placeholder="e.g. C:\\Script locali\\clienteA">
                 </div>
-                <button class="btn btn-primary" onclick="saveProjectLink('${lane.id}')">Save link</button>
+                <div style="display:flex;gap:8px">
+                    <button class="btn btn-primary" onclick="saveProjectLink('${lane.id}')">Save link</button>
+                    <button class="btn" onclick="openDocsModal('${lane.id}')" title="Documentazione del progetto (file per l'AI)">📄 Documentazione</button>
+                </div>
             </div>
         `).join('');
     }
@@ -5625,6 +5650,14 @@ $dataJson = json_encode($data);
         sel.value = cur;
     }
 
+    // Bottone "＋ Nuova card" del sub-header Kanban: apre il modale sulla prima swimlane/colonna.
+    function quickAddCard() {
+        const lane = [...boardData.swimlanes].sort((a, b) => a.position - b.position)[0];
+        const col = [...boardData.columns].sort((a, b) => a.position - b.position)[0];
+        if (!lane || !col) { toast('Crea prima una swimlane e una colonna', 'error'); return; }
+        openCardModal(null, col.id, lane.id);
+    }
+
     function openCardModal(cardId = null, colId = null, laneId = null) {
         const modal = document.getElementById('cardModal');
         const form = document.getElementById('cardForm');
@@ -6114,6 +6147,17 @@ $dataJson = json_encode($data);
     // onboarding al primo avvio, ecc.), così non li ho dovuti toccare uno per uno.
     function openConfigModal() { showView('settings'); }
 
+    // === Settings a schede ===
+    let settingsTabName = (() => { try { return localStorage.getItem('ykan_settings_tab') || 'generale'; } catch (_) { return 'generale'; } })();
+
+    function settingsTab(name) {
+        settingsTabName = name;
+        try { localStorage.setItem('ykan_settings_tab', name); } catch (_) {}
+        document.querySelectorAll('#settingsView .dash-tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
+        document.querySelectorAll('#settingsView .settings-panel').forEach(p => p.style.display = p.dataset.panel === name ? 'block' : 'none');
+        if (name === 'progetti') renderProjectsManager();
+    }
+
     async function loadSettingsView() {
         document.getElementById('configProjectName').value = boardData.config.project_name || '';
         document.getElementById('configLanguage').value = boardData.config.ai_language || 'en';
@@ -6123,6 +6167,7 @@ $dataJson = json_encode($data);
         document.getElementById('configGithubRepo').value = boardData.config.github_repo || '';
         document.getElementById('configSessionMode').value = boardData.config.session_open_mode || 'terminal';
         renderLabelsManager();
+        settingsTab(settingsTabName);
 
         const badge = document.getElementById('claudeKeyBadge');
         badge.textContent = '...';
@@ -6140,9 +6185,8 @@ $dataJson = json_encode($data);
         }
     }
 
-    document.getElementById('configForm').addEventListener('submit', async (e) => {
-        e.preventDefault();
-        const config = {
+    function collectConfigForm() {
+        return {
             project_name: document.getElementById('configProjectName').value,
             ai_language: document.getElementById('configLanguage').value,
             gemini_api_key: document.getElementById('configGeminiKey').value,
@@ -6151,11 +6195,37 @@ $dataJson = json_encode($data);
             session_open_mode: document.getElementById('configSessionMode').value,
             theme: boardData.config.theme
         };
+    }
+
+    async function saveConfigForm() {
+        const config = collectConfigForm();
         boardData.config = config;
         document.getElementById('projectName').textContent = config.project_name;
         document.title = `_Ykan - ${config.project_name}`;
         await api('save_config', config);
+    }
+
+    document.getElementById('configForm').addEventListener('submit', async (e) => {
+        e.preventDefault();
+        await saveConfigForm();
+        toast('Impostazioni salvate', 'success');
     });
+
+    async function testGithubConnection() {
+        await saveConfigForm();
+        toast('🔎 Verifico connessione GitHub...', 'info');
+        const result = await api('github_repo_info');
+        if (!result.success) { toast('❌ ' + result.error, 'error'); return; }
+        toast(`✅ Connesso a ${result.repo.full_name}`, 'success');
+    }
+
+    async function testGeminiKey() {
+        await saveConfigForm();
+        toast('🔎 Verifico chiave Gemini...', 'info');
+        const result = await api('gemini_analyze', { prompt: 'custom', custom_prompt: 'Rispondi solo con: OK' });
+        if (!result.success) { toast('❌ ' + result.error, 'error'); return; }
+        toast('✅ Chiave Gemini valida', 'success');
+    }
 
     // === PANNELLO CLAUDE (skills + memoria, sola lettura via Bridge) ===
     let claudeSkills = null; // null = non ancora caricato/non raggiungibile, [] = caricato ma vuoto
@@ -6722,18 +6792,6 @@ Rules:
         toast('PRD creato: ' + res.slug, 'success');
         await pmRefresh();
         pmOut(`<div class="pm-out">${escHtml(res.content)}</div>`);
-    }
-
-    // Quick-capture: open the panel, expand the New PRD form, focus the idea.
-    function pmQuickIdea() {
-        const p = document.getElementById('pmPanel');
-        if (!p.classList.contains('open')) togglePm();
-        setTimeout(() => {
-            const f = document.getElementById('pmNewPrdForm');
-            if (f) f.style.display = 'block';
-            const i = document.getElementById('pmIdea');
-            if (i) i.focus();
-        }, 120);
     }
 
     async function pmDoEpic(slug) {
