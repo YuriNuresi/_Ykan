@@ -150,4 +150,61 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     chrome.storage.local.get(STORAGE_KEY).then(stored => sendResponse(stored[STORAGE_KEY] || null));
     return true;
   }
+  if (msg && msg.type === 'get-captured') {
+    chrome.storage.local.get(CAPTURE_KEY).then(stored => sendResponse(stored[CAPTURE_KEY] || []));
+    return true;
+  }
+  if (msg && msg.type === 'clear-captured') {
+    chrome.storage.local.set({ [CAPTURE_KEY]: [] }).then(() => sendResponse({ ok: true }));
+    return true;
+  }
+  if (msg && msg.type === 'probe-url') {
+    probeUrl(msg.url).then(sendResponse);
+    return true;
+  }
 });
+
+// === CATTURA RICHIESTE — per scoprire l'endpoint (non documentato) che claude.ai/code
+// usa per elencare le sessioni cloud. Stesso principio di fetchUsage(): nessun token,
+// solo osservazione passiva di richieste che il browser fa già col cookie di sessione.
+// Non blocca né modifica nulla (nessun listener "blocking"), legge solo url/metodo.
+const CAPTURE_KEY = 'ykanCapturedRequests';
+const CAPTURE_LIMIT = 150;
+// Rumore noto da escludere: telemetria, lo stream di completion (enorme e frequente),
+// lo usage (già coperto sopra), asset statici.
+const IGNORE_SUBSTR = ['/usage', 'statsig', 'sentry', 'ingest', 'telemetry', 'completion', 'typing', '/gate', 'doubleclick', 'analytics', 'segment.'];
+
+function shouldIgnoreUrl(url) {
+  return IGNORE_SUBSTR.some(s => url.includes(s));
+}
+
+async function logCapturedRequest(entry) {
+  const { [CAPTURE_KEY]: list = [] } = await chrome.storage.local.get(CAPTURE_KEY);
+  if (list.some(e => e.url === entry.url && e.method === entry.method)) return; // già vista
+  list.unshift(entry);
+  if (list.length > CAPTURE_LIMIT) list.length = CAPTURE_LIMIT;
+  await chrome.storage.local.set({ [CAPTURE_KEY]: list });
+}
+
+chrome.webRequest.onBeforeRequest.addListener(
+  details => {
+    if (details.type !== 'xmlhttprequest') return;
+    if (shouldIgnoreUrl(details.url)) return;
+    logCapturedRequest({ url: details.url, method: details.method, ts: Date.now() });
+  },
+  { urls: ['https://claude.ai/*'] }
+);
+
+// Ri-legge una URL già catturata (solo GET, stesso cookie del browser) e ne restituisce
+// un'anteprima — così si capisce dal popup, senza aprire DevTools, se è quella giusta.
+async function probeUrl(url) {
+  try {
+    const res = await fetch(url, { credentials: 'include', headers: { 'Accept': 'application/json' } });
+    const text = await res.text();
+    let preview = text.slice(0, 4000);
+    try { preview = JSON.stringify(JSON.parse(text), null, 2).slice(0, 4000); } catch (_) { /* non JSON, va bene il testo grezzo */ }
+    return { ok: res.ok, status: res.status, preview };
+  } catch (err) {
+    return { ok: false, status: 0, preview: '', error: String(err && err.message || err) };
+  }
+}

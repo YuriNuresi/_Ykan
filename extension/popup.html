@@ -17,6 +17,14 @@
   button:hover { background: #363b47; }
   a { color: #7aa2ff; }
   #errorBox { display: none; font-size: 11px; color: #f0a; margin-bottom: 8px; }
+  h2 { font-size: 12px; margin: 14px 0 6px; display: flex; align-items: center; justify-content: space-between; }
+  #captureList { max-height: 180px; overflow-y: auto; font-size: 10px; }
+  .cap-row { border: 1px solid #2a2e38; border-radius: 6px; padding: 5px 6px; margin-bottom: 5px; }
+  .cap-row .cap-url { word-break: break-all; color: #cbd2de; }
+  .cap-row .cap-meta { color: #6b7280; margin: 2px 0 4px; }
+  .cap-row .cap-actions { display: flex; gap: 6px; }
+  .cap-preview { white-space: pre-wrap; word-break: break-all; background: #12141a; border-radius: 4px; padding: 5px; margin-top: 5px; max-height: 140px; overflow-y: auto; display: none; }
+  .cap-empty { color: #6b7280; font-size: 11px; }
 </style>
 </head>
 <body>
@@ -34,6 +42,16 @@
   </div>
   <div class="meta" id="lastUpdated"></div>
   <div class="meta"><a href="https://claude.ai/new#settings/usage" target="_blank" rel="noopener">Apri il dettaglio su claude.ai →</a></div>
+
+  <h2>Richieste catturate su claude.ai
+    <span>
+      <button id="copyCapturedBtn" title="Copia tutto come JSON">📋</button>
+      <button id="clearCapturedBtn" title="Svuota">🗑</button>
+    </span>
+  </h2>
+  <div class="meta" style="margin-bottom:6px">Naviga su claude.ai/code (apri la lista sessioni), poi torna qui.</div>
+  <div id="captureList"><div class="cap-empty">Nessuna richiesta catturata ancora.</div></div>
+
   <script src="popup.js"></script>
 </body>
 </html>
