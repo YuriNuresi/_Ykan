@@ -21,3 +21,6 @@ Thumbs.db
 bridge/node_modules/
 bridge/dist/
 bridge/*.log
+
+# Cartella del .env scelta in Settings (percorso locale per ogni installazione)
+_Ykan_local.json

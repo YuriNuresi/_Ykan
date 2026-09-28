@@ -159,14 +159,16 @@ header('Content-Type: application/json; charset=utf-8');
 // ============================================================================
 final class McpError extends Exception {}
 
+// Stesso archivio di _Ykan.php (file JSON o MySQL, vedi loadData/saveData là).
+define('YKAN_LIB', true);
+require_once __DIR__ . '/_Ykan.php';
+
 function mcp_load(): array {
-    if (!is_file(MCP_DATA_FILE)) return [];
-    $raw = file_get_contents(MCP_DATA_FILE);
-    return json_decode($raw, true) ?: [];
+    return loadData();
 }
 
 function mcp_save(array $data): void {
-    file_put_contents(MCP_DATA_FILE, json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
+    saveData($data);
 }
 
 function mcp_id(string $prefix = 'card'): string {
@@ -670,7 +672,8 @@ function mcp_run_tool(string $name, array $a): string {
                     if (stripos($col['name'], (string)$a['column']) !== false) { $colId = $col['id']; break; }
                 }
             }
-            $priority = in_array($a['priority'] ?? 'medium', ['high', 'medium', 'low'], true) ? $a['priority'] : 'medium';
+            $priority = $a['priority'] ?? 'medium';
+            if (!in_array($priority, ['high', 'medium', 'low'], true)) $priority = 'medium';
 
             $labelId = null;
             if (!empty($a['label'])) {

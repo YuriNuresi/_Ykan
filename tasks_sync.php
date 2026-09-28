@@ -94,10 +94,14 @@ function ykan_tasks_sync(): array {
         return ['ok' => false, 'error' => 'gmail_mailer.php non espone le funzioni attese.'];
     }
 
-    $dataFile = __DIR__ . '/_Ykan_data.json';
-    if (!is_file($dataFile)) return ['ok' => false, 'error' => '_Ykan_data.json non trovato.'];
-    $data = json_decode((string) file_get_contents($dataFile), true);
-    if (!is_array($data)) return ['ok' => false, 'error' => '_Ykan_data.json illeggibile.'];
+    // Stesso archivio di _Ykan.php (file JSON o MySQL).
+    if (!defined('YKAN_LIB')) define('YKAN_LIB', true);
+    require_once __DIR__ . '/_Ykan.php';
+    try {
+        $data = loadData();
+    } catch (Throwable $e) {
+        return ['ok' => false, 'error' => 'Archivio dati non disponibile: ' . $e->getMessage()];
+    }
 
     try {
         $token = gmail_access_token($clientId, $clientSecret, $refreshToken);
@@ -194,7 +198,7 @@ function ykan_tasks_sync(): array {
         }
     }
 
-    file_put_contents($dataFile, json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
+    saveData($data);
 
     $summary = sprintf(
         '%d tasklist create, %d task creati, %d aggiornati, %d completati su Google, %d completati su Ykan',

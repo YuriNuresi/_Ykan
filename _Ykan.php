@@ -91,14 +91,133 @@ const DEFAULT_DATA = [
     ]
 ];
 
+// === STORAGE: file JSON (default) oppure MySQL ================================
+// Ykan resta un file unico: senza configurazione salva tutto in _Ykan_data.json.
+// Con YKAN_STORAGE=mysql + DB_* nel .env usa MySQL, una riga per utente con la board
+// intera (tabella ykan_boards). L'opt-in esplicito serve perché il .env dell'hosting
+// ha già DB_* condivisi con altri progetti. Se MySQL è richiesto ma non risponde, Ykan
+// si ferma con un errore invece di ripiegare sul file: le due copie divergerebbero.
+// Dove cercare il .env si imposta in Settings → Generale (salvato in YKAN_LOCAL_CONFIG,
+// fuori dal file dati perché serve prima di sapere dove stanno i dati).
+const YKAN_LOCAL_CONFIG = __DIR__ . '/_Ykan_local.json';
+
+function ykanLocalConfig(): array {
+    if (!is_file(YKAN_LOCAL_CONFIG)) return [];
+    return json_decode((string)@file_get_contents(YKAN_LOCAL_CONFIG), true) ?: [];
+}
+
+function ykanSaveLocalConfig(array $cfg): bool {
+    return file_put_contents(YKAN_LOCAL_CONFIG, json_encode($cfg, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE)) !== false;
+}
+
+/** Minimal .env reader: KEY=VALUE per riga, ignora commenti e righe vuote (come mcp_load_env). */
+function ykanParseEnv(string $path): array {
+    $out = [];
+    if (!is_file($path) || !is_readable($path)) return $out;
+    foreach (file($path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [] as $line) {
+        $line = ltrim($line);
+        if ($line === '' || $line[0] === '#') continue;
+        $eq = strpos($line, '=');
+        if ($eq === false) continue;
+        $key = trim(substr($line, 0, $eq));
+        $val = trim(substr($line, $eq + 1));
+        if (strlen($val) >= 2 && ($val[0] === '"' || $val[0] === "'") && substr($val, -1) === $val[0]) {
+            $val = substr($val, 1, -1);
+        }
+        if ($key !== '' && !array_key_exists($key, $out)) $out[$key] = $val;
+    }
+    return $out;
+}
+
+/** Cartelle in cui può stare il .env: quella di _Ykan.php e fino a 3 livelli sopra. */
+function ykanEnvCandidates(): array {
+    $dirs = [];
+    $d = __DIR__;
+    for ($i = 0; $i < 4; $i++) {
+        $dirs[] = $d;
+        $up = dirname($d);
+        if ($up === $d) break;
+        $d = $up;
+    }
+    return $dirs;
+}
+
+/** File .env da leggere: la cartella scelta in Settings, altrimenti accanto a _Ykan.php e poi quella sopra. */
+function ykanEnvFiles(): array {
+    $dir = (string)(ykanLocalConfig()['env_dir'] ?? '');
+    if ($dir !== '' && is_dir($dir)) return [rtrim($dir, '/\\') . DIRECTORY_SEPARATOR . '.env'];
+    return [__DIR__ . DIRECTORY_SEPARATOR . '.env', dirname(__DIR__) . DIRECTORY_SEPARATOR . '.env'];
+}
+
+function ykanEnvAll(): array {
+    static $env = null;
+    if ($env === null) {
+        $env = [];
+        foreach (ykanEnvFiles() as $f) $env += ykanParseEnv($f); // il primo file vince
+    }
+    return $env;
+}
+
+function ykanDbRequested(): bool {
+    return strtolower((string)(ykanEnvAll()['YKAN_STORAGE'] ?? '')) === 'mysql';
+}
+
+/** Connessione MySQL secondo il .env; lancia RuntimeException se configurata ma non raggiungibile. */
+function ykanDb(): ?PDO {
+    static $pdo = null;
+    if ($pdo !== null || !ykanDbRequested()) return $pdo;
+    $e = ykanEnvAll();
+    if (($e['DB_NAME'] ?? '') === '' || ($e['DB_USER'] ?? '') === '') {
+        throw new RuntimeException('YKAN_STORAGE=mysql ma DB_NAME/DB_USER mancano nel .env');
+    }
+    $dsn = sprintf('mysql:host=%s;port=%d;dbname=%s;charset=%s',
+        $e['DB_HOST'] ?? 'localhost', (int)($e['DB_PORT'] ?? 3306), $e['DB_NAME'], $e['DB_CHARSET'] ?? 'utf8mb4');
+    try {
+        $pdo = new PDO($dsn, $e['DB_USER'], $e['DB_PASS'] ?? '', [
+            PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+            PDO::ATTR_TIMEOUT => 5,
+        ]);
+    } catch (PDOException $ex) {
+        throw new RuntimeException('MySQL non raggiungibile: ' . $ex->getMessage());
+    }
+    $pdo->exec('CREATE TABLE IF NOT EXISTS ykan_boards (
+        user_id INT UNSIGNED NOT NULL PRIMARY KEY,
+        data LONGTEXT NOT NULL,
+        updated_at DATETIME NOT NULL
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4');
+    return $pdo;
+}
+
+function ykanStorageMode(): string {
+    return ykanDbRequested() ? 'mysql' : 'json';
+}
+
+/** Utente corrente. Per ora sempre 1 (la board attuale); con il login Google (#454) arriva dalla sessione. */
+function ykanCurrentUserId(): int {
+    return 1;
+}
+
 // === DATA FUNCTIONS ===
 function loadData(): array {
-    if (!file_exists(DATA_FILE)) {
-        saveData(DEFAULT_DATA);
-        return DEFAULT_DATA;
+    if ($pdo = ykanDb()) {
+        $st = $pdo->prepare('SELECT data FROM ykan_boards WHERE user_id = ?');
+        $st->execute([ykanCurrentUserId()]);
+        $raw = $st->fetchColumn();
+        if ($raw === false) {
+            // Primo avvio in MySQL: importa la board dal file JSON, se c'è.
+            $data = is_file(DATA_FILE) ? (json_decode((string)file_get_contents(DATA_FILE), true) ?: DEFAULT_DATA) : DEFAULT_DATA;
+            ykanEnsureSeq($data);
+            saveData($data);
+            return $data;
+        }
+        $data = json_decode((string)$raw, true) ?: DEFAULT_DATA;
+    } else {
+        if (!file_exists(DATA_FILE)) {
+            saveData(DEFAULT_DATA);
+            return DEFAULT_DATA;
+        }
+        $data = json_decode((string)file_get_contents(DATA_FILE), true) ?? DEFAULT_DATA;
     }
-    $content = file_get_contents(DATA_FILE);
-    $data = json_decode($content, true) ?? DEFAULT_DATA;
     // Backfill short, human-friendly ids (#1, #2, …) on boards created before them.
     if (ykanEnsureSeq($data)) {
         saveData($data);
@@ -107,7 +226,50 @@ function loadData(): array {
 }
 
 function saveData(array $data): bool {
+    if ($pdo = ykanDb()) {
+        $st = $pdo->prepare('INSERT INTO ykan_boards (user_id, data, updated_at) VALUES (?, ?, NOW())
+            ON DUPLICATE KEY UPDATE data = VALUES(data), updated_at = VALUES(updated_at)');
+        return $st->execute([ykanCurrentUserId(), json_encode($data, JSON_UNESCAPED_UNICODE)]);
+    }
     return file_put_contents(DATA_FILE, json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE)) !== false;
+}
+
+/** Stato per Settings → Generale: modalità, cartella .env, candidate, esito della connessione. Mai i valori. */
+function ykanStorageInfo(): array {
+    $cands = [];
+    foreach (ykanEnvCandidates() as $d) {
+        $f = $d . DIRECTORY_SEPARATOR . '.env';
+        $keys = is_file($f) ? array_keys(ykanParseEnv($f)) : [];
+        $cands[] = [
+            'dir' => $d,
+            'has_env' => is_file($f),
+            'has_db' => in_array('DB_NAME', $keys, true) && in_array('DB_USER', $keys, true),
+            'storage_mysql' => strtolower((string)(ykanParseEnv($f)['YKAN_STORAGE'] ?? '')) === 'mysql',
+        ];
+    }
+    $info = [
+        'mode' => ykanStorageMode(),
+        'env_dir' => (string)(ykanLocalConfig()['env_dir'] ?? ''),
+        'env_files' => array_values(array_filter(ykanEnvFiles(), 'is_file')),
+        'candidates' => $cands,
+        'data_file' => is_file(DATA_FILE),
+        'db_ok' => null,
+        'db_msg' => '',
+    ];
+    if ($info['mode'] === 'mysql') {
+        try {
+            $pdo = ykanDb();
+            $n = (int)$pdo->query('SELECT COUNT(*) FROM ykan_boards')->fetchColumn();
+            $info['db_ok'] = true;
+            $info['db_msg'] = "MySQL ok ($n board)";
+        } catch (Throwable $ex) {
+            $info['db_ok'] = false;
+            $info['db_msg'] = $ex->getMessage();
+        }
+    } else {
+        $info['db_msg'] = 'Uso il file _Ykan_data.json (nel .env manca YKAN_STORAGE=mysql)';
+    }
+    return $info;
 }
 
 function generateId(string $prefix = 'id'): string {
@@ -158,26 +320,9 @@ function ykanEnsureSeq(array &$data): bool {
 }
 
 // === .env reader (shared keys: MCP_ROOT, ANTHROPIC_KEY, etc.) =================
+// Legge dai file di ykanEnvFiles(), quindi rispetta la cartella scelta in Settings.
 function ykanEnv(string $key): string {
-    static $cache = [];
-    if (isset($cache[$key])) return $cache[$key];
-    foreach ([__DIR__ . '/.env', dirname(__DIR__) . '/.env'] as $envPath) {
-        if (!is_file($envPath) || !is_readable($envPath)) continue;
-        foreach (file($envPath, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) as $line) {
-            $line = ltrim($line);
-            if ($line === '' || $line[0] === '#') continue;
-            if (preg_match('/^' . preg_quote($key, '/') . '\s*=\s*(.*)$/', $line, $m)) {
-                $v = trim($m[1]);
-                if (strlen($v) >= 2 && ($v[0] === '"' || $v[0] === "'") && substr($v, -1) === $v[0]) {
-                    $v = substr($v, 1, -1);
-                }
-                $cache[$key] = $v;
-                return $v;
-            }
-        }
-    }
-    $cache[$key] = '';
-    return '';
+    return (string)(ykanEnvAll()[$key] ?? '');
 }
 
 // GitHub token: GITHUB_TOKEN in the server .env wins over the value saved in the board data,
@@ -536,12 +681,39 @@ function scanProject(string $rootDir, int $maxDepth = 3): array {
     return $result;
 }
 
+// mcp.php e tasks_sync.php includono questo file solo per le funzioni (loadData/saveData…).
+if (defined('YKAN_LIB')) return;
+
 // === API HANDLER ===
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['api'])) {
     header('Content-Type: application/json');
     $input = json_decode(file_get_contents('php://input'), true) ?? [];
-    $data = loadData();
     $action = $_GET['api'];
+
+    // Archivio dati: rispondono anche quando MySQL non è raggiungibile, per poterlo sistemare.
+    if ($action === 'storage_info') {
+        echo json_encode(ykanStorageInfo());
+        exit;
+    }
+    if ($action === 'save_env_dir') {
+        $dir = trim((string)($input['env_dir'] ?? ''));
+        if ($dir !== '' && !is_dir($dir)) {
+            echo json_encode(['success' => false, 'error' => 'Cartella inesistente']);
+            exit;
+        }
+        $cfg = ykanLocalConfig();
+        if ($dir === '') unset($cfg['env_dir']); else $cfg['env_dir'] = $dir;
+        echo json_encode(['success' => ykanSaveLocalConfig($cfg)]);
+        exit;
+    }
+
+    try {
+        $data = loadData();
+    } catch (Throwable $ex) {
+        http_response_code(500);
+        echo json_encode(['success' => false, 'error' => $ex->getMessage()]);
+        exit;
+    }
 
     try {
         $result = match($action) {
@@ -2510,7 +2682,18 @@ PROMPT;
 }
 
 // === LOAD DATA FOR HTML ===
-$data = loadData();
+try {
+    $data = loadData();
+} catch (Throwable $ex) {
+    http_response_code(500);
+    $msg = htmlspecialchars($ex->getMessage());
+    $envs = htmlspecialchars(implode(', ', ykanEnvFiles()));
+    echo "<!doctype html><meta charset='utf-8'><title>Ykan — archivio dati non disponibile</title>"
+       . "<body style='font-family:system-ui;padding:3rem;max-width:720px;margin:auto'>"
+       . "<h1>Archivio dati non disponibile</h1><p>{$msg}</p>"
+       . "<p>Il .env letto è: <code>{$envs}</code>. Correggi i DB_* oppure togli <code>YKAN_STORAGE=mysql</code> per tornare al file JSON.</p></body>";
+    exit;
+}
 $dataJson = json_encode($data);
 ?>
 <!DOCTYPE html>
@@ -3352,6 +3535,18 @@ $dataJson = json_encode($data);
                     <label>Labels</label>
                     <div id="labelsManager"></div>
                     <button type="button" class="btn" onclick="addLabel()" style="margin-top:8px">+ Add Label</button>
+                </div>
+                <div class="form-group">
+                    <label>Archivio dati</label>
+                    <div id="storageStatus" style="font-size:13px;color:var(--text2);margin-bottom:8px">…</div>
+                    <label style="font-weight:normal;font-size:13px">Cartella del file .env</label>
+                    <div style="display:flex;gap:6px">
+                        <input type="text" id="configEnvDir" placeholder="automatica: accanto a _Ykan.php, poi la cartella sopra" style="flex:1">
+                        <button type="button" class="btn" onclick="saveEnvDir()">Salva</button>
+                        <button type="button" class="btn" onclick="loadStorageInfo(true)">🔍 Cerca</button>
+                    </div>
+                    <div id="envCandidates" style="margin-top:8px;font-size:13px"></div>
+                    <small style="color:var(--text2)">Con <code>YKAN_STORAGE=mysql</code> e i <code>DB_*</code> nel .env Ykan usa MySQL (al primo avvio importa la board dal file JSON). Altrimenti usa <code>_Ykan_data.json</code>.</small>
                 </div>
             </div>
 
@@ -5398,7 +5593,8 @@ $dataJson = json_encode($data);
         if (mode === 'terminal') { openTerminalModal(lane.id, context); return; }
         if (mode === 'desktop') {
             let url = 'claude://code/new?q=' + encodeURIComponent(context.prompt || '');
-            if (lane.local_path) url += '&folder=' + encodeURIComponent(lane.local_path);
+            // "cwd" (non "folder", che Desktop ignora aprendo una cartella temporanea): il prompt parte da solo
+            if (lane.local_path) url += '&cwd=' + encodeURIComponent(lane.local_path);
             window.location.href = url;
             return;
         }
@@ -6352,6 +6548,33 @@ $dataJson = json_encode($data);
         if (name === 'progetti') renderProjectsManager();
     }
 
+    // Archivio dati (JSON o MySQL) e cartella del .env: vedi ykanStorageInfo() lato PHP.
+    async function loadStorageInfo(showCandidates) {
+        const box = document.getElementById('storageStatus');
+        const list = document.getElementById('envCandidates');
+        let info;
+        try {
+            info = await (await fetch('?api=storage_info', { method: 'POST' })).json();
+        } catch (_) { box.textContent = 'Stato non disponibile'; return; }
+        const icon = info.mode === 'mysql' ? (info.db_ok ? '🟢 MySQL' : '🔴 MySQL') : '📄 File JSON';
+        box.innerHTML = `<strong>${icon}</strong> — ${escHtml(info.db_msg)}`
+            + (info.env_files.length ? `<br>.env letto: <code>${info.env_files.map(escHtml).join('</code>, <code>')}</code>` : '<br>Nessun .env trovato');
+        document.getElementById('configEnvDir').value = info.env_dir || '';
+        if (!showCandidates) { list.innerHTML = ''; return; }
+        list.innerHTML = info.candidates.map(c => {
+            const tag = !c.has_env ? '<span style="color:var(--text2)">nessun .env</span>'
+                : (c.has_db ? '✅ .env con DB_*' : '.env senza DB_*') + (c.storage_mysql ? ' · YKAN_STORAGE=mysql' : '');
+            return `<div style="display:flex;gap:8px;align-items:center;padding:3px 0">
+                <button type="button" class="btn" style="padding:2px 8px" onclick="document.getElementById('configEnvDir').value=${escHtml(JSON.stringify(c.dir))}">Usa</button>
+                <code>${escHtml(c.dir)}</code> ${tag}</div>`;
+        }).join('');
+    }
+
+    async function saveEnvDir() {
+        const r = await api('save_env_dir', { env_dir: document.getElementById('configEnvDir').value.trim() });
+        if (r && r.success) loadStorageInfo(true);
+    }
+
     async function loadSettingsView() {
         document.getElementById('configProjectName').value = boardData.config.project_name || '';
         document.getElementById('configLanguage').value = boardData.config.ai_language || 'en';
@@ -6362,6 +6585,7 @@ $dataJson = json_encode($data);
         document.getElementById('configSessionMode').value = boardData.config.session_open_mode || 'terminal';
         renderLabelsManager();
         settingsTab(settingsTabName);
+        loadStorageInfo(false);
 
         const badge = document.getElementById('claudeKeyBadge');
         badge.textContent = '...';
