@@ -132,12 +132,22 @@ function ensureAlarm() {
   });
 }
 
+// Chrome azzera il badge quando l'estensione si ricarica o si aggiorna: lo ridisegno subito
+// dall'ultimo dato salvato, così il numero non sparisce in attesa del prossimo fetch.
+async function restoreBadge() {
+  const { [STORAGE_KEY]: stored } = await chrome.storage.local.get(STORAGE_KEY);
+  if (stored && (stored.usage || stored.errorKind)) await applyBadge(stored.usage, stored.errorKind);
+}
+restoreBadge();
+
+// Install/aggiornamento e avvio del browser leggono subito, senza la soglia dei 45 s
+// (altrimenti dopo un reload il primo refresh veniva saltato).
 chrome.runtime.onInstalled.addListener(() => {
   chrome.storage.local.remove('ykanCapturedRequests'); // resto del vecchio cattura-richieste (tolto in 0.2.0)
   ensureAlarm();
-  refreshAndUpdateBadge();
+  refreshAndUpdateBadge({ force: true });
 });
-chrome.runtime.onStartup.addListener(() => { ensureAlarm(); refreshAndUpdateBadge(); });
+chrome.runtime.onStartup.addListener(() => { ensureAlarm(); refreshAndUpdateBadge({ force: true }); });
 chrome.alarms.onAlarm.addListener(alarm => { if (alarm.name === ALARM_NAME) refreshAndUpdateBadge(); });
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
