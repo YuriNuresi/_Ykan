@@ -29,13 +29,82 @@ const extRequire = isSea ? require('node:module').createRequire(process.execPath
 const WebSocket = extRequire('ws');
 const pty = extRequire('node-pty');
 
-const PORT = 51820;
+const PORT = Number(process.env.YKAN_BRIDGE_PORT) || 51820; // la board usa 51820: cambiarla serve solo per le prove
 // Origini ammesse: la board ufficiale + eventuali extra da YKAN_BRIDGE_ORIGINS (separate da virgola)
 const ALLOWED_ORIGINS = ['https://ykan.portale3d.it']
     .concat((process.env.YKAN_BRIDGE_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean));
 
 function isAllowedOrigin(origin) {
     return ALLOWED_ORIGINS.includes(origin);
+}
+
+// === COLLEGAMENTO ALL'ACCOUNT YKAN ONLINE (PC collegati) ===
+// Il PC si lega a un account della board online con un codice generato li' (Settings → PC
+// collegati): il server restituisce un token che resta solo qui, in ~/.ykan-bridge-link.json.
+// Da quel momento il Bridge si fa sentire ogni 20 secondi, cosi' la board online sa che
+// questo PC e' acceso. Solo chiamate in uscita verso la board: nessuna porta aperta.
+const LINK_FILE = path.join(os.homedir(), '.ykan-bridge-link.json');
+const HEARTBEAT_MS = 20000;
+const BRIDGE_VERSION = (() => {
+    try { return JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8')).version; } catch (_) { return '0.0.0'; }
+})();
+let linkState = { lastBeat: null, lastError: '' };
+
+function readLink() {
+    try { return JSON.parse(fs.readFileSync(LINK_FILE, 'utf8')); } catch (_) { return null; }
+}
+
+function writeLink(link) {
+    fs.writeFileSync(LINK_FILE, JSON.stringify(link, null, 2), { mode: 0o600 });
+}
+
+function osLabel() {
+    return `${os.platform()} ${os.release()}`.slice(0, 40);
+}
+
+async function boardCall(server, route, body, token) {
+    const res = await fetch(`${server}/_Ykan.php?bridge=${route}`, {
+        method: 'POST',
+        headers: Object.assign({ 'Content-Type': 'application/json' }, token ? { Authorization: 'Bearer ' + token } : {}),
+        // Il token va anche nel corpo: alcuni hosting tolgono l'header Authorization.
+        body: JSON.stringify(token ? Object.assign({}, body, { token }) : body),
+        signal: AbortSignal.timeout(15000)
+    });
+    let j = {};
+    try { j = await res.json(); } catch (_) { /* risposta non JSON */ }
+    if (!res.ok || !j.success) {
+        const err = new Error(j.error || `HTTP ${res.status}`);
+        err.status = res.status;
+        throw err;
+    }
+    return j;
+}
+
+async function pairWith(server, code, name) {
+    if (!isAllowedOrigin(server)) throw new Error('board non ammessa: ' + server);
+    const j = await boardCall(server, 'pair', { code, name, os: osLabel(), version: BRIDGE_VERSION });
+    writeLink({ server, token: j.token, bridgeId: j.bridge_id, name: j.name, account: j.account, linkedAt: new Date().toISOString() });
+    linkState = { lastBeat: new Date().toISOString(), lastError: '' };
+    return { name: j.name, account: j.account };
+}
+
+async function heartbeat() {
+    const link = readLink();
+    if (!link) return;
+    try {
+        const j = await boardCall(link.server, 'heartbeat', { os: osLabel(), version: BRIDGE_VERSION }, link.token);
+        linkState = { lastBeat: new Date().toISOString(), lastError: '' };
+        if (j.name && j.name !== link.name) writeLink(Object.assign({}, link, { name: j.name })); // rinominato dalla board
+    } catch (e) {
+        linkState.lastError = e.status === 401 ? 'revocato dalla board' : String((e && e.message) || e);
+    }
+}
+
+function linkInfo() {
+    const link = readLink();
+    if (!link) return { linked: false, version: BRIDGE_VERSION };
+    return { linked: true, name: link.name, account: link.account, server: link.server, bridgeId: link.bridgeId,
+        lastBeat: linkState.lastBeat, lastError: linkState.lastError, version: BRIDGE_VERSION };
 }
 
 // === SESSIONS (invariato rispetto a sessions-server.js) ===
@@ -676,6 +745,27 @@ const server = http.createServer((req, res) => {
         return res.end();
     }
 
+    // Collegamento all'account online: stato, collega (codice dalla board), scollega.
+    if (req.method === 'GET' && parsed.pathname === '/link') {
+        if (!isAllowedOrigin(origin)) return json(403, { error: 'origin non ammessa' });
+        return json(200, linkInfo());
+    }
+    if (req.method === 'POST' && (parsed.pathname === '/link' || parsed.pathname === '/unlink')) {
+        if (!isAllowedOrigin(origin)) return json(403, { error: 'origin non ammessa' });
+        if (!/^application\/json/.test(req.headers['content-type'] || '')) return json(415, { error: 'serve application/json' });
+        readBody(req, 5000).then(async raw => {
+            if (parsed.pathname === '/unlink') {
+                try { fs.unlinkSync(LINK_FILE); } catch (_) { /* gia' scollegato */ }
+                return json(200, linkInfo());
+            }
+            const b = JSON.parse(raw || '{}');
+            // La board che chiede il collegamento e' anche il server a cui collegarsi.
+            await pairWith(origin, String(b.code || ''), String(b.name || os.hostname()));
+            json(200, linkInfo());
+        }).catch(e => json(e.status === 403 ? 403 : 500, { error: String((e && e.message) || e) }));
+        return;
+    }
+
     // Archivia/riapre sessioni anche in Claude Desktop: stesse regole (solo board ammessa, solo JSON).
     if (req.method === 'POST' && parsed.pathname === '/desktop-archive') {
         if (!isAllowedOrigin(origin)) return json(403, { error: 'origin non ammessa' });
@@ -802,4 +892,20 @@ server.listen(PORT, '127.0.0.1', () => {
     console.log('  GET  /sessions?dir=...  storico sessioni (sola lettura)');
     console.log('  WS   /pty?dir=...       shell interattiva (Origin obbligatorio: ' + ALLOWED_ORIGINS.join(', ') + ')');
     console.log('  claude usato per launch/resume: ' + resolveClaudeBin());
+    const link = readLink();
+    console.log(link ? `  collegato a ${link.server} come "${link.name}" (${link.account})` : '  non collegato a un account online (Settings → PC collegati)');
+    heartbeat();
+    setInterval(heartbeat, HEARTBEAT_MS);
 });
+
+// Collegamento da riga di comando, per un PC su cui non si apre la board:
+//   node bridge-server.js --pair ABCD2345 --name "PC studio" [--server https://ykan.portale3d.it]
+(() => {
+    const args = process.argv.slice(2);
+    const arg = n => { const i = args.indexOf(n); return i >= 0 ? args[i + 1] : ''; };
+    const code = arg('--pair');
+    if (!code) return;
+    pairWith(arg('--server') || ALLOWED_ORIGINS[0], code, arg('--name') || os.hostname())
+        .then(r => console.log(`Collegato come "${r.name}" all'account ${r.account}.`))
+        .catch(e => console.error('Collegamento fallito: ' + ((e && e.message) || e)));
+})();

@@ -270,6 +270,88 @@ function ykanAuthSchema(PDO $pdo): void {
         key_hash CHAR(64) NOT NULL UNIQUE,
         created_at DATETIME NOT NULL
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4');
+    $pdo->exec("CREATE TABLE IF NOT EXISTS ykan_bridges (
+        id INT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        user_id INT UNSIGNED NOT NULL,
+        name VARCHAR(60) NOT NULL,
+        token_hash CHAR(64) NOT NULL UNIQUE,
+        os VARCHAR(40) NOT NULL DEFAULT '',
+        version VARCHAR(20) NOT NULL DEFAULT '',
+        created_at DATETIME NOT NULL,
+        last_seen DATETIME NULL,
+        KEY (user_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+    $pdo->exec('CREATE TABLE IF NOT EXISTS ykan_pair_codes (
+        code_hash CHAR(64) NOT NULL PRIMARY KEY,
+        user_id INT UNSIGNED NOT NULL,
+        expires_at INT UNSIGNED NOT NULL
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4');
+}
+
+// === PC COLLEGATI (Bridge) ====================================================
+// Ogni PC con il Bridge si lega a un account con un codice di 8 caratteri (valido 10 minuti,
+// una volta sola) e riceve un token suo: nel DB resta solo l'hash. Il Bridge si fa sentire
+// ogni ~20 secondi (?bridge=heartbeat): è "online" se l'ultimo segnale ha meno di 60 secondi.
+// Queste chiamate arrivano dal Bridge, non dal browser: niente sessione Google, solo il token.
+const YKAN_BRIDGE_ONLINE_SECS = 60;
+
+function ykanBridgeList(int $uid): array {
+    $st = ykanDb()->prepare('SELECT id, name, os, version, created_at, last_seen,
+        (last_seen IS NOT NULL AND TIMESTAMPDIFF(SECOND, last_seen, NOW()) < ' . YKAN_BRIDGE_ONLINE_SECS . ') AS online
+        FROM ykan_bridges WHERE user_id = ? ORDER BY name');
+    $st->execute([$uid]);
+    return array_map(function ($b) {
+        $b['id'] = (int)$b['id'];
+        $b['online'] = (bool)$b['online'];
+        return $b;
+    }, $st->fetchAll(PDO::FETCH_ASSOC));
+}
+
+function ykanBridgeEndpoint(): never {
+    header('Content-Type: application/json');
+    $reply = function (int $code, array $body): never {
+        http_response_code($code);
+        echo json_encode($body);
+        exit;
+    };
+    if (ykanStorageMode() !== 'mysql') $reply(400, ['success' => false, 'error' => 'I PC collegati richiedono Ykan su MySQL.']);
+    $in = json_decode((string)file_get_contents('php://input'), true) ?: [];
+    $pdo = ykanDb();
+    $route = (string)$_GET['bridge'];
+
+    if ($route === 'pair') {
+        $code = strtoupper((string)preg_replace('/[^A-Za-z0-9]/', '', (string)($in['code'] ?? '')));
+        $st = $pdo->prepare('SELECT user_id FROM ykan_pair_codes WHERE code_hash = ? AND expires_at >= ?');
+        $st->execute([hash('sha256', $code), time()]);
+        $uid = $st->fetchColumn();
+        if ($uid === false) $reply(403, ['success' => false, 'error' => 'Codice non valido o scaduto: generane uno nuovo da Ykan.']);
+        $pdo->prepare('DELETE FROM ykan_pair_codes WHERE code_hash = ? OR expires_at < ?')->execute([hash('sha256', $code), time()]);
+        $name = trim(mb_substr((string)($in['name'] ?? ''), 0, 60)) ?: 'PC';
+        $token = bin2hex(random_bytes(32));
+        $pdo->prepare('INSERT INTO ykan_bridges (user_id, name, token_hash, os, version, created_at, last_seen) VALUES (?, ?, ?, ?, ?, NOW(), NOW())')
+            ->execute([(int)$uid, $name, hash('sha256', $token), mb_substr((string)($in['os'] ?? ''), 0, 40), mb_substr((string)($in['version'] ?? ''), 0, 20)]);
+        $bridgeId = (int)$pdo->lastInsertId();
+        $user = ykanUserById((int)$uid);
+        $reply(200, ['success' => true, 'token' => $token, 'bridge_id' => $bridgeId, 'name' => $name, 'account' => $user['email'] ?? '']);
+    }
+
+    // Tutte le altre chiamate: token del Bridge (header Authorization o, se l'hosting lo toglie, nel corpo).
+    $auth = (string)($_SERVER['HTTP_AUTHORIZATION'] ?? $_SERVER['REDIRECT_HTTP_AUTHORIZATION'] ?? '');
+    $token = stripos($auth, 'Bearer ') === 0 ? trim(substr($auth, 7)) : (string)($in['token'] ?? '');
+    $bridge = false;
+    if ($token !== '') {
+        $st = $pdo->prepare('SELECT id, user_id, name FROM ykan_bridges WHERE token_hash = ?');
+        $st->execute([hash('sha256', $token)]);
+        $bridge = $st->fetch(PDO::FETCH_ASSOC);
+    }
+    if (!$bridge) $reply(401, ['success' => false, 'error' => 'PC non collegato o revocato.']);
+
+    if ($route === 'heartbeat') {
+        $pdo->prepare('UPDATE ykan_bridges SET last_seen = NOW(), os = ?, version = ? WHERE id = ?')
+            ->execute([mb_substr((string)($in['os'] ?? ''), 0, 40), mb_substr((string)($in['version'] ?? ''), 0, 20), (int)$bridge['id']]);
+        $reply(200, ['success' => true, 'name' => $bridge['name']]);
+    }
+    $reply(404, ['success' => false, 'error' => 'Chiamata sconosciuta.']);
 }
 
 function ykanGoogleHttp(string $url, ?string $body, array $headers): array {
@@ -950,7 +1032,9 @@ function scanProject(string $rootDir, int $maxDepth = 3): array {
 if (defined('YKAN_LIB')) return;
 
 // Login Google (solo con MySQL + GOOGLE_CLIENT_ID): da qui in giù l'utente è noto.
+// Le chiamate ?bridge= arrivano dai PC collegati con il loro token, senza sessione.
 try {
+    if (isset($_GET['bridge'])) ykanBridgeEndpoint();
     ykanAuthGate();
 } catch (Throwable $ex) {
     http_response_code(500);
@@ -990,6 +1074,34 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['api'])) {
             ON DUPLICATE KEY UPDATE key_hash = VALUES(key_hash), created_at = VALUES(created_at)')
             ->execute([ykanCurrentUserId(), hash('sha256', $key)]);
         echo json_encode(['success' => true, 'url' => ykanBaseUrl() . '/mcp.php?k=' . $key]);
+        exit;
+    }
+    // PC collegati dell'utente (solo MySQL).
+    if (in_array($action, ['bridge_list', 'bridge_pair_code', 'bridge_rename', 'bridge_revoke'], true)) {
+        if (ykanStorageMode() !== 'mysql') {
+            echo json_encode(['success' => false, 'error' => 'I PC collegati richiedono Ykan su MySQL (versione online).']);
+            exit;
+        }
+        $uid = ykanCurrentUserId();
+        $pdo = ykanDb();
+        if ($action === 'bridge_pair_code') {
+            $alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // niente 0/O, 1/I
+            $code = '';
+            for ($i = 0; $i < 8; $i++) $code .= $alphabet[random_int(0, strlen($alphabet) - 1)];
+            $pdo->prepare('DELETE FROM ykan_pair_codes WHERE expires_at < ?')->execute([time()]);
+            $pdo->prepare('INSERT INTO ykan_pair_codes (code_hash, user_id, expires_at) VALUES (?, ?, ?)')
+                ->execute([hash('sha256', $code), $uid, time() + 600]);
+            echo json_encode(['success' => true, 'code' => $code, 'server' => ykanBaseUrl(), 'expires_in' => 600]);
+            exit;
+        }
+        $id = (int)($input['id'] ?? 0);
+        if ($action === 'bridge_rename') {
+            $name = trim(mb_substr((string)($input['name'] ?? ''), 0, 60));
+            if ($name !== '') $pdo->prepare('UPDATE ykan_bridges SET name = ? WHERE id = ? AND user_id = ?')->execute([$name, $id, $uid]);
+        } elseif ($action === 'bridge_revoke') {
+            $pdo->prepare('DELETE FROM ykan_bridges WHERE id = ? AND user_id = ?')->execute([$id, $uid]);
+        }
+        echo json_encode(['success' => true, 'bridges' => ykanBridgeList($uid)]);
         exit;
     }
     if ($action === 'save_env_dir') {
@@ -3311,6 +3423,19 @@ $dataJson = json_encode($data);
         .dash-bridge { font-size: 11px; padding: 2px 8px; border-radius: 10px; background: var(--bg2); color: var(--text2); }
         .dash-bridge.ok { color: #16a34a; } .dash-bridge.ko { color: #dc2626; }
         /* Badge consumo Claude in header (popolato dall'estensione via postMessage, vedi extension/) */
+        .bridge-wrap { position: relative; }
+        .bridge-chip { display: flex; align-items: center; gap: 6px; padding: 5px 10px; border: 1px solid var(--border); border-radius: 999px; background: var(--bg2); color: var(--text); cursor: pointer; font-size: 13px; white-space: nowrap; }
+        .bridge-chip:hover { border-color: var(--accent); }
+        .bridge-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text2); flex: none; }
+        .bridge-dot.on { background: #22c55e; }
+        .bridge-dot.off { background: #ef4444; }
+        .bridge-menu { position: absolute; right: 0; top: calc(100% + 6px); min-width: 260px; max-width: calc(100vw - 32px); background: var(--bg); border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 8px 24px rgba(0,0,0,.18); padding: 6px; z-index: 300; display: none; }
+        .bridge-menu.open { display: block; }
+        .bridge-menu button { display: flex; align-items: center; gap: 8px; width: 100%; padding: 8px 10px; border: 0; border-radius: 6px; background: none; color: var(--text); cursor: pointer; font-size: 13px; text-align: left; }
+        .bridge-menu button:hover, .bridge-menu button.sel { background: var(--bg2); }
+        .bridge-menu small { display: block; color: var(--text2); padding: 6px 10px 2px; font-size: 12px; }
+        .bridge-row { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+        .bridge-row .grow { flex: 1; min-width: 160px; }
         .usage-mini { display: flex; flex-direction: column; gap: 2px; padding: 3px 8px; border-radius: 8px; background: var(--bg2); cursor: pointer; }
         .usage-row { display: flex; align-items: center; gap: 5px; font-size: 10px; color: var(--text2); white-space: nowrap; }
         .usage-label { width: 22px; flex-shrink: 0; }
@@ -3513,6 +3638,12 @@ $dataJson = json_encode($data);
             <button id="tabClaude" onclick="showView('claude')">🤖 Claude</button>
         </nav>
         <div class="header-actions">
+            <div class="bridge-wrap" id="bridgeWrap" style="display:none">
+                <button type="button" class="bridge-chip" id="bridgeChip" onclick="toggleBridgeMenu(event)" title="PC su cui lavora Ykan">
+                    <span class="bridge-dot" id="bridgeChipDot"></span><span id="bridgeChipLabel">Questo computer</span>
+                </button>
+                <div class="bridge-menu" id="bridgeMenu"></div>
+            </div>
             <div id="claudeUsageBadge" class="usage-mini" style="display:none" title="Consumo Claude — clic per aggiornare. Richiede l'estensione Chrome Ykan Usage Badge (extension/)." onclick="claudeUsageRefresh()"></div>
             <button class="btn btn-icon" onclick="toggleTheme()" title="Toggle light/dark">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
@@ -3832,6 +3963,16 @@ $dataJson = json_encode($data);
                     <label>Labels</label>
                     <div id="labelsManager"></div>
                     <button type="button" class="btn" onclick="addLabel()" style="margin-top:8px">+ Add Label</button>
+                </div>
+                <div class="form-group" id="bridgesGroup" style="display:none">
+                    <label>PC collegati (Bridge)</label>
+                    <small style="color:var(--text2);display:block;margin-bottom:6px">Ogni PC con il Bridge acceso si collega al tuo account: poi dall'header scegli su quale PC lavorare, anche da un altro computer.</small>
+                    <div id="bridgesManager"></div>
+                    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">
+                        <button type="button" class="btn" id="bridgeLinkHereBtn" onclick="linkThisPc()">🖥 Collega questo PC</button>
+                        <button type="button" class="btn" onclick="pairCodeOtherPc()">🔢 Codice per un altro PC</button>
+                    </div>
+                    <div id="bridgePairBox" style="display:none;margin-top:8px;font-size:13px"></div>
                 </div>
                 <div class="form-group" id="accountGroup" style="display:none">
                     <label>Account</label>
@@ -4180,7 +4321,7 @@ $dataJson = json_encode($data);
             });
             if (res.status === 401 && YKAN_USER) { location.reload(); return { success: false }; } // sessione scaduta: torna alla pagina di accesso
             const result = await res.json();
-            const silentActions = ['get_data', 'gemini_analyze', 'claude_execute', 'claude_status', 'list_themes', 'burndown_data', 'loose_ends', 'link_session', 'session_state', 'github_repo_status'];
+            const silentActions = ['get_data', 'gemini_analyze', 'claude_execute', 'claude_status', 'list_themes', 'burndown_data', 'loose_ends', 'link_session', 'session_state', 'github_repo_status', 'bridge_list', 'bridge_pair_code'];
             if (result.success) {
                 if (!silentActions.includes(action)) {
                     toast('Salvato', 'success');
@@ -5823,6 +5964,146 @@ $dataJson = json_encode($data);
 
     // === SESSIONS (local Claude Code session history, read-only via local Bridge) ===
     const BRIDGE_URL = 'http://127.0.0.1:51820';
+
+    // === PC COLLEGATI (Bridge) ===
+    // Solo con il login (board online su MySQL). ykanBridges: i PC dell'account con lo stato
+    // online/offline; ykanLocalLink: il Bridge di questo computer (/link), null se non risponde.
+    // bridgeTarget: 'local' (questo computer, 127.0.0.1) oppure l'id di un PC collegato. Il
+    // passaggio delle azioni sul PC scelto arriva con il relay (card #457): per ora la scelta
+    // e lo stato si vedono nell'header, ma Dashboard e terminale usano ancora questo computer.
+    let ykanBridges = [];
+    let ykanLocalLink = null;
+    let bridgeTarget = (() => { try { return localStorage.getItem('ykan_bridge_target') || 'local'; } catch (_) { return 'local'; } })();
+
+    async function refreshBridges() {
+        if (!YKAN_USER) return;
+        const r = await api('bridge_list');
+        if (r && r.success) ykanBridges = r.bridges;
+        try {
+            const res = await fetch(BRIDGE_URL + '/link', { cache: 'no-store' });
+            ykanLocalLink = res.status === 404 ? { outdated: true } : await res.json();
+        } catch (_) { ykanLocalLink = null; }
+        if (bridgeTarget !== 'local' && !ykanBridges.some(b => String(b.id) === String(bridgeTarget))) setBridgeTarget('local');
+        renderBridgeChip();
+        renderBridgesManager();
+    }
+
+    function setBridgeTarget(t) {
+        bridgeTarget = String(t);
+        try { localStorage.setItem('ykan_bridge_target', bridgeTarget); } catch (_) {}
+        renderBridgeChip();
+    }
+
+    function bridgeLocalName() {
+        return ykanLocalLink && ykanLocalLink.linked ? ykanLocalLink.name : '';
+    }
+
+    function renderBridgeChip() {
+        if (!YKAN_USER) return;
+        document.getElementById('bridgeWrap').style.display = '';
+        const dot = document.getElementById('bridgeChipDot');
+        const label = document.getElementById('bridgeChipLabel');
+        const chip = document.getElementById('bridgeChip');
+        if (bridgeTarget === 'local') {
+            const up = !!ykanLocalLink && !ykanLocalLink.outdated;
+            dot.className = 'bridge-dot ' + (up ? 'on' : 'off');
+            label.textContent = 'Questo computer' + (bridgeLocalName() ? ' (' + bridgeLocalName() + ')' : '');
+            chip.title = up ? 'Bridge di questo computer attivo' : 'Bridge di questo computer non raggiungibile su 127.0.0.1:51820';
+        } else {
+            const b = ykanBridges.find(x => String(x.id) === bridgeTarget);
+            dot.className = 'bridge-dot ' + (b && b.online ? 'on' : 'off');
+            label.textContent = b ? b.name : '?';
+            chip.title = b ? 'Connesso al bridge: ' + b.name + ' · ' + (b.online ? 'online' : 'offline') : '';
+        }
+        renderBridgeMenu();
+    }
+
+    function renderBridgeMenu() {
+        const menu = document.getElementById('bridgeMenu');
+        const up = !!ykanLocalLink && !ykanLocalLink.outdated;
+        const item = (id, name, on, extra) => `<button type="button" class="${bridgeTarget === id ? 'sel' : ''}" onclick="setBridgeTarget('${id}');toggleBridgeMenu()">
+            <span class="bridge-dot ${on ? 'on' : 'off'}"></span><span style="flex:1">${escHtml(name)}</span><span style="color:var(--text2);font-size:12px">${extra}</span></button>`;
+        let html = item('local', 'Questo computer' + (bridgeLocalName() ? ' (' + bridgeLocalName() + ')' : ''), up, up ? 'locale' : 'spento');
+        ykanBridges.filter(b => !(ykanLocalLink && ykanLocalLink.bridgeId === b.id)).forEach(b => {
+            html += item(String(b.id), b.name, b.online, b.online ? 'online' : 'offline');
+        });
+        if (bridgeTarget !== 'local') html += '<small>Il lavoro sul PC scelto (Dashboard, sessioni, avvio dei task) arriva con il prossimo aggiornamento: per ora si vede solo lo stato.</small>';
+        html += `<small><a href="#" onclick="showView('settings');settingsTab('generale');toggleBridgeMenu();return false">Gestisci i PC collegati…</a></small>`;
+        menu.innerHTML = html;
+    }
+
+    function toggleBridgeMenu(ev) {
+        if (ev) ev.stopPropagation();
+        document.getElementById('bridgeMenu').classList.toggle('open');
+    }
+    document.addEventListener('click', e => {
+        const m = document.getElementById('bridgeMenu');
+        if (m && m.classList.contains('open') && !e.target.closest('#bridgeWrap')) m.classList.remove('open');
+    });
+
+    function renderBridgesManager() {
+        const box = document.getElementById('bridgesManager');
+        if (!box) return;
+        const here = ykanLocalLink && ykanLocalLink.linked ? ykanLocalLink.bridgeId : null;
+        box.innerHTML = ykanBridges.length ? ykanBridges.map(b => `<div class="bridge-row">
+                <span class="bridge-dot ${b.online ? 'on' : 'off'}"></span>
+                <div class="grow"><strong>${escHtml(b.name)}</strong>${b.id === here ? ' <span style="color:var(--accent);font-size:12px">questo PC</span>' : ''}
+                    <div style="color:var(--text2);font-size:12px">${b.online ? 'online' : 'offline'}${b.last_seen ? ' · ultimo segnale ' + escHtml(b.last_seen) : ''}${b.version ? ' · Bridge ' + escHtml(b.version) : ''}${b.os ? ' · ' + escHtml(b.os) : ''}</div></div>
+                <button type="button" class="btn" onclick="renameBridge(${b.id})">Rinomina</button>
+                <button type="button" class="btn" onclick="revokeBridge(${b.id})">Scollega</button>
+            </div>`).join('') : '<div style="color:var(--text2);font-size:13px">Nessun PC collegato.</div>';
+        const btn = document.getElementById('bridgeLinkHereBtn');
+        if (!ykanLocalLink) { btn.disabled = true; btn.title = 'Il Bridge di questo computer non risponde: avvialo e riprova'; }
+        else if (ykanLocalLink.outdated) { btn.disabled = true; btn.title = 'Il Bridge di questo computer è troppo vecchio: aggiornalo (serve la 0.2.0)'; }
+        else { btn.disabled = false; btn.title = here ? 'Questo PC è già collegato: ricollegarlo lo registra di nuovo' : ''; }
+    }
+
+    async function linkThisPc() {
+        const name = prompt('Nome di questo PC (es. PC casa, PC studio):', bridgeLocalName() || '');
+        if (!name) return;
+        const r = await api('bridge_pair_code');
+        if (!r || !r.success) return;
+        try {
+            const res = await fetch(BRIDGE_URL + '/link', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code: r.code, name }) });
+            const j = await res.json();
+            if (!res.ok) throw new Error(j.error || 'errore ' + res.status);
+            toast('Collegato: ' + j.name, 'success');
+        } catch (e) {
+            toast('Collegamento non riuscito: ' + e.message, 'error');
+        }
+        refreshBridges();
+    }
+
+    async function pairCodeOtherPc() {
+        const r = await api('bridge_pair_code');
+        if (!r || !r.success) return;
+        const box = document.getElementById('bridgePairBox');
+        box.style.display = 'block';
+        box.innerHTML = `Codice valido 10 minuti, una volta sola: <strong style="font-size:16px;letter-spacing:2px">${escHtml(r.code)}</strong><br>
+            Sull'altro PC, nella cartella <code>bridge</code>, lancia:<br>
+            <code style="user-select:all">node bridge-server.js --pair ${escHtml(r.code)} --name "PC studio" --server ${escHtml(r.server)}</code><br>
+            <span style="color:var(--text2)">Oppure apri Ykan su quel PC e usa "Collega questo PC".</span>`;
+    }
+
+    async function renameBridge(id) {
+        const b = ykanBridges.find(x => x.id === id);
+        const name = prompt('Nuovo nome:', b ? b.name : '');
+        if (!name) return;
+        const r = await api('bridge_rename', { id, name });
+        if (r && r.success) { ykanBridges = r.bridges; renderBridgeChip(); renderBridgesManager(); }
+    }
+
+    async function revokeBridge(id) {
+        const b = ykanBridges.find(x => x.id === id);
+        if (!confirm('Scollegare "' + (b ? b.name : id) + '"? Il suo Bridge non potrà più ricevere comandi finché non lo ricolleghi.')) return;
+        const r = await api('bridge_revoke', { id });
+        if (r && r.success) { ykanBridges = r.bridges; if (bridgeTarget === String(id)) setBridgeTarget('local'); refreshBridges(); }
+    }
+
+    if (YKAN_USER) {
+        refreshBridges();
+        setInterval(refreshBridges, 30000);
+    }
     let sessionsState = { laneId: null };
 
     async function openSessionsModal(laneId) {
@@ -6915,6 +7196,8 @@ $dataJson = json_encode($data);
         document.getElementById('storageGroup').style.display = YKAN_OWNER ? '' : 'none';
         if (YKAN_OWNER) loadStorageInfo(false);
         if (YKAN_USER) {
+            document.getElementById('bridgesGroup').style.display = 'block';
+            refreshBridges();
             document.getElementById('mcpKeyGroup').style.display = 'block';
             document.getElementById('accountGroup').style.display = 'block';
             document.getElementById('accountLabel').textContent = (YKAN_USER.name ? YKAN_USER.name + ' · ' : '') + YKAN_USER.email;
