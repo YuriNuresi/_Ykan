@@ -201,12 +201,22 @@ function ykanCurrentUserId(): int {
     return (int)($GLOBALS['ykanUserId'] ?? 1);
 }
 
+/**
+ * Il proprietario dell'installazione (utente 1, o chiunque se non c'è login) è l'unico che può
+ * usare ciò che tocca il server: cartelle dei progetti, file, temi, chiavi del .env, scansioni.
+ * Gli altri utenti hanno solo la propria board, con le proprie chiavi Gemini/GitHub.
+ */
+function ykanIsOwner(): bool {
+    return !ykanLoginRequired() || ykanCurrentUserId() === 1;
+}
+
 // === LOGIN GOOGLE (solo in modalità MySQL) ===================================
 // Stesso flusso di Skanno (state anti-CSRF, cookie "ricordami" selector:validator), ma nel
 // file unico. Il client OAuth è GOOGLE_CLIENT_ID/SECRET del .env; il redirect è
 // <cartella di _Ykan.php>/auth_callback.php (file ponte che include questo) oppure
 // YKAN_GOOGLE_REDIRECT_URI. Finché i dati non sono separati per utente (#455) entrano solo
-// gli indirizzi in YKAN_ALLOWED_EMAILS: il primo che entra diventa l'utente 1 (la board esistente).
+// gli indirizzi in YKAN_ALLOWED_EMAILS ("*" = chiunque): il primo che entra diventa l'utente 1
+// (la board esistente); gli altri partono con una board vuota tutta loro.
 const YKAN_REMEMBER_COOKIE = 'ykan_remember';
 const YKAN_REMEMBER_DAYS = 30;
 
@@ -255,6 +265,11 @@ function ykanAuthSchema(PDO $pdo): void {
         user_id INT UNSIGNED NOT NULL,
         expires_at INT UNSIGNED NOT NULL
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4');
+    $pdo->exec('CREATE TABLE IF NOT EXISTS ykan_mcp_keys (
+        user_id INT UNSIGNED NOT NULL PRIMARY KEY,
+        key_hash CHAR(64) NOT NULL UNIQUE,
+        created_at DATETIME NOT NULL
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4');
 }
 
 function ykanGoogleHttp(string $url, ?string $body, array $headers): array {
@@ -291,7 +306,8 @@ function ykanUserById(int $id): ?array {
 function ykanLoginGoogle(array $info): array {
     $email = strtolower((string)($info['email'] ?? ''));
     if ($email === '' || empty($info['email_verified'])) throw new RuntimeException('Account Google senza email verificata.');
-    if (!in_array($email, ykanAllowedEmails(), true)) throw new RuntimeException("L'account {$email} non è abilitato su questo Ykan.");
+    $allowed = ykanAllowedEmails();
+    if (!in_array('*', $allowed, true) && !in_array($email, $allowed, true)) throw new RuntimeException("L'account {$email} non è abilitato su questo Ykan.");
     $pdo = ykanDb();
     $st = $pdo->prepare('SELECT id FROM ykan_users WHERE google_sub = ?');
     $st->execute([(string)$info['sub']]);
@@ -446,8 +462,11 @@ function loadData(): array {
         $st->execute([ykanCurrentUserId()]);
         $raw = $st->fetchColumn();
         if ($raw === false) {
-            // Primo avvio in MySQL: importa la board dal file JSON, se c'è.
-            $data = is_file(DATA_FILE) ? (json_decode((string)file_get_contents(DATA_FILE), true) ?: DEFAULT_DATA) : DEFAULT_DATA;
+            // Primo avvio in MySQL: il proprietario (utente 1) importa la board dal file JSON;
+            // ogni altro utente parte da una board vuota.
+            $data = ykanCurrentUserId() === 1 && is_file(DATA_FILE)
+                ? (json_decode((string)file_get_contents(DATA_FILE), true) ?: DEFAULT_DATA)
+                : DEFAULT_DATA;
             ykanEnsureSeq($data);
             saveData($data);
             return $data;
@@ -564,7 +583,9 @@ function ykanEnsureSeq(array &$data): bool {
 
 // === .env reader (shared keys: MCP_ROOT, ANTHROPIC_KEY, etc.) =================
 // Legge dai file di ykanEnvFiles(), quindi rispetta la cartella scelta in Settings.
+// Solo per il proprietario: sono le sue chiavi (ANTHROPIC_KEY, GITHUB_TOKEN, MCP_ROOT…).
 function ykanEnv(string $key): string {
+    if (!ykanIsOwner()) return '';
     return (string)(ykanEnvAll()[$key] ?? '');
 }
 
@@ -599,6 +620,7 @@ function ykanCanonical(string $path): string {
 
 /** Resolve a swimlane's linked project folder to a real, confined base path. */
 function ykanProjectBase(array $lane): string {
+    if (!ykanIsOwner()) throw new RuntimeException('Le cartelle sul server sono disponibili solo al proprietario di questo Ykan.');
     $rel = trim((string)($lane['path'] ?? ''));
     if ($rel === '') throw new RuntimeException('Nessuna cartella collegata a questo progetto.');
     $rootReal = realpath(ykanMcpRoot());
@@ -942,9 +964,32 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['api'])) {
     $input = json_decode(file_get_contents('php://input'), true) ?? [];
     $action = $_GET['api'];
 
+    // Azioni che toccano il server (file, temi, configurazione): solo il proprietario.
+    $ownerOnly = ['storage_info', 'save_env_dir', 'save_theme', 'delete_theme', 'analyze_project', 'scan_todos',
+        'list_project_files', 'claude_execute', 'pm_list', 'pm_read', 'pm_prd', 'pm_epic', 'pm_breakdown'];
+    if (in_array($action, $ownerOnly, true) && !ykanIsOwner()) {
+        http_response_code(403);
+        echo json_encode(['success' => false, 'error' => 'Funzione disponibile solo al proprietario di questo Ykan.']);
+        exit;
+    }
+
     // Archivio dati: rispondono anche quando MySQL non è raggiungibile, per poterlo sistemare.
     if ($action === 'storage_info') {
         echo json_encode(ykanStorageInfo());
+        exit;
+    }
+    // Chiave MCP personale (solo MySQL): una per utente, rigenerarla invalida la precedente.
+    // Si vede una volta sola: nel DB resta solo l'hash.
+    if ($action === 'mcp_key') {
+        if (ykanStorageMode() !== 'mysql') {
+            echo json_encode(['success' => false, 'error' => 'Le chiavi MCP personali richiedono MySQL; in locale usa MCP_SECRET nel .env.']);
+            exit;
+        }
+        $key = bin2hex(random_bytes(24));
+        ykanDb()->prepare('INSERT INTO ykan_mcp_keys (user_id, key_hash, created_at) VALUES (?, ?, NOW())
+            ON DUPLICATE KEY UPDATE key_hash = VALUES(key_hash), created_at = VALUES(created_at)')
+            ->execute([ykanCurrentUserId(), hash('sha256', $key)]);
+        echo json_encode(['success' => true, 'url' => ykanBaseUrl() . '/mcp.php?k=' . $key]);
         exit;
     }
     if ($action === 'save_env_dir') {
@@ -3796,7 +3841,13 @@ $dataJson = json_encode($data);
                         <a class="btn" href="?auth=logout">Esci</a>
                     </div>
                 </div>
-                <div class="form-group">
+                <div class="form-group" id="mcpKeyGroup" style="display:none">
+                    <label>Connettore MCP personale</label>
+                    <small style="color:var(--text2);display:block;margin-bottom:6px">Per gestire la tua board da claude.ai o dall'app Claude: Settings → Connectors → Add custom connector, incolla l'indirizzo. Rigenerarlo disattiva quello vecchio.</small>
+                    <button type="button" class="btn" onclick="createMcpKey()">🔑 Genera indirizzo del connettore</button>
+                    <input type="text" id="mcpKeyUrl" readonly style="display:none;margin-top:8px;width:100%" onclick="this.select()">
+                </div>
+                <div class="form-group" id="storageGroup">
                     <label>Archivio dati</label>
                     <div id="storageStatus" style="font-size:13px;color:var(--text2);margin-bottom:8px">…</div>
                     <label style="font-weight:normal;font-size:13px">Cartella del file .env</label>
@@ -4111,6 +4162,7 @@ $dataJson = json_encode($data);
     let boardData = <?= $dataJson ?>;
     // Utente del login Google (null se Ykan gira senza login: file JSON o MySQL senza Google).
     const YKAN_USER = <?= json_encode($GLOBALS['ykanUser'] ?? null, JSON_HEX_TAG | JSON_HEX_AMP) ?>;
+    const YKAN_OWNER = <?= ykanIsOwner() ? 'true' : 'false' ?>; // cartelle/file/temi/.env solo al proprietario
     // true when the server .env provides GITHUB_TOKEN (the value itself never reaches the browser)
     const ykanGithubEnvToken = <?= ykanEnv('GITHUB_TOKEN') !== '' ? 'true' : 'false' ?>;
     let draggedCard = null;
@@ -6834,6 +6886,17 @@ $dataJson = json_encode($data);
         }).join('');
     }
 
+    async function createMcpKey() {
+        if (!confirm('Generare un nuovo indirizzo? Quello precedente smette di funzionare.')) return;
+        const r = await api('mcp_key');
+        if (!r || !r.success) return;
+        const el = document.getElementById('mcpKeyUrl');
+        el.style.display = 'block';
+        el.value = r.url;
+        el.select();
+        toast('Copialo adesso: non verrà più mostrato', 'success');
+    }
+
     async function saveEnvDir() {
         const r = await api('save_env_dir', { env_dir: document.getElementById('configEnvDir').value.trim() });
         if (r && r.success) loadStorageInfo(true);
@@ -6849,8 +6912,10 @@ $dataJson = json_encode($data);
         document.getElementById('configSessionMode').value = boardData.config.session_open_mode || 'terminal';
         renderLabelsManager();
         settingsTab(settingsTabName);
-        loadStorageInfo(false);
+        document.getElementById('storageGroup').style.display = YKAN_OWNER ? '' : 'none';
+        if (YKAN_OWNER) loadStorageInfo(false);
         if (YKAN_USER) {
+            document.getElementById('mcpKeyGroup').style.display = 'block';
             document.getElementById('accountGroup').style.display = 'block';
             document.getElementById('accountLabel').textContent = (YKAN_USER.name ? YKAN_USER.name + ' · ' : '') + YKAN_USER.email;
             const av = document.getElementById('accountAvatar');

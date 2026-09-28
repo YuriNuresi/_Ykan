@@ -145,12 +145,34 @@ function mcp_provided_secret(): string {
     return '';
 }
 
-if (MCP_SECRET === '' || !hash_equals(MCP_SECRET, mcp_provided_secret())) {
+// Stesso archivio di _Ykan.php (file JSON o MySQL, vedi loadData/saveData là).
+define('YKAN_LIB', true);
+require_once __DIR__ . '/_Ykan.php';
+
+// MCP_SECRET del .env = proprietario (utente 1). In modalità MySQL ogni utente può generare
+// una chiave personale da Settings (tabella ykan_mcp_keys): vede solo la propria board.
+function mcp_resolve_user(string $key): ?int {
+    if ($key === '') return null;
+    if (MCP_SECRET !== '' && hash_equals(MCP_SECRET, $key)) return 1;
+    if (ykanStorageMode() !== 'mysql') return null;
+    $st = ykanDb()->prepare('SELECT user_id FROM ykan_mcp_keys WHERE key_hash = ?');
+    $st->execute([hash('sha256', $key)]);
+    $uid = $st->fetchColumn();
+    return $uid === false ? null : (int)$uid;
+}
+
+$__uid = mcp_resolve_user(mcp_provided_secret());
+if ($__uid === null) {
     http_response_code(401);
     header('Content-Type: application/json; charset=utf-8');
-    echo json_encode(['error' => MCP_SECRET === '' ? 'server not configured (.env missing MCP_SECRET)' : 'unauthorized']);
+    echo json_encode(['error' => MCP_SECRET === '' && ykanStorageMode() !== 'mysql' ? 'server not configured (.env missing MCP_SECRET)' : 'unauthorized']);
     exit;
 }
+$GLOBALS['ykanUserId'] = $__uid;
+
+// Chi non è il proprietario usa solo gli strumenti della board: niente file, DB, mail, sync.
+const MCP_USER_TOOLS = ['list_projects', 'board_summary', 'list_tasks', 'get_task', 'add_task', 'move_task',
+    'complete_task', 'add_label', 'set_task_label'];
 
 header('Content-Type: application/json; charset=utf-8');
 
@@ -158,10 +180,6 @@ header('Content-Type: application/json; charset=utf-8');
 // Data helpers (same on-disk format as _Ykan.php)
 // ============================================================================
 final class McpError extends Exception {}
-
-// Stesso archivio di _Ykan.php (file JSON o MySQL, vedi loadData/saveData là).
-define('YKAN_LIB', true);
-require_once __DIR__ . '/_Ykan.php';
 
 function mcp_load(): array {
     return loadData();
@@ -592,6 +610,9 @@ function mcp_tool_defs(): array {
 
 /** Execute a tool. Returns a plain-text result string. Throws McpError on failure. */
 function mcp_run_tool(string $name, array $a): string {
+    if (!ykanIsOwner() && !in_array($name, MCP_USER_TOOLS, true)) {
+        throw new McpError("Tool '{$name}' disponibile solo al proprietario di questo Ykan.");
+    }
     $data = mcp_load();
     // One-off backfill of short ids for boards created before them.
     if ($data && mcp_ensure_seq($data)) mcp_save($data);
@@ -1093,7 +1114,9 @@ function mcp_handle(array $msg): ?array {
             return mcp_result($id, (object)[]);
 
         case 'tools/list':
-            return mcp_result($id, ['tools' => mcp_tool_defs()]);
+            $defs = mcp_tool_defs();
+            if (!ykanIsOwner()) $defs = array_values(array_filter($defs, fn($t) => in_array($t['name'], MCP_USER_TOOLS, true)));
+            return mcp_result($id, ['tools' => $defs]);
 
         case 'tools/call':
             $name = $params['name'] ?? '';
