@@ -64,6 +64,14 @@ async function fetchUsage() {
   };
 }
 
+// Tempo mancante al reset, es. "1h 33m"; '' se il dato non c'è. (Il tooltip si aggiorna a ogni fetch, cioè ogni minuto.)
+function fmtLeft(iso) {
+  if (!iso) return '';
+  const min = Math.max(0, Math.floor((new Date(iso).getTime() - Date.now()) / 60000));
+  const hr = Math.floor(min / 60);
+  return hr < 24 ? `${hr > 0 ? hr + 'h ' : ''}${min % 60}m` : `${Math.floor(hr / 24)}g ${hr % 24}h`;
+}
+
 function pickBadgeColor(pct) {
   if (pct >= 90) return '#C8533C';
   if (pct >= 70) return '#D98639';
@@ -88,7 +96,8 @@ async function applyBadge(usage, errorKind) {
   await chrome.action.setBadgeBackgroundColor({ color: pickBadgeColor(pct) });
   if (chrome.action.setBadgeTextColor) { try { await chrome.action.setBadgeTextColor({ color: '#FFFFFF' }); } catch (_) {} }
   const wk = Math.round(usage?.weekly?.utilization ?? 0);
-  await chrome.action.setTitle({ title: `Ykan Usage — 5h: ${pct}% · Settimana: ${wk}%` });
+  const left = fmtLeft(usage?.fiveHour?.resets_at);
+  await chrome.action.setTitle({ title: `Ykan Usage — 5h: ${pct}%${left ? ` (reset tra ${left})` : ''} · Settimana: ${wk}%` });
 }
 
 let inFlight = null;

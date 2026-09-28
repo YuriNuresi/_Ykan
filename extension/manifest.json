@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Ykan Usage Badge",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Mostra il consumo Claude (5 ore / settimanale) sulla toolbar e lo passa alla dashboard Ykan quando è aperta.",
   "permissions": ["storage", "alarms"],
   "host_permissions": ["https://claude.ai/*", "https://ykan.portale3d.it/*"],

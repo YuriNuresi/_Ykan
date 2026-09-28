@@ -16,6 +16,10 @@
   button { background: #2a2e38; border: none; color: #e6e6e6; border-radius: 6px; padding: 4px 8px; font-size: 11px; cursor: pointer; }
   button:hover { background: #363b47; }
   a { color: #7aa2ff; }
+  .reset { font-size: 12px; color: #cbd2de; margin-top: 6px; }
+  .reset b { color: #fff; }
+  .reset.small { font-size: 11px; color: #6b7280; }
+  .reset.small b { color: #9aa1ad; font-weight: normal; }
   #errorBox { display: none; font-size: 11px; color: #f0a; margin-bottom: 8px; }
 </style>
 </head>
@@ -25,12 +29,12 @@
   <div class="row">
     <div class="label"><span>5 ore</span><span id="fiveHourPct">—</span></div>
     <div class="bar"><div class="bar-fill" id="fiveHourFill" style="width:0%"></div></div>
-    <div class="meta" id="fiveHourReset"></div>
+    <div class="reset" id="fiveHourReset"></div>
   </div>
   <div class="row">
     <div class="label"><span>Settimanale</span><span id="weeklyPct">—</span></div>
     <div class="bar"><div class="bar-fill" id="weeklyFill" style="width:0%"></div></div>
-    <div class="meta" id="weeklyReset"></div>
+    <div class="reset small" id="weeklyReset"></div>
   </div>
   <div class="meta" id="lastUpdated"></div>
   <div class="meta"><a href="https://claude.ai/new#settings/usage" target="_blank" rel="noopener">Apri il dettaglio su claude.ai →</a></div>

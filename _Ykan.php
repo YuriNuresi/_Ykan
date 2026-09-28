@@ -3557,6 +3557,7 @@ $dataJson = json_encode($data);
         .usage-bar i { display: block; height: 100%; border-radius: 3px; background: #3A6FD9; }
         .usage-bar i.warn { background: #D98639; } .usage-bar i.danger { background: #C8533C; }
         .usage-pct { width: 28px; text-align: right; flex-shrink: 0; font-weight: 600; }
+        .usage-reset { font-size: 10px; opacity: .85; }
         .dash-h { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; color: var(--text2); margin: 22px 0 8px; }
         .dash-proj { font-weight: 600; font-size: 13px; margin: 12px 0 6px; }
         .dash-item { border: 1px solid var(--border); border-left: 3px solid var(--medium, #f59e0b); border-radius: 6px; padding: 8px 10px; margin-bottom: 5px; background: var(--bg3, transparent); }
@@ -7656,15 +7657,20 @@ $dataJson = json_encode($data);
         }
         const u = e.data.usage;
         if (!u) { badge.style.display = 'none'; return; }
-        const bar = (label, pct) => {
+        const left = iso => {
+            if (!iso) return '';
+            const min = Math.max(0, Math.floor((new Date(iso) - Date.now()) / 60000));
+            return min >= 60 ? `${Math.floor(min / 60)}h${String(min % 60).padStart(2, '0')}` : `${min}m`;
+        };
+        const bar = (label, pct, reset) => {
             const p = Math.round(pct ?? NaN);
             const ok = Number.isFinite(p);
             const cls = !ok ? '' : p >= 90 ? 'danger' : p >= 70 ? 'warn' : '';
             const width = ok ? Math.max(0, Math.min(100, p)) : 0;
-            return `<div class="usage-row"><span class="usage-label">${label}</span><span class="usage-bar"><i class="${cls}" style="width:${width}%"></i></span><span class="usage-pct">${ok ? p + '%' : '—'}</span></div>`;
+            return `<div class="usage-row"><span class="usage-label">${label}</span><span class="usage-bar"><i class="${cls}" style="width:${width}%"></i></span><span class="usage-pct">${ok ? p + '%' : '—'}</span>${reset !== undefined ? `<span class="usage-reset" title="Reset del limite di 5 ore">${reset ? '↺ ' + reset : ''}</span>` : ''}</div>`;
         };
         badge.style.display = '';
-        badge.innerHTML = bar('5h', u.fiveHour?.utilization) + bar('Sett', u.weekly?.utilization);
+        badge.innerHTML = bar('5h', u.fiveHour?.utilization, left(u.fiveHour?.resets_at)) + bar('Sett', u.weekly?.utilization);
     });
 
     function claudeUsageRefresh() {

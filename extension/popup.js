@@ -10,15 +10,25 @@ function setBar(el, pct) {
   else if (pct >= 70) el.classList.add('warn');
 }
 
-function fmtReset(iso) {
+// Tempo mancante al reset, es. "1h 33m" / "5g 3h"; '' se il dato non c'è.
+function fmtLeft(iso) {
   if (!iso) return '';
   const diffMs = new Date(iso).getTime() - Date.now();
-  if (diffMs <= 0) return 'si azzera ora';
+  if (diffMs <= 0) return 'ora';
   const min = Math.floor(diffMs / 60000);
   const hr = Math.floor(min / 60);
-  if (hr < 24) return `si azzera tra ${hr > 0 ? hr + 'h ' : ''}${min % 60}min`;
-  const days = Math.floor(hr / 24);
-  return `si azzera tra ${days}g`;
+  if (hr < 24) return `${hr > 0 ? hr + 'h ' : ''}${min % 60}m`;
+  return `${Math.floor(hr / 24)}g ${hr % 24}h`;
+}
+
+function fmtReset(iso, at) {
+  const left = fmtLeft(iso);
+  if (!left) return '';
+  if (left === 'ora') return '↺ Reset <b>adesso</b>';
+  const when = new Date(iso).toLocaleString('it-IT', at === 'time'
+    ? { hour: '2-digit', minute: '2-digit' }
+    : { weekday: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+  return `↺ Reset tra <b>${left}</b> · ${when}`;
 }
 
 function render(stored) {
@@ -37,10 +47,10 @@ function render(stored) {
   const wk = (stored && stored.usage && stored.usage.weekly) || {};
   $('fiveHourPct').textContent = fmtPct(fh.utilization);
   setBar($('fiveHourFill'), fh.utilization);
-  $('fiveHourReset').textContent = fmtReset(fh.resets_at);
+  $('fiveHourReset').innerHTML = fmtReset(fh.resets_at, 'time');
   $('weeklyPct').textContent = fmtPct(wk.utilization);
   setBar($('weeklyFill'), wk.utilization);
-  $('weeklyReset').textContent = fmtReset(wk.resets_at);
+  $('weeklyReset').innerHTML = fmtReset(wk.resets_at);
 
   $('lastUpdated').textContent = stored && stored.fetchedAt
     ? 'Aggiornato ' + Math.max(0, Math.round((Date.now() - stored.fetchedAt) / 60000)) + ' min fa'
@@ -51,6 +61,9 @@ async function load() {
   const res = await chrome.storage.local.get('ykanUsageData');
   render(res.ykanUsageData || null);
 }
+
+// Il conto alla rovescia avanza anche a popup aperto.
+setInterval(load, 30000);
 
 $('refreshBtn').addEventListener('click', async () => {
   $('refreshBtn').disabled = true;
