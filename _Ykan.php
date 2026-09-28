@@ -185,6 +185,7 @@ function ykanDb(): ?PDO {
         data LONGTEXT NOT NULL,
         updated_at DATETIME NOT NULL
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4');
+    ykanAuthSchema($pdo);
     return $pdo;
 }
 
@@ -192,9 +193,250 @@ function ykanStorageMode(): string {
     return ykanDbRequested() ? 'mysql' : 'json';
 }
 
-/** Utente corrente. Per ora sempre 1 (la board attuale); con il login Google (#454) arriva dalla sessione. */
+/**
+ * Utente corrente: impostato da ykanAuthGate() dopo il login Google. Senza login (file JSON,
+ * MySQL senza Google configurato, oppure mcp.php/cron in modalità YKAN_LIB) è l'utente 1.
+ */
 function ykanCurrentUserId(): int {
-    return 1;
+    return (int)($GLOBALS['ykanUserId'] ?? 1);
+}
+
+// === LOGIN GOOGLE (solo in modalità MySQL) ===================================
+// Stesso flusso di Skanno (state anti-CSRF, cookie "ricordami" selector:validator), ma nel
+// file unico. Il client OAuth è GOOGLE_CLIENT_ID/SECRET del .env; il redirect è
+// <cartella di _Ykan.php>/auth_callback.php (file ponte che include questo) oppure
+// YKAN_GOOGLE_REDIRECT_URI. Finché i dati non sono separati per utente (#455) entrano solo
+// gli indirizzi in YKAN_ALLOWED_EMAILS: il primo che entra diventa l'utente 1 (la board esistente).
+const YKAN_REMEMBER_COOKIE = 'ykan_remember';
+const YKAN_REMEMBER_DAYS = 30;
+
+function ykanGoogleConfigured(): bool {
+    $e = ykanEnvAll();
+    return ($e['GOOGLE_CLIENT_ID'] ?? '') !== '' && ($e['GOOGLE_CLIENT_SECRET'] ?? '') !== '';
+}
+
+function ykanLoginRequired(): bool {
+    return ykanStorageMode() === 'mysql' && ykanGoogleConfigured();
+}
+
+function ykanHttps(): bool {
+    return (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
+        || (($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https');
+}
+
+function ykanBaseUrl(): string {
+    $dir = rtrim(str_replace('\\', '/', dirname($_SERVER['SCRIPT_NAME'] ?? '/')), '/');
+    return (ykanHttps() ? 'https' : 'http') . '://' . ($_SERVER['HTTP_HOST'] ?? 'localhost') . $dir;
+}
+
+function ykanRedirectUri(): string {
+    $uri = (string)(ykanEnvAll()['YKAN_GOOGLE_REDIRECT_URI'] ?? '');
+    return $uri !== '' ? $uri : ykanBaseUrl() . '/auth_callback.php';
+}
+
+function ykanAllowedEmails(): array {
+    $raw = (string)(ykanEnvAll()['YKAN_ALLOWED_EMAILS'] ?? '');
+    return array_values(array_filter(array_map(fn($s) => strtolower(trim($s)), explode(',', $raw))));
+}
+
+function ykanAuthSchema(PDO $pdo): void {
+    $pdo->exec('CREATE TABLE IF NOT EXISTS ykan_users (
+        id INT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        google_sub VARCHAR(64) NOT NULL UNIQUE,
+        email VARCHAR(255) NOT NULL,
+        name VARCHAR(255) NOT NULL DEFAULT \'\',
+        avatar VARCHAR(512) NOT NULL DEFAULT \'\',
+        created_at DATETIME NOT NULL,
+        last_login DATETIME NOT NULL
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4');
+    $pdo->exec('CREATE TABLE IF NOT EXISTS ykan_remember (
+        selector CHAR(32) NOT NULL PRIMARY KEY,
+        validator_hash CHAR(64) NOT NULL,
+        user_id INT UNSIGNED NOT NULL,
+        expires_at INT UNSIGNED NOT NULL
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4');
+}
+
+function ykanGoogleHttp(string $url, ?string $body, array $headers): array {
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_HTTPHEADER => $headers,
+        CURLOPT_TIMEOUT => 15,
+        CURLOPT_CONNECTTIMEOUT => 8,
+    ]);
+    if ($body !== null) {
+        curl_setopt($ch, CURLOPT_POST, true);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, $body);
+    }
+    $resp = curl_exec($ch);
+    $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $err = curl_error($ch);
+    curl_close($ch);
+    if ($resp === false) throw new RuntimeException('Google non raggiungibile: ' . $err);
+    $data = json_decode((string)$resp, true);
+    if ($code >= 400 || !is_array($data)) {
+        throw new RuntimeException('Google ha risposto ' . $code . (is_array($data) ? ': ' . ($data['error_description'] ?? $data['error'] ?? '') : ''));
+    }
+    return $data;
+}
+
+function ykanUserById(int $id): ?array {
+    $st = ykanDb()->prepare('SELECT id, email, name, avatar FROM ykan_users WHERE id = ?');
+    $st->execute([$id]);
+    return $st->fetch(PDO::FETCH_ASSOC) ?: null;
+}
+
+/** Crea o aggiorna l'utente da userinfo di Google e apre la sessione. */
+function ykanLoginGoogle(array $info): array {
+    $email = strtolower((string)($info['email'] ?? ''));
+    if ($email === '' || empty($info['email_verified'])) throw new RuntimeException('Account Google senza email verificata.');
+    if (!in_array($email, ykanAllowedEmails(), true)) throw new RuntimeException("L'account {$email} non è abilitato su questo Ykan.");
+    $pdo = ykanDb();
+    $st = $pdo->prepare('SELECT id FROM ykan_users WHERE google_sub = ?');
+    $st->execute([(string)$info['sub']]);
+    $id = (int)$st->fetchColumn();
+    $now = date('Y-m-d H:i:s');
+    if ($id) {
+        $pdo->prepare('UPDATE ykan_users SET email = ?, name = ?, avatar = ?, last_login = ? WHERE id = ?')
+            ->execute([$email, (string)($info['name'] ?? ''), (string)($info['picture'] ?? ''), $now, $id]);
+    } else {
+        // Il primo utente in assoluto è il proprietario della board esistente (riga 1 di ykan_boards).
+        $first = (int)$pdo->query('SELECT COUNT(*) FROM ykan_users')->fetchColumn() === 0;
+        $pdo->prepare('INSERT INTO ykan_users (' . ($first ? 'id, ' : '') . 'google_sub, email, name, avatar, created_at, last_login)
+            VALUES (' . ($first ? '1, ' : '') . '?, ?, ?, ?, ?, ?)')
+            ->execute([(string)$info['sub'], $email, (string)($info['name'] ?? ''), (string)($info['picture'] ?? ''), $now, $now]);
+        $id = $first ? 1 : (int)$pdo->lastInsertId();
+    }
+    session_regenerate_id(true);
+    $_SESSION['ykan_uid'] = $id;
+    return ykanUserById($id);
+}
+
+function ykanRemember(int $uid): void {
+    $selector = bin2hex(random_bytes(16));
+    $validator = bin2hex(random_bytes(32));
+    $expires = time() + YKAN_REMEMBER_DAYS * 86400;
+    ykanDb()->prepare('INSERT INTO ykan_remember (selector, validator_hash, user_id, expires_at) VALUES (?, ?, ?, ?)')
+        ->execute([$selector, hash('sha256', $validator), $uid, $expires]);
+    setcookie(YKAN_REMEMBER_COOKIE, $selector . ':' . $validator, [
+        'expires' => $expires, 'path' => '/', 'secure' => ykanHttps(), 'httponly' => true, 'samesite' => 'Lax',
+    ]);
+}
+
+function ykanLoginFromCookie(): ?array {
+    $raw = (string)($_COOKIE[YKAN_REMEMBER_COOKIE] ?? '');
+    if (!str_contains($raw, ':')) return null;
+    [$selector, $validator] = explode(':', $raw, 2);
+    if (strlen($selector) !== 32 || $validator === '') return null;
+    $st = ykanDb()->prepare('SELECT validator_hash, user_id, expires_at FROM ykan_remember WHERE selector = ?');
+    $st->execute([$selector]);
+    $row = $st->fetch(PDO::FETCH_ASSOC);
+    if (!$row || (int)$row['expires_at'] < time() || !hash_equals($row['validator_hash'], hash('sha256', $validator))) return null;
+    $user = ykanUserById((int)$row['user_id']);
+    if ($user) $_SESSION['ykan_uid'] = (int)$user['id'];
+    return $user;
+}
+
+function ykanLogout(): void {
+    $raw = (string)($_COOKIE[YKAN_REMEMBER_COOKIE] ?? '');
+    if (str_contains($raw, ':')) {
+        ykanDb()->prepare('DELETE FROM ykan_remember WHERE selector = ?')->execute([explode(':', $raw, 2)[0]]);
+    }
+    setcookie(YKAN_REMEMBER_COOKIE, '', ['expires' => time() - 3600, 'path' => '/', 'secure' => ykanHttps(), 'httponly' => true, 'samesite' => 'Lax']);
+    unset($_SESSION['ykan_uid']);
+    session_regenerate_id(true);
+}
+
+function ykanAuthPage(string $error = ''): never {
+    http_response_code($error !== '' ? 403 : 200);
+    $err = $error !== '' ? '<p class="err">' . htmlspecialchars($error) . '</p>' : '';
+    echo <<<HTML
+<!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Ykan — accesso</title><style>
+:root{--bg:#f6f6f4;--card:#fff;--text:#1d1d1b;--muted:#6b6b66;--border:#e3e3de;--accent:#2563eb}
+@media (prefers-color-scheme:dark){:root{--bg:#141412;--card:#1e1e1b;--text:#ececea;--muted:#9a9a94;--border:#2e2e2a}}
+body{margin:0;min-height:100vh;display:grid;place-items:center;background:var(--bg);color:var(--text);font-family:system-ui,sans-serif;padding:16px}
+.box{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:32px;max-width:360px;width:100%;text-align:center}
+h1{margin:0 0 6px;font-size:22px}p{color:var(--muted);margin:0 0 22px;font-size:14px}
+a.btn{display:inline-flex;gap:10px;align-items:center;padding:10px 18px;border:1px solid var(--border);border-radius:8px;color:var(--text);text-decoration:none;font-weight:600}
+a.btn:hover{border-color:var(--accent)}.err{color:#dc2626;margin-top:16px;margin-bottom:0}
+</style></head><body><div class="box"><h1>Ykan</h1><p>Accedi per vedere i tuoi progetti e i tuoi task.</p>
+<a class="btn" href="?auth=google"><svg width="18" height="18" viewBox="0 0 48 48"><path fill="#FFC107" d="M43.6 20.5H42V20H24v8h11.3C33.7 32.7 29.2 36 24 36c-6.6 0-12-5.4-12-12s5.4-12 12-12c3.1 0 5.8 1.2 7.9 3.1l5.7-5.7C34 6.1 29.3 4 24 4 12.9 4 4 12.9 4 24s8.9 20 20 20 20-8.9 20-20c0-1.3-.1-2.4-.4-3.5z"/><path fill="#FF3D00" d="m6.3 14.7 6.6 4.8C14.7 15.1 19 12 24 12c3.1 0 5.8 1.2 7.9 3.1l5.7-5.7C34 6.1 29.3 4 24 4 16.3 4 9.7 8.3 6.3 14.7z"/><path fill="#4CAF50" d="M24 44c5.2 0 9.9-2 13.4-5.2l-6.2-5.2C29.2 35.1 26.7 36 24 36c-5.2 0-9.6-3.3-11.3-8l-6.5 5C9.5 39.6 16.2 44 24 44z"/><path fill="#1976D2" d="M43.6 20.5H42V20H24v8h11.3c-.8 2.2-2.2 4.2-4.1 5.6l6.2 5.2C37 39.2 44 34 44 24c0-1.3-.1-2.4-.4-3.5z"/></svg>Accedi con Google</a>
+{$err}</div></body></html>
+HTML;
+    exit;
+}
+
+/**
+ * Porta d'ingresso della board: gestisce ?auth=google|callback|logout e, se il login è
+ * richiesto, ferma chi non è autenticato (pagina di accesso, o 401 per le chiamate API).
+ */
+function ykanAuthGate(): void {
+    if (!ykanLoginRequired()) return;
+    session_name('ykan_sess');
+    session_set_cookie_params(['lifetime' => 0, 'path' => '/', 'secure' => ykanHttps(), 'httponly' => true, 'samesite' => 'Lax']);
+    session_start();
+    $env = ykanEnvAll();
+    $route = (string)($_GET['auth'] ?? '');
+
+    if ($route === 'google') {
+        $state = bin2hex(random_bytes(16));
+        $_SESSION['ykan_oauth_state'] = $state;
+        header('Location: https://accounts.google.com/o/oauth2/v2/auth?' . http_build_query([
+            'client_id' => $env['GOOGLE_CLIENT_ID'],
+            'redirect_uri' => ykanRedirectUri(),
+            'response_type' => 'code',
+            'scope' => 'openid email profile',
+            'state' => $state,
+            'access_type' => 'online',
+            'prompt' => 'select_account',
+        ]));
+        exit;
+    }
+    if ($route === 'callback') {
+        $expected = (string)($_SESSION['ykan_oauth_state'] ?? '');
+        unset($_SESSION['ykan_oauth_state']);
+        try {
+            if (isset($_GET['error'])) throw new RuntimeException('Accesso annullato.');
+            $state = (string)($_GET['state'] ?? '');
+            if ($expected === '' || !hash_equals($expected, $state)) throw new RuntimeException('Sessione di accesso scaduta, riprova.');
+            $tokens = ykanGoogleHttp('https://oauth2.googleapis.com/token', http_build_query([
+                'code' => (string)($_GET['code'] ?? ''),
+                'client_id' => $env['GOOGLE_CLIENT_ID'],
+                'client_secret' => $env['GOOGLE_CLIENT_SECRET'],
+                'redirect_uri' => ykanRedirectUri(),
+                'grant_type' => 'authorization_code',
+            ]), ['Content-Type: application/x-www-form-urlencoded']);
+            $info = ykanGoogleHttp('https://openidconnect.googleapis.com/v1/userinfo', null, ['Authorization: Bearer ' . ($tokens['access_token'] ?? '')]);
+            $user = ykanLoginGoogle($info);
+            ykanRemember((int)$user['id']);
+        } catch (Throwable $ex) {
+            ykanAuthPage($ex->getMessage());
+        }
+        header('Location: ' . ykanBaseUrl() . '/_Ykan.php');
+        exit;
+    }
+    if ($route === 'logout') {
+        ykanLogout();
+        header('Location: ' . ykanBaseUrl() . '/_Ykan.php');
+        exit;
+    }
+
+    $user = null;
+    if (!empty($_SESSION['ykan_uid'])) $user = ykanUserById((int)$_SESSION['ykan_uid']);
+    if (!$user) $user = ykanLoginFromCookie();
+    if (!$user) {
+        if (isset($_GET['api'])) {
+            http_response_code(401);
+            header('Content-Type: application/json');
+            echo json_encode(['success' => false, 'error' => 'Sessione scaduta: ricarica la pagina e accedi.']);
+            exit;
+        }
+        ykanAuthPage();
+    }
+    $GLOBALS['ykanUserId'] = (int)$user['id'];
+    $GLOBALS['ykanUser'] = $user;
 }
 
 // === DATA FUNCTIONS ===
@@ -255,6 +497,7 @@ function ykanStorageInfo(): array {
         'data_file' => is_file(DATA_FILE),
         'db_ok' => null,
         'db_msg' => '',
+        'login' => ykanLoginRequired(),
     ];
     if ($info['mode'] === 'mysql') {
         try {
@@ -683,6 +926,15 @@ function scanProject(string $rootDir, int $maxDepth = 3): array {
 
 // mcp.php e tasks_sync.php includono questo file solo per le funzioni (loadData/saveData…).
 if (defined('YKAN_LIB')) return;
+
+// Login Google (solo con MySQL + GOOGLE_CLIENT_ID): da qui in giù l'utente è noto.
+try {
+    ykanAuthGate();
+} catch (Throwable $ex) {
+    http_response_code(500);
+    echo 'Ykan: accesso non disponibile — ' . htmlspecialchars($ex->getMessage());
+    exit;
+}
 
 // === API HANDLER ===
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['api'])) {
@@ -3536,6 +3788,14 @@ $dataJson = json_encode($data);
                     <div id="labelsManager"></div>
                     <button type="button" class="btn" onclick="addLabel()" style="margin-top:8px">+ Add Label</button>
                 </div>
+                <div class="form-group" id="accountGroup" style="display:none">
+                    <label>Account</label>
+                    <div style="display:flex;gap:10px;align-items:center">
+                        <img id="accountAvatar" alt="" referrerpolicy="no-referrer" style="width:28px;height:28px;border-radius:50%">
+                        <span id="accountLabel" style="flex:1"></span>
+                        <a class="btn" href="?auth=logout">Esci</a>
+                    </div>
+                </div>
                 <div class="form-group">
                     <label>Archivio dati</label>
                     <div id="storageStatus" style="font-size:13px;color:var(--text2);margin-bottom:8px">…</div>
@@ -3849,6 +4109,8 @@ $dataJson = json_encode($data);
     })();
 
     let boardData = <?= $dataJson ?>;
+    // Utente del login Google (null se Ykan gira senza login: file JSON o MySQL senza Google).
+    const YKAN_USER = <?= json_encode($GLOBALS['ykanUser'] ?? null, JSON_HEX_TAG | JSON_HEX_AMP) ?>;
     // true when the server .env provides GITHUB_TOKEN (the value itself never reaches the browser)
     const ykanGithubEnvToken = <?= ykanEnv('GITHUB_TOKEN') !== '' ? 'true' : 'false' ?>;
     let draggedCard = null;
@@ -3864,6 +4126,7 @@ $dataJson = json_encode($data);
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(data)
             });
+            if (res.status === 401 && YKAN_USER) { location.reload(); return { success: false }; } // sessione scaduta: torna alla pagina di accesso
             const result = await res.json();
             const silentActions = ['get_data', 'gemini_analyze', 'claude_execute', 'claude_status', 'list_themes', 'burndown_data', 'loose_ends', 'link_session', 'session_state', 'github_repo_status'];
             if (result.success) {
@@ -6558,7 +6821,8 @@ $dataJson = json_encode($data);
         } catch (_) { box.textContent = 'Stato non disponibile'; return; }
         const icon = info.mode === 'mysql' ? (info.db_ok ? '🟢 MySQL' : '🔴 MySQL') : '📄 File JSON';
         box.innerHTML = `<strong>${icon}</strong> — ${escHtml(info.db_msg)}`
-            + (info.env_files.length ? `<br>.env letto: <code>${info.env_files.map(escHtml).join('</code>, <code>')}</code>` : '<br>Nessun .env trovato');
+            + (info.login ? '<br>🔐 Login Google attivo' : '')
+            + (info.env_files.length ? `<br>.env letto:<code>${info.env_files.map(escHtml).join('</code>, <code>')}</code>` : '<br>Nessun .env trovato');
         document.getElementById('configEnvDir').value = info.env_dir || '';
         if (!showCandidates) { list.innerHTML = ''; return; }
         list.innerHTML = info.candidates.map(c => {
@@ -6586,6 +6850,12 @@ $dataJson = json_encode($data);
         renderLabelsManager();
         settingsTab(settingsTabName);
         loadStorageInfo(false);
+        if (YKAN_USER) {
+            document.getElementById('accountGroup').style.display = 'block';
+            document.getElementById('accountLabel').textContent = (YKAN_USER.name ? YKAN_USER.name + ' · ' : '') + YKAN_USER.email;
+            const av = document.getElementById('accountAvatar');
+            if (YKAN_USER.avatar) av.src = YKAN_USER.avatar; else av.style.display = 'none';
+        }
 
         const badge = document.getElementById('claudeKeyBadge');
         badge.textContent = '...';
