@@ -281,6 +281,19 @@ function ykanAuthSchema(PDO $pdo): void {
         last_seen DATETIME NULL,
         KEY (user_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+    $pdo->exec("CREATE TABLE IF NOT EXISTS ykan_bridge_cmds (
+        id INT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        bridge_id INT UNSIGNED NOT NULL,
+        user_id INT UNSIGNED NOT NULL,
+        method VARCHAR(6) NOT NULL,
+        path VARCHAR(2000) NOT NULL,
+        body MEDIUMTEXT NOT NULL,
+        status VARCHAR(10) NOT NULL DEFAULT 'queued',
+        http_status SMALLINT NOT NULL DEFAULT 0,
+        result LONGTEXT NULL,
+        created_at DATETIME NOT NULL,
+        KEY (bridge_id, status)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
     $pdo->exec('CREATE TABLE IF NOT EXISTS ykan_pair_codes (
         code_hash CHAR(64) NOT NULL PRIMARY KEY,
         user_id INT UNSIGNED NOT NULL,
@@ -294,6 +307,15 @@ function ykanAuthSchema(PDO $pdo): void {
 // ogni ~20 secondi (?bridge=heartbeat): è "online" se l'ultimo segnale ha meno di 60 secondi.
 // Queste chiamate arrivano dal Bridge, non dal browser: niente sessione Google, solo il token.
 const YKAN_BRIDGE_ONLINE_SECS = 60;
+
+// Relay: la board mette in coda un comando per un PC (ykan_bridge_cmds), il Bridge di quel PC
+// lo prende con ?bridge=poll (richiesta che resta aperta qualche secondo), lo esegue su se stesso
+// e rimanda la risposta con ?bridge=result. Solo i percorsi di questo elenco (lo stesso che il
+// Bridge controlla a sua volta): letture e l'apertura di Claude Desktop, niente shell libera.
+const YKAN_RELAY_PATHS = ['/sessions', '/session', '/reviews', '/git', '/claude/skills', '/claude/skill',
+    '/claude/memory', '/claude/memory/file', '/desktop-archive', '/desktop/new', '/desktop/resume'];
+const YKAN_RELAY_WAIT_SECS = 25; // quanto la board aspetta la risposta del PC
+const YKAN_POLL_HOLD_SECS = 8;   // quanto una ?bridge=poll resta aperta se non ci sono comandi
 
 function ykanBridgeList(int $uid): array {
     $st = ykanDb()->prepare('SELECT id, name, os, version, created_at, last_seen,
@@ -346,6 +368,32 @@ function ykanBridgeEndpoint(): never {
     }
     if (!$bridge) $reply(401, ['success' => false, 'error' => 'PC non collegato o revocato.']);
 
+    if ($route === 'poll') {
+        @set_time_limit(YKAN_POLL_HOLD_SECS + 20);
+        $pdo->prepare('UPDATE ykan_bridges SET last_seen = NOW() WHERE id = ?')->execute([(int)$bridge['id']]);
+        // Comandi mai presi entro il tempo di attesa della board: la board ha già risposto "non in tempo".
+        $pdo->prepare("UPDATE ykan_bridge_cmds SET status = 'expired' WHERE bridge_id = ? AND status = 'queued'
+            AND created_at < NOW() - INTERVAL " . YKAN_RELAY_WAIT_SECS . ' SECOND')->execute([(int)$bridge['id']]);
+        $deadline = microtime(true) + YKAN_POLL_HOLD_SECS;
+        $sel = $pdo->prepare("SELECT id, method, path, body FROM ykan_bridge_cmds WHERE bridge_id = ? AND status = 'queued' ORDER BY id LIMIT 5");
+        $take = $pdo->prepare("UPDATE ykan_bridge_cmds SET status = 'taken' WHERE id = ? AND status = 'queued'");
+        do {
+            $sel->execute([(int)$bridge['id']]);
+            $cmds = [];
+            foreach ($sel->fetchAll(PDO::FETCH_ASSOC) as $c) {
+                $take->execute([(int)$c['id']]);
+                if ($take->rowCount() === 1) $cmds[] = ['id' => (int)$c['id'], 'method' => $c['method'], 'path' => $c['path'], 'body' => $c['body']];
+            }
+            if ($cmds) $reply(200, ['success' => true, 'commands' => $cmds]);
+            usleep(300000);
+        } while (microtime(true) < $deadline);
+        $reply(200, ['success' => true, 'commands' => []]);
+    }
+    if ($route === 'result') {
+        $pdo->prepare("UPDATE ykan_bridge_cmds SET status = 'done', http_status = ?, result = ? WHERE id = ? AND bridge_id = ? AND status = 'taken'")
+            ->execute([(int)($in['status'] ?? 500), (string)($in['body'] ?? ''), (int)($in['id'] ?? 0), (int)$bridge['id']]);
+        $reply(200, ['success' => true]);
+    }
     if ($route === 'heartbeat') {
         $pdo->prepare('UPDATE ykan_bridges SET last_seen = NOW(), os = ?, version = ? WHERE id = ?')
             ->execute([mb_substr((string)($in['os'] ?? ''), 0, 40), mb_substr((string)($in['version'] ?? ''), 0, 20), (int)$bridge['id']]);
@@ -535,6 +583,9 @@ function ykanAuthGate(): void {
     }
     $GLOBALS['ykanUserId'] = (int)$user['id'];
     $GLOBALS['ykanUser'] = $user;
+    // Da qui la sessione serve solo in lettura: liberarla evita che una richiesta lunga (il relay
+    // aspetta fino a 25 s la risposta di un PC) blocchi tutte le altre chiamate dello stesso utente.
+    session_write_close();
 }
 
 // === DATA FUNCTIONS ===
@@ -1077,7 +1128,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['api'])) {
         exit;
     }
     // PC collegati dell'utente (solo MySQL).
-    if (in_array($action, ['bridge_list', 'bridge_pair_code', 'bridge_rename', 'bridge_revoke'], true)) {
+    if (in_array($action, ['bridge_list', 'bridge_pair_code', 'bridge_rename', 'bridge_revoke', 'bridge_relay'], true)) {
         if (ykanStorageMode() !== 'mysql') {
             echo json_encode(['success' => false, 'error' => 'I PC collegati richiedono Ykan su MySQL (versione online).']);
             exit;
@@ -1093,6 +1144,38 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['api'])) {
                 ->execute([hash('sha256', $code), $uid, time() + 600]);
             echo json_encode(['success' => true, 'code' => $code, 'server' => ykanBaseUrl(), 'expires_in' => 600]);
             exit;
+        }
+        if ($action === 'bridge_relay') {
+            $bid = (int)($input['bridge_id'] ?? 0);
+            $path = (string)($input['path'] ?? '');
+            $method = strtoupper((string)($input['method'] ?? 'GET')) === 'POST' ? 'POST' : 'GET';
+            $st = $pdo->prepare('SELECT name, (last_seen IS NOT NULL AND TIMESTAMPDIFF(SECOND, last_seen, NOW()) < ' . YKAN_BRIDGE_ONLINE_SECS . ') AS online
+                FROM ykan_bridges WHERE id = ? AND user_id = ?');
+            $st->execute([$bid, $uid]);
+            $b = $st->fetch(PDO::FETCH_ASSOC);
+            $fail = function (string $msg): never { echo json_encode(['success' => false, 'error' => $msg]); exit; };
+            if (!$b) $fail('PC non trovato tra i tuoi PC collegati.');
+            if (!$b['online']) $fail('"' . $b['name'] . '" è offline: il suo Bridge è spento o senza rete.');
+            if (!in_array(strtok($path, '?'), YKAN_RELAY_PATHS, true) || strlen($path) > 2000) $fail('Funzione non disponibile da remoto.');
+            $pdo->prepare("DELETE FROM ykan_bridge_cmds WHERE created_at < NOW() - INTERVAL 1 HOUR")->execute();
+            $pdo->prepare("INSERT INTO ykan_bridge_cmds (bridge_id, user_id, method, path, body, created_at) VALUES (?, ?, ?, ?, ?, NOW())")
+                ->execute([$bid, $uid, $method, $path, (string)($input['body'] ?? '')]);
+            $cmdId = (int)$pdo->lastInsertId();
+            @set_time_limit(YKAN_RELAY_WAIT_SECS + 20);
+            $poll = $pdo->prepare('SELECT status, http_status, result FROM ykan_bridge_cmds WHERE id = ?');
+            $deadline = microtime(true) + YKAN_RELAY_WAIT_SECS;
+            do {
+                usleep(200000);
+                $poll->execute([$cmdId]);
+                $row = $poll->fetch(PDO::FETCH_ASSOC);
+                if ($row && $row['status'] === 'done') {
+                    $pdo->prepare('DELETE FROM ykan_bridge_cmds WHERE id = ?')->execute([$cmdId]);
+                    echo json_encode(['success' => true, 'status' => (int)$row['http_status'], 'body' => (string)$row['result']]);
+                    exit;
+                }
+            } while (microtime(true) < $deadline);
+            $pdo->prepare("UPDATE ykan_bridge_cmds SET status = 'expired' WHERE id = ?")->execute([$cmdId]);
+            $fail('"' . $b['name'] . '" non ha risposto in tempo.');
         }
         $id = (int)($input['id'] ?? 0);
         if ($action === 'bridge_rename') {
@@ -4751,7 +4834,7 @@ $dataJson = json_encode($data);
             return;
         }
         try {
-            const r = await fetch(BRIDGE_URL + '/desktop-archive', {
+            const r = await bridgeFetch('/desktop-archive', {
                 method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids, archived })
             });
             const j = await r.json();
@@ -4793,7 +4876,7 @@ $dataJson = json_encode($data);
         out.anyLane = lanes.length > 0;
         await Promise.all(lanes.map(async l => {
             try {
-                const r = await fetch(BRIDGE_URL + '/sessions?dir=' + encodeURIComponent(l.local_path));
+                const r = await bridgeFetch('/sessions?dir=' + encodeURIComponent(l.local_path));
                 if (!r.ok) throw new Error('HTTP ' + r.status);
                 out.byLane[l.id] = (await r.json()).sessions || [];
                 out.byLane[l.id].forEach(s => sessionIndex.set(s.id, { laneId: l.id, s }));
@@ -4872,7 +4955,7 @@ $dataJson = json_encode($data);
     // Giudizi di Claude sulle sessioni (dal Bridge): validi solo se la sessione non è cambiata dopo la revisione
     async function fetchReviews() {
         try {
-            const r = await fetch(BRIDGE_URL + '/reviews');
+            const r = await bridgeFetch('/reviews');
             if (!r.ok) return {};
             return (await r.json()).sessions || {};
         } catch (_) { return {}; }
@@ -5170,7 +5253,7 @@ $dataJson = json_encode($data);
         let ok = false;
         await Promise.all(lanes.map(async l => {
             try {
-                const r = await fetch(BRIDGE_URL + '/git?dir=' + encodeURIComponent(l.local_path));
+                const r = await bridgeFetch('/git?dir=' + encodeURIComponent(l.local_path));
                 if (r.ok) { byLane[l.id] = await r.json(); ok = true; }
             } catch (_) { /* bridge spento */ }
         }));
@@ -5574,6 +5657,7 @@ $dataJson = json_encode($data);
     function closeGitInit() { document.getElementById('gitInitModal').classList.remove('active'); gitInitLane = null; }
 
     async function gitInitRun() {
+        if (bridgeIsRemote()) { toast('Disponibile solo su "Questo computer": sceglilo nell’header', 'error'); return; }
         const lane = gitInitLane;
         if (!lane) return;
         const remote = document.getElementById('gitInitRemote').value.trim();
@@ -5695,7 +5779,7 @@ $dataJson = json_encode($data);
     }
 
     async function fetchLaneSessions(lane) {
-        const r = await fetch(BRIDGE_URL + '/sessions?dir=' + encodeURIComponent(lane.local_path));
+        const r = await bridgeFetch('/sessions?dir=' + encodeURIComponent(lane.local_path));
         if (!r.ok) throw new Error('HTTP ' + r.status);
         const list = (await r.json()).sessions || [];
         list.forEach(s => sessionIndex.set(s.id, { laneId: lane.id, s }));
@@ -5730,7 +5814,7 @@ $dataJson = json_encode($data);
         document.getElementById('sessionModal').classList.add('active');
         renderSessionPanel();
         try {
-            const r = await fetch(BRIDGE_URL + '/session?dir=' + encodeURIComponent(lane.local_path) + '&id=' + encodeURIComponent(sessionId));
+            const r = await bridgeFetch('/session?dir=' + encodeURIComponent(lane.local_path) + '&id=' + encodeURIComponent(sessionId));
             if (!r.ok) throw new Error('HTTP ' + r.status);
             if (sessView && sessView.s.id === sessionId) { sessView.transcript = await r.json(); renderSessionPanel(true); }
         } catch (e) {
@@ -5854,6 +5938,7 @@ $dataJson = json_encode($data);
     }
 
     async function sessSplit() {
+        if (bridgeIsRemote()) { toast('Disponibile solo su "Questo computer": sceglilo nell’header', 'error'); return; }
         if (sessView.busy) return;
         const { lane, s } = sessView;
         const doneCol = c => c.archived || DASH_DONE_RE.test((boardData.columns.find(x => x.id === c.column_id) || {}).name || '');
@@ -5965,6 +6050,45 @@ $dataJson = json_encode($data);
     // === SESSIONS (local Claude Code session history, read-only via local Bridge) ===
     const BRIDGE_URL = 'http://127.0.0.1:51820';
 
+    // Tutte le chiamate al Bridge passano da qui. "Questo computer" → 127.0.0.1 come sempre;
+    // un PC collegato → relay della board online (?api=bridge_relay), che risponde con lo stato e
+    // il corpo della risposta di quel Bridge: qui torna una Response normale, così chi chiama non
+    // cambia. Errori di rete/relay → eccezione, come quando il Bridge locale è spento.
+    async function bridgeFetch(path, opts = {}) {
+        if (!bridgeIsRemote()) return fetch(BRIDGE_URL + path, opts);
+        const res = await fetch('?api=bridge_relay', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ bridge_id: Number(bridgeTarget), path, method: opts.method || 'GET', body: opts.body || '' })
+        });
+        let j;
+        try { j = await res.json(); } catch (_) { throw new Error('relay: risposta non valida'); }
+        if (!j.success) throw new Error(j.error || 'relay non riuscito');
+        return new Response(j.body, { status: j.status, headers: { 'Content-Type': 'application/json' } });
+    }
+
+    function bridgeIsRemote() {
+        return !!YKAN_USER && bridgeTarget !== 'local';
+    }
+
+    function bridgeTargetName() {
+        const b = ykanBridges.find(x => String(x.id) === bridgeTarget);
+        return b ? b.name : 'PC remoto';
+    }
+
+    // Apre Claude Desktop sul PC scelto (nuova sessione con prompt, o ripresa), via relay.
+    async function remoteDesktop(path, payload) {
+        const name = bridgeTargetName();
+        try {
+            const r = await bridgeFetch(path, { method: 'POST', body: JSON.stringify(payload) });
+            const j = await r.json();
+            if (!r.ok) throw new Error(j.error || 'HTTP ' + r.status);
+            toast('Aperto in Claude Desktop su ' + name, 'success');
+        } catch (e) {
+            toast('Non aperto su ' + name + ': ' + e.message, 'error');
+        }
+    }
+
     // === PC COLLEGATI (Bridge) ===
     // Solo con il login (board online su MySQL). ykanBridges: i PC dell'account con lo stato
     // online/offline; ykanLocalLink: il Bridge di questo computer (/link), null se non risponde.
@@ -5983,15 +6107,18 @@ $dataJson = json_encode($data);
             const res = await fetch(BRIDGE_URL + '/link', { cache: 'no-store' });
             ykanLocalLink = res.status === 404 ? { outdated: true } : await res.json();
         } catch (_) { ykanLocalLink = null; }
-        if (bridgeTarget !== 'local' && !ykanBridges.some(b => String(b.id) === String(bridgeTarget))) setBridgeTarget('local');
+        if (bridgeTarget !== 'local' && !ykanBridges.some(b => String(b.id) === String(bridgeTarget))) setBridgeTarget('local', true);
         renderBridgeChip();
         renderBridgesManager();
     }
 
-    function setBridgeTarget(t) {
+    function setBridgeTarget(t, noReload) {
+        const changed = bridgeTarget !== String(t);
         bridgeTarget = String(t);
         try { localStorage.setItem('ykan_bridge_target', bridgeTarget); } catch (_) {}
         renderBridgeChip();
+        // Dashboard, sessioni, Git e pannello Claude leggono dal PC scelto: si ricarica tutto da lì.
+        if (changed && !noReload) location.reload();
     }
 
     function bridgeLocalName() {
@@ -6027,7 +6154,7 @@ $dataJson = json_encode($data);
         ykanBridges.filter(b => !(ykanLocalLink && ykanLocalLink.bridgeId === b.id)).forEach(b => {
             html += item(String(b.id), b.name, b.online, b.online ? 'online' : 'offline');
         });
-        if (bridgeTarget !== 'local') html += '<small>Il lavoro sul PC scelto (Dashboard, sessioni, avvio dei task) arriva con il prossimo aggiornamento: per ora si vede solo lo stato.</small>';
+        if (bridgeTarget !== 'local') html += '<small>Dashboard, sessioni e avvio in Claude Desktop lavorano su questo PC. Il terminale dal vivo e l\'analisi delle sessioni restano su "Questo computer".</small>';
         html += `<small><a href="#" onclick="showView('settings');settingsTab('generale');toggleBridgeMenu();return false">Gestisci i PC collegati…</a></small>`;
         menu.innerHTML = html;
     }
@@ -6097,7 +6224,7 @@ $dataJson = json_encode($data);
         const b = ykanBridges.find(x => x.id === id);
         if (!confirm('Scollegare "' + (b ? b.name : id) + '"? Il suo Bridge non potrà più ricevere comandi finché non lo ricolleghi.')) return;
         const r = await api('bridge_revoke', { id });
-        if (r && r.success) { ykanBridges = r.bridges; if (bridgeTarget === String(id)) setBridgeTarget('local'); refreshBridges(); }
+        if (r && r.success) { ykanBridges = r.bridges; if (bridgeTarget === String(id)) setBridgeTarget('local', true); refreshBridges(); }
     }
 
     if (YKAN_USER) {
@@ -6115,7 +6242,7 @@ $dataJson = json_encode($data);
         list.innerHTML = '<div style="padding:12px;color:var(--text2);font-size:13px">Carico…</div>';
         document.getElementById('sessionsModal').classList.add('active');
         try {
-            const res = await fetch(BRIDGE_URL + '/sessions?dir=' + encodeURIComponent(lane.local_path));
+            const res = await bridgeFetch('/sessions?dir=' + encodeURIComponent(lane.local_path));
             if (!res.ok) throw new Error('HTTP ' + res.status);
             const data = await res.json();
             renderSessionsList(data.sessions || []);
@@ -6186,11 +6313,18 @@ $dataJson = json_encode($data);
     function launchSession(lane, context) {
         context = context || {};
         const mode = boardData.config.session_open_mode || 'terminal';
+        // PC remoto scelto nell'header: la sessione si apre in Claude Desktop su quel PC
+        // (il terminale dal vivo esiste solo su questo computer; il cloud non dipende dal PC).
+        if (bridgeIsRemote() && mode !== 'cloud') {
+            remoteDesktop('/desktop/new', { prompt: context.prompt || '', dir: lane.local_path || '' });
+            return;
+        }
         if (mode === 'terminal') { openTerminalModal(lane.id, context); return; }
         if (mode === 'desktop') {
             let url = 'claude://code/new?q=' + encodeURIComponent(context.prompt || '');
-            // "cwd" (non "folder", che Desktop ignora aprendo una cartella temporanea): il prompt parte da solo
-            if (lane.local_path) url += '&cwd=' + encodeURIComponent(lane.local_path);
+            // Parametri letti da Claude Desktop: q (o prompt) e folder. Con una cartella passata da
+            // fuori Desktop può chiedere conferma prima di partire (cwd= non esiste: viene ignorato).
+            if (lane.local_path) url += '&folder=' + encodeURIComponent(lane.local_path);
             window.location.href = url;
             return;
         }
@@ -6205,6 +6339,7 @@ $dataJson = json_encode($data);
     // una sessione locale). Il Bridge lancia la claude.exe più recente: quella nel PATH può essere
     // troppo vecchia per leggere le sessioni di Desktop.
     function resumeSession(lane, sessionId) {
+        if (bridgeIsRemote()) { remoteDesktop('/desktop/resume', { sessionId }); return; }
         if ((boardData.config.session_open_mode || 'terminal') === 'desktop') {
             window.location.href = 'claude://resume?session=' + encodeURIComponent(sessionId);
             return;
@@ -6248,6 +6383,12 @@ $dataJson = json_encode($data);
             if (sess.socket && sess.socket.readyState === WebSocket.OPEN) sess.socket.send(JSON.stringify({ type: 'input', data }));
         });
 
+        if (bridgeIsRemote()) {
+            term.writeln('Il terminale dal vivo funziona solo su "Questo computer".');
+            term.writeln('Su ' + bridgeTargetName() + ' apri le sessioni in Claude Desktop (pulsanti Avvia/Riprendi), oppure scegli "Questo computer" nell\'header.');
+            termSwitchTab(id, !context.noFocus);
+            return;
+        }
         let wsUrl = 'ws://127.0.0.1:51820/pty?dir=' + encodeURIComponent(lane.local_path);
         if (context.launch) wsUrl += '&launch=' + encodeURIComponent(context.launch);
         if (context.prompt) wsUrl += '&prompt=' + encodeURIComponent(context.prompt);
@@ -7291,7 +7432,7 @@ $dataJson = json_encode($data);
 
     async function claudeFetchSkills() {
         try {
-            const r = await fetch(BRIDGE_URL + '/claude/skills');
+            const r = await bridgeFetch('/claude/skills');
             if (!r.ok) throw new Error('HTTP ' + r.status);
             claudeSkills = (await r.json()).skills || [];
         } catch (_) { claudeSkills = null; }
@@ -7304,7 +7445,7 @@ $dataJson = json_encode($data);
         const lane = boardData.swimlanes.find(l => l.id === laneId);
         if (!lane || !lane.local_path) { claudeRenderBody(); return; }
         try {
-            const r = await fetch(BRIDGE_URL + '/claude/memory?dir=' + encodeURIComponent(lane.local_path));
+            const r = await bridgeFetch('/claude/memory?dir=' + encodeURIComponent(lane.local_path));
             if (!r.ok) throw new Error('HTTP ' + r.status);
             claudeMemory[laneId] = await r.json();
         } catch (_) { claudeMemory[laneId] = null; }
@@ -7371,13 +7512,13 @@ $dataJson = json_encode($data);
         try {
             let url;
             if (parts[0] === 'skill') {
-                url = BRIDGE_URL + '/claude/skill?id=' + encodeURIComponent(parts[1]);
+                url = '/claude/skill?id=' + encodeURIComponent(parts[1]);
             } else {
                 const lane = boardData.swimlanes.find(l => l.id === parts[1]);
                 if (!lane) throw new Error('progetto non trovato');
-                url = BRIDGE_URL + '/claude/memory/file?dir=' + encodeURIComponent(lane.local_path) + '&file=' + encodeURIComponent(parts[2]);
+                url = '/claude/memory/file?dir=' + encodeURIComponent(lane.local_path) + '&file=' + encodeURIComponent(parts[2]);
             }
-            const r = await fetch(url);
+            const r = await bridgeFetch(url);
             if (!r.ok) throw new Error('HTTP ' + r.status);
             const { content } = await r.json();
             const el = document.getElementById(safeId);

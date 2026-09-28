@@ -22,6 +22,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const url = require('url');
+const { spawn: spawnProcess } = require('child_process');
 // Dentro l'exe (Node SEA) require() vede solo i built-in: ws e node-pty si caricano
 // dalla cartella node_modules che sta accanto all'exe.
 const isSea = (() => { try { return require('node:sea').isSea(); } catch (_) { return false; } })();
@@ -62,13 +63,13 @@ function osLabel() {
     return `${os.platform()} ${os.release()}`.slice(0, 40);
 }
 
-async function boardCall(server, route, body, token) {
+async function boardCall(server, route, body, token, timeoutMs = 15000) {
     const res = await fetch(`${server}/_Ykan.php?bridge=${route}`, {
         method: 'POST',
         headers: Object.assign({ 'Content-Type': 'application/json' }, token ? { Authorization: 'Bearer ' + token } : {}),
         // Il token va anche nel corpo: alcuni hosting tolgono l'header Authorization.
         body: JSON.stringify(token ? Object.assign({}, body, { token }) : body),
-        signal: AbortSignal.timeout(15000)
+        signal: AbortSignal.timeout(timeoutMs)
     });
     let j = {};
     try { j = await res.json(); } catch (_) { /* risposta non JSON */ }
@@ -98,6 +99,62 @@ async function heartbeat() {
     } catch (e) {
         linkState.lastError = e.status === 401 ? 'revocato dalla board' : String((e && e.message) || e);
     }
+}
+
+// === RELAY: comandi dalla board online quando lavori da un altro computer ===
+// Il Bridge chiede alla board "ci sono comandi per me?" (?bridge=poll, la richiesta resta aperta
+// qualche secondo), esegue ogni comando su se stesso come se arrivasse dalla board (stessi
+// controlli di sempre) e rimanda la risposta (?bridge=result). Solo i percorsi di questo elenco,
+// lo stesso che controlla il server: letture e apertura di Claude Desktop, niente shell.
+const RELAY_PATHS = new Set(['/sessions', '/session', '/reviews', '/git', '/claude/skills', '/claude/skill',
+    '/claude/memory', '/claude/memory/file', '/desktop-archive', '/desktop/new', '/desktop/resume']);
+
+function selfRequest(method, p, body, origin) {
+    return new Promise(resolve => {
+        const req = http.request({ host: '127.0.0.1', port: PORT, method, path: p,
+            headers: { Origin: origin, 'Content-Type': 'application/json' } }, res => {
+            let data = '';
+            res.setEncoding('utf8');
+            res.on('data', c => { data += c; });
+            res.on('end', () => resolve({ status: res.statusCode, body: data }));
+        });
+        req.on('error', e => resolve({ status: 502, body: JSON.stringify({ error: String(e.message) }) }));
+        req.setTimeout(20000, () => req.destroy(new Error('il Bridge non ha risposto in tempo')));
+        if (method === 'POST') req.write(body || '');
+        req.end();
+    });
+}
+
+async function runRelayCommand(link, cmd) {
+    const p = String(cmd.path || '');
+    const result = RELAY_PATHS.has(p.split('?')[0])
+        ? await selfRequest(cmd.method === 'POST' ? 'POST' : 'GET', p, cmd.body, link.server)
+        : { status: 403, body: JSON.stringify({ error: 'funzione non disponibile da remoto' }) };
+    try { await boardCall(link.server, 'result', { id: cmd.id, status: result.status, body: result.body }, link.token); }
+    catch (e) { console.error('Relay: risposta non consegnata: ' + ((e && e.message) || e)); }
+}
+
+async function relayLoop() {
+    const sleep = ms => new Promise(r => setTimeout(r, ms));
+    for (;;) {
+        const link = readLink();
+        if (!link) { await sleep(5000); continue; }
+        try {
+            const j = await boardCall(link.server, 'poll', {}, link.token, 25000);
+            linkState.lastBeat = new Date().toISOString();
+            for (const cmd of j.commands || []) runRelayCommand(link, cmd); // in parallelo
+        } catch (e) {
+            linkState.lastError = e.status === 401 ? 'revocato dalla board' : String((e && e.message) || e);
+            await sleep(e.status === 401 ? 30000 : 5000);
+        }
+    }
+}
+
+// Apre un link claude:// con il programma registrato (Claude Desktop), senza passare da una shell.
+function openUrl(u) {
+    const [cmd, args] = process.platform === 'win32' ? ['rundll32.exe', ['url.dll,FileProtocolHandler', u]]
+        : process.platform === 'darwin' ? ['open', [u]] : ['xdg-open', [u]];
+    spawnProcess(cmd, args, { detached: true, stdio: 'ignore', windowsHide: true }).unref();
 }
 
 function linkInfo() {
@@ -766,6 +823,30 @@ const server = http.createServer((req, res) => {
         return;
     }
 
+    // Apre Claude Desktop su questo PC: nuova sessione (prompt + cartella) o ripresa di una sessione.
+    // Usato dalla board quando lavori da un altro computer e hai scelto questo PC.
+    if (req.method === 'POST' && (parsed.pathname === '/desktop/new' || parsed.pathname === '/desktop/resume')) {
+        if (!isAllowedOrigin(origin)) return json(403, { error: 'origin non ammessa' });
+        if (!/^application\/json/.test(req.headers['content-type'] || '')) return json(415, { error: 'serve application/json' });
+        readBody(req, 100000).then(raw => {
+            const b = JSON.parse(raw || '{}');
+            let link;
+            if (parsed.pathname === '/desktop/new') {
+                const dir = String(b.dir || '');
+                if (dir && !fs.existsSync(dir)) return json(400, { error: 'cartella inesistente su questo PC: ' + dir });
+                // Claude Desktop legge q (o prompt) e folder; cwd= non esiste e viene ignorato.
+                link = 'claude://code/new?q=' + encodeURIComponent(String(b.prompt || '')) + (dir ? '&folder=' + encodeURIComponent(dir) : '');
+            } else {
+                const id = String(b.sessionId || '');
+                if (!/^[a-zA-Z0-9_-]{1,80}$/.test(id)) return json(400, { error: 'sessione non valida' });
+                link = 'claude://resume?session=' + encodeURIComponent(id);
+            }
+            openUrl(link);
+            json(200, { ok: true, host: os.hostname() });
+        }).catch(e => json(500, { error: String((e && e.message) || e) }));
+        return;
+    }
+
     // Archivia/riapre sessioni anche in Claude Desktop: stesse regole (solo board ammessa, solo JSON).
     if (req.method === 'POST' && parsed.pathname === '/desktop-archive') {
         if (!isAllowedOrigin(origin)) return json(403, { error: 'origin non ammessa' });
@@ -896,6 +977,7 @@ server.listen(PORT, '127.0.0.1', () => {
     console.log(link ? `  collegato a ${link.server} come "${link.name}" (${link.account})` : '  non collegato a un account online (Settings → PC collegati)');
     heartbeat();
     setInterval(heartbeat, HEARTBEAT_MS);
+    relayLoop();
 });
 
 // Collegamento da riga di comando, per un PC su cui non si apre la board:
