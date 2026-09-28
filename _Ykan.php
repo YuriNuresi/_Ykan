@@ -6076,14 +6076,17 @@ $dataJson = json_encode($data);
         return b ? b.name : 'PC remoto';
     }
 
-    // Apre Claude Desktop sul PC scelto (nuova sessione con prompt, o ripresa), via relay.
+    // Lavoro sul PC scelto, via relay: /desktop/new avvia Claude Code nella cartella del progetto
+    // (a fine lavoro la sessione si apre in Claude Desktop), /desktop/resume riapre una sessione.
     async function remoteDesktop(path, payload) {
         const name = bridgeTargetName();
         try {
             const r = await bridgeFetch(path, { method: 'POST', body: JSON.stringify(payload) });
             const j = await r.json();
             if (!r.ok) throw new Error(j.error || 'HTTP ' + r.status);
-            toast('Aperto in Claude Desktop su ' + name, 'success');
+            toast(path === '/desktop/new'
+                ? 'Claude sta lavorando su ' + name + ': a fine lavoro la sessione si apre in Claude Desktop'
+                : 'Riaperta in Claude Desktop su ' + name, 'success');
         } catch (e) {
             toast('Non aperto su ' + name + ': ' + e.message, 'error');
         }
@@ -6316,7 +6319,7 @@ $dataJson = json_encode($data);
         // PC remoto scelto nell'header: la sessione si apre in Claude Desktop su quel PC
         // (il terminale dal vivo esiste solo su questo computer; il cloud non dipende dal PC).
         if (bridgeIsRemote() && mode !== 'cloud') {
-            remoteDesktop('/desktop/new', { prompt: context.prompt || '', dir: lane.local_path || '' });
+            remoteDesktop('/desktop/new', { prompt: context.prompt || '', dir: lane.local_path || '', name: lane.name || '' });
             return;
         }
         if (mode === 'terminal') { openTerminalModal(lane.id, context); return; }

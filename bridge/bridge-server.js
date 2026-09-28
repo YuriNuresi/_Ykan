@@ -44,7 +44,7 @@ function isAllowedOrigin(origin) {
 // collegati): il server restituisce un token che resta solo qui, in ~/.ykan-bridge-link.json.
 // Da quel momento il Bridge si fa sentire ogni 20 secondi, cosi' la board online sa che
 // questo PC e' acceso. Solo chiamate in uscita verso la board: nessuna porta aperta.
-const LINK_FILE = path.join(os.homedir(), '.ykan-bridge-link.json');
+const LINK_FILE = process.env.YKAN_BRIDGE_LINK_FILE || path.join(os.homedir(), '.ykan-bridge-link.json'); // variabile: solo per le prove
 const HEARTBEAT_MS = 20000;
 const BRIDGE_VERSION = (() => {
     try { return JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8')).version; } catch (_) { return '0.0.0'; }
@@ -148,6 +148,36 @@ async function relayLoop() {
             await sleep(e.status === 401 ? 30000 : 5000);
         }
     }
+}
+
+// Lavoro avviato da un altro computer: nessuno davanti a questo PC, quindi niente deep link
+// code/new (con una cartella passata da fuori Claude Desktop chiede conferma). Il Bridge lancia
+// Claude Code nella cartella del progetto con un id di sessione scelto qui; quando ha finito apre
+// la stessa sessione in Claude Desktop con claude://resume (Desktop rifiuta di importarla mentre
+// un altro processo la sta ancora usando), dove si continua anche dal telefono con Remote Control.
+// Permessi: acceptEdits (modifica i file del progetto, i comandi vengono negati); si cambia con
+// YKAN_REMOTE_PERMISSION_MODE (default | acceptEdits | plan | bypassPermissions).
+const REMOTE_PERMISSION_MODE = process.env.YKAN_REMOTE_PERMISSION_MODE || 'acceptEdits';
+const REMOTE_TIMEOUT_MS = 2 * 60 * 60 * 1000;
+
+function startRemoteSession(dir, prompt, name) {
+    const sessionId = require('crypto').randomUUID();
+    const args = ['-p', '--session-id', sessionId, '--permission-mode', REMOTE_PERMISSION_MODE, '--output-format', 'json'];
+    if (name) args.push('--name', name.slice(0, 80));
+    const child = spawnProcess(resolveClaudeBin(), args, { cwd: dir, windowsHide: true });
+    console.log(`Sessione remota ${sessionId} avviata in ${dir}`);
+    let err = '';
+    child.stdout.on('data', () => {});
+    child.stderr.on('data', d => { err = (err + d).slice(-2000); });
+    const timer = setTimeout(() => child.kill(), REMOTE_TIMEOUT_MS);
+    child.on('error', e => { clearTimeout(timer); console.error(`Sessione remota ${sessionId}: ${e.message}`); });
+    child.on('close', code => {
+        clearTimeout(timer);
+        console.log(`Sessione remota ${sessionId} finita (codice ${code})${code ? ': ' + err.trim().slice(0, 300) : ''}`);
+        openUrl('claude://resume?session=' + sessionId);
+    });
+    child.stdin.end(prompt);
+    return sessionId;
 }
 
 // Apre un link claude:// con il programma registrato (Claude Desktop), senza passare da una shell.
@@ -823,25 +853,25 @@ const server = http.createServer((req, res) => {
         return;
     }
 
-    // Apre Claude Desktop su questo PC: nuova sessione (prompt + cartella) o ripresa di una sessione.
-    // Usato dalla board quando lavori da un altro computer e hai scelto questo PC.
+    // Usati dalla board quando lavori da un altro computer e hai scelto questo PC:
+    // /desktop/new avvia Claude Code nella cartella (poi la sessione si apre in Desktop),
+    // /desktop/resume riapre in Claude Desktop una sessione esistente.
     if (req.method === 'POST' && (parsed.pathname === '/desktop/new' || parsed.pathname === '/desktop/resume')) {
         if (!isAllowedOrigin(origin)) return json(403, { error: 'origin non ammessa' });
         if (!/^application\/json/.test(req.headers['content-type'] || '')) return json(415, { error: 'serve application/json' });
         readBody(req, 100000).then(raw => {
             const b = JSON.parse(raw || '{}');
-            let link;
             if (parsed.pathname === '/desktop/new') {
                 const dir = String(b.dir || '');
-                if (dir && !fs.existsSync(dir)) return json(400, { error: 'cartella inesistente su questo PC: ' + dir });
-                // Claude Desktop legge q (o prompt) e folder; cwd= non esiste e viene ignorato.
-                link = 'claude://code/new?q=' + encodeURIComponent(String(b.prompt || '')) + (dir ? '&folder=' + encodeURIComponent(dir) : '');
-            } else {
-                const id = String(b.sessionId || '');
-                if (!/^[a-zA-Z0-9_-]{1,80}$/.test(id)) return json(400, { error: 'sessione non valida' });
-                link = 'claude://resume?session=' + encodeURIComponent(id);
+                const prompt = String(b.prompt || '').trim();
+                if (!dir || !fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) return json(400, { error: 'cartella del progetto inesistente su questo PC: ' + (dir || '(nessuna)') });
+                if (!prompt) return json(400, { error: 'prompt vuoto' });
+                const sessionId = startRemoteSession(dir, prompt, String(b.name || ''));
+                return json(200, { ok: true, host: os.hostname(), sessionId, started: true });
             }
-            openUrl(link);
+            const id = String(b.sessionId || '');
+            if (!/^[a-zA-Z0-9_-]{1,80}$/.test(id)) return json(400, { error: 'sessione non valida' });
+            openUrl('claude://resume?session=' + encodeURIComponent(id));
             json(200, { ok: true, host: os.hostname() });
         }).catch(e => json(500, { error: String((e && e.message) || e) }));
         return;
