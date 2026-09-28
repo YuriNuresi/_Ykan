@@ -1093,6 +1093,37 @@ try {
     exit;
 }
 
+// Settings → Strumenti: pacchetti da scaricare, generati da bridge/build-dist.js in downloads/
+// (cartella chiusa al web da .htaccess: si passa solo da qui, dopo il login).
+function ykanDownloads(): array {
+    $list = [
+        'bridge' => 'ykan-bridge-windows.zip',
+        'extension' => 'ykan-usage-extension.zip',
+    ];
+    $out = [];
+    foreach ($list as $key => $name) {
+        $path = __DIR__ . '/downloads/' . $name;
+        $out[$key] = is_file($path)
+            ? ['name' => $name, 'path' => $path, 'size' => filesize($path), 'date' => date('d/m/Y', filemtime($path))]
+            : null;
+    }
+    return $out;
+}
+
+if (isset($_GET['download'])) {
+    $file = ykanDownloads()[(string)$_GET['download']] ?? null;
+    if (!$file) {
+        http_response_code(404);
+        echo 'File non disponibile.';
+        exit;
+    }
+    header('Content-Type: application/zip');
+    header('Content-Disposition: attachment; filename="' . $file['name'] . '"');
+    header('Content-Length: ' . $file['size']);
+    readfile($file['path']);
+    exit;
+}
+
 // === API HANDLER ===
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['api'])) {
     header('Content-Type: application/json');
@@ -3547,6 +3578,19 @@ $dataJson = json_encode($data);
         .dash-tabs button { background: transparent; border: none; border-bottom: 2px solid transparent; color: inherit; opacity: .65; padding: 8px 14px; font-size: 13px; font-weight: 500; cursor: pointer; margin-bottom: -1px; }
         .dash-tabs button:hover { opacity: 1; }
         .dash-tabs button.active { opacity: 1; border-bottom-color: var(--accent); }
+        .tool-card { background: var(--bg2); border: 1px solid var(--border); border-radius: 10px; padding: 16px 18px; margin-bottom: 16px; font-size: 13px; line-height: 1.55; }
+        .tool-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; flex-wrap: wrap; }
+        .tool-head h3 { margin: 0 0 2px; font-size: 16px; }
+        .tool-head small, .tool-meta, .tool-req, .tool-note, .tool-missing { color: var(--text2); }
+        .tool-meta { font-size: 12px; margin-top: 6px; }
+        .tool-missing { font-size: 12px; padding: 6px 0; }
+        .tool-card h4 { margin: 12px 0 4px; font-size: 13px; }
+        .tool-card p { margin: 8px 0 0; }
+        .tool-card ol { margin: 0; padding-left: 20px; }
+        .tool-card li { margin: 4px 0; }
+        .tool-note { font-size: 12px; border-top: 1px solid var(--border); padding-top: 10px; margin-top: 12px !important; }
+        .tool-card code { font-size: 12px; }
+        .tool-card a:not(.btn) { color: var(--accent); }
         .dash-count { display: inline-block; min-width: 18px; text-align: center; font-size: 11px; font-weight: 600; padding: 0 6px; border-radius: 9px; background: var(--bg2); color: var(--text2); margin-left: 4px; }
         .dash-tabs button.active .dash-count { background: var(--accent); color: #fff; }
         .dash-hint { font-size: 12px; color: var(--text2); margin-bottom: 10px; }
@@ -4023,6 +4067,7 @@ $dataJson = json_encode($data);
             <button data-tab="github" onclick="settingsTab('github')">GitHub</button>
             <button data-tab="progetti" onclick="settingsTab('progetti')">Progetti</button>
             <button data-tab="aspetto" onclick="settingsTab('aspetto')">Aspetto</button>
+            <button data-tab="strumenti" onclick="settingsTab('strumenti')">Strumenti</button>
         </div>
 
         <form id="configForm" style="max-width:720px">
@@ -4152,6 +4197,67 @@ $dataJson = json_encode($data);
                 </select>
             </div>
             <button type="button" class="btn" onclick="openThemesModal()">🎨 Gestisci temi</button>
+        </div>
+
+        <?php $ykanDl = ykanDownloads(); $dlSize = fn($b) => $b < 1048576 ? max(1, round($b / 1024)) . ' KB' : number_format($b / 1048576, 1, ',', '') . ' MB'; ?>
+        <div class="settings-panel tools-panel" data-panel="strumenti" style="display:none;max-width:720px">
+            <div class="tool-card">
+                <div class="tool-head">
+                    <div>
+                        <h3>🖥 Ykan Bridge per Windows</h3>
+                        <small>Programma che gira sul tuo PC e collega la board a Claude Code.</small>
+                    </div>
+                    <?php if ($ykanDl['bridge']): ?>
+                        <a class="btn btn-primary" href="?download=bridge">⬇ Scarica</a>
+                    <?php else: ?>
+                        <span class="tool-missing">Non ancora pubblicato</span>
+                    <?php endif; ?>
+                </div>
+                <?php if ($ykanDl['bridge']): ?>
+                    <div class="tool-meta"><?= htmlspecialchars($ykanDl['bridge']['name']) ?> · <?= $dlSize($ykanDl['bridge']['size']) ?> · aggiornato il <?= $ykanDl['bridge']['date'] ?></div>
+                <?php endif; ?>
+                <p>Serve per i pulsanti <b>▶️ PLAY</b> e <b>Riprendi</b> (terminale nella board), per il pannello <b>🤖 Claude</b> (skill e memoria) e per lavorare su questo PC anche da un altro computer.</p>
+                <p class="tool-req">Richiede Windows 64 bit e <a href="https://docs.anthropic.com/it/docs/claude-code/overview" target="_blank" rel="noopener">Claude Code</a> installato (comando <code>claude</code>).</p>
+                <h4>Istruzioni d'uso</h4>
+                <ol>
+                    <li>Scarica lo zip e fai <b>tasto destro → Estrai tutto</b> in una cartella che non cancellerai, ad esempio <code>Documenti\Ykan Bridge</code>.</li>
+                    <li>Apri la cartella estratta e fai doppio clic su <code>ykan-bridge.exe</code>.<br>
+                        Se Windows mostra "PC protetto da Windows" clicca <b>Ulteriori informazioni → Esegui comunque</b>: il programma non è firmato, non è un virus.</li>
+                    <li>Si apre una finestra nera: è il Bridge acceso. <b>Lasciala aperta</b> (anche ridotta a icona) mentre usi Ykan.</li>
+                    <li>Torna qui in <a href="#" onclick="settingsTab('generale');return false">Generale → PC collegati</a> e clicca <b>🖥 Collega questo PC</b>. Da un altro computer usa invece <b>🔢 Codice per un altro PC</b>.</li>
+                </ol>
+                <p class="tool-note">Non spostare <code>ykan-bridge.exe</code> fuori dalla sua cartella: la cartella <code>node_modules</code> deve stargli accanto. Il Bridge accetta connessioni solo da questo PC (<code>127.0.0.1:51820</code>).<br>
+                    <b>Aggiornare:</b> chiudi la finestra del Bridge, scarica il nuovo zip ed estrailo sopra la vecchia cartella sostituendo i file, poi riavvialo.</p>
+            </div>
+
+            <div class="tool-card">
+                <div class="tool-head">
+                    <div>
+                        <h3>🧩 Estensione Ykan Usage Badge</h3>
+                        <small>Estensione per Chrome ed Edge che mostra quanto hai consumato di Claude.</small>
+                    </div>
+                    <?php if ($ykanDl['extension']): ?>
+                        <a class="btn btn-primary" href="?download=extension">⬇ Scarica</a>
+                    <?php else: ?>
+                        <span class="tool-missing">Non ancora pubblicato</span>
+                    <?php endif; ?>
+                </div>
+                <?php if ($ykanDl['extension']): ?>
+                    <div class="tool-meta"><?= htmlspecialchars($ykanDl['extension']['name']) ?> · <?= $dlSize($ykanDl['extension']['size']) ?> · aggiornato il <?= $ykanDl['extension']['date'] ?></div>
+                <?php endif; ?>
+                <p>Legge il consumo di Claude (finestra di 5 ore e settimanale) dal tuo account claude.ai e lo mostra come numero sull'icona del browser, nel suo popup e nell'header di Ykan. Si aggiorna da sola ogni minuto; non chiede password e non invia dati altrove.</p>
+                <p class="tool-req">Richiede Chrome o Edge con l'accesso a <a href="https://claude.ai" target="_blank" rel="noopener">claude.ai</a> già fatto.</p>
+                <h4>Istruzioni d'uso</h4>
+                <ol>
+                    <li>Scarica lo zip ed estrailo in una cartella che non cancellerai: il browser la usa ogni volta, non solo durante l'installazione.</li>
+                    <li>Apri <code>chrome://extensions</code> (su Edge <code>edge://extensions</code>) scrivendolo nella barra degli indirizzi.</li>
+                    <li>Attiva <b>Modalità sviluppatore</b> (interruttore in alto a destra; su Edge nel menu a sinistra).</li>
+                    <li>Clicca <b>Carica estensione non pacchettizzata</b> e scegli la cartella <code>ykan-usage-extension</code> (quella che contiene <code>manifest.json</code>).</li>
+                    <li>Fissa l'icona dal pulsante puzzle 🧩 della barra: vedrai il numero del consumo. Ricarica Ykan e il badge compare anche nell'header.</li>
+                </ol>
+                <p class="tool-note">Il badge in Ykan compare solo sulla board online (<code>ykan.portale3d.it</code>). Se resta vuoto, apri claude.ai in quel browser e controlla di essere collegato.<br>
+                    <b>Aggiornare:</b> estrai il nuovo zip sopra la stessa cartella, poi in <code>chrome://extensions</code> clicca ↻ sull'estensione.</p>
+            </div>
         </div>
     </section>
 
@@ -7285,6 +7391,8 @@ $dataJson = json_encode($data);
         try { localStorage.setItem('ykan_settings_tab', name); } catch (_) {}
         document.querySelectorAll('#settingsView .dash-tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
         document.querySelectorAll('#settingsView .settings-panel').forEach(p => p.style.display = p.dataset.panel === name ? 'block' : 'none');
+        // "Save" solo sulle schede che stanno dentro il form (Progetti/Aspetto/Strumenti salvano da sé)
+        document.querySelector('#configForm .modal-actions').style.display = document.querySelector(`#configForm [data-panel="${name}"]`) ? '' : 'none';
         if (name === 'progetti') renderProjectsManager();
     }
 

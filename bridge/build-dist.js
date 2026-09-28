@@ -3,6 +3,7 @@
 
 // Costruisce dist/ykan-bridge/: ykan-bridge.exe (Node SEA) + node_modules (ws, node-pty)
 // + LEGGIMI.txt. Uso: npm run build   (Windows x64)
+// Crea anche ../downloads/*.zip (Bridge + estensione) scaricabili da Settings → Strumenti.
 
 const fs = require('fs');
 const path = require('path');
@@ -56,5 +57,22 @@ su http://127.0.0.1:51820 (solo su questo PC). Lascia la finestra aperta mentre 
 Non spostare l'exe fuori da questa cartella: la cartella node_modules deve stargli accanto.
 Serve Claude Code installato (comando "claude") per i pulsanti PLAY e Riprendi.
 `);
+
+// Zip per Settings → Strumenti della board: finiscono in ../downloads/ (da caricare su OVH
+// accanto a _Ykan.php). Usa il tar di Windows (bsdtar), che sa scrivere zip.
+const downloads = path.join(root, '..', 'downloads');
+fs.mkdirSync(downloads, { recursive: true });
+const tar = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'tar.exe');
+const zip = (name, parent, folder) => {
+    const dest = path.join(downloads, name);
+    rm(dest);
+    execFileSync(tar, ['-a', '-cf', dest, '-C', parent, folder], { stdio: 'inherit' });
+    console.log('Zip:', dest);
+};
+zip('ykan-bridge-windows.zip', path.join(root, 'dist'), 'ykan-bridge');
+
+const ext = path.join(root, 'dist', 'ykan-usage-extension');
+fs.cpSync(path.join(root, '..', 'extension'), ext, { recursive: true });
+zip('ykan-usage-extension.zip', path.join(root, 'dist'), 'ykan-usage-extension');
 
 console.log('\nFatto:', out);

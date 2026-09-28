@@ -24,3 +24,6 @@ bridge/*.log
 
 # Cartella del .env scelta in Settings (percorso locale per ogni installazione)
 _Ykan_local.json
+
+# Pacchetti di Settings → Strumenti (generati da bridge: npm run build)
+downloads/*.zip
