@@ -34,7 +34,7 @@ A second tab next to Kanban, sharing one project + period filter across four vie
 - **Attività** - a per-day timeline of task moves and session activity
 - **Revisione sessioni** - review of Claude Code sessions, grouped by project, with a suggested verdict (resume, conclude, or split into tasks)
 - **Git** - repository status per project (local changes, commits to push) plus GitHub last push / open issues
-- **Local Bridge** (`bridge/`, Node, optional) - runs only on `127.0.0.1`, feeds the Dashboard real Claude Code session history and a live terminal; the board degrades gracefully when it isn't running
+- **Local Bridge** (`bridge/`, Node, optional) - runs only on `127.0.0.1`, feeds the Dashboard real Claude Code session history and a live terminal; the board degrades gracefully when it isn't running. Started via `bridge/autostart-hidden.vbs` it shows a tray icon (green/red) with Restart / Quit / Open log
 
 ### MCP Server & Automation
 Beyond remote board/file control from the Claude mobile app, `mcp.php` turns _Ykan into a

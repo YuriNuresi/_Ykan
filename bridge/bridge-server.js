@@ -576,11 +576,34 @@ function shellForPlatform() {
     return process.env.SHELL || '/bin/bash';
 }
 
-// Resolve the claude CLI's own directory without going through a shell (PATHEXT/alias
-// resolution isn't available to a direct spawn on Windows), so launch='claude' works
-// wherever `claude` is a real executable reachable through PATH.
+// Quale binario `claude` lanciare. Non basta quello nel PATH: su Windows puo' essere una
+// versione vecchissima (es. 2.1.7) che va in crash ("null is not an object (evaluating
+// 'A.split')") riprendendo sessioni scritte da Claude Desktop (2.1.2xx). Claude Desktop
+// tiene sempre aggiornata la propria copia in %APPDATA%\Claude\claude-code\<versione>\claude.exe:
+// si preferisce la piu' recente di quelle, poi il PATH. Override manuale: YKAN_CLAUDE_BIN.
+// (Niente shell: su Windows uno spawn diretto non risolve PATHEXT/alias.)
+function compareVersions(a, b) {
+    const pa = a.split('.').map(n => parseInt(n, 10) || 0), pb = b.split('.').map(n => parseInt(n, 10) || 0);
+    for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+        const d = (pa[i] || 0) - (pb[i] || 0);
+        if (d) return d;
+    }
+    return 0;
+}
+
 function resolveClaudeBin() {
-    return process.platform === 'win32' ? 'claude.exe' : 'claude';
+    if (process.env.YKAN_CLAUDE_BIN && fs.existsSync(process.env.YKAN_CLAUDE_BIN)) return process.env.YKAN_CLAUDE_BIN;
+    if (process.platform === 'win32') {
+        const root = process.env.APPDATA && path.join(process.env.APPDATA, 'Claude', 'claude-code');
+        try {
+            const versions = fs.readdirSync(root)
+                .filter(v => /^\d+(\.\d+)+$/.test(v) && fs.existsSync(path.join(root, v, 'claude.exe')))
+                .sort(compareVersions);
+            if (versions.length) return path.join(root, versions[versions.length - 1], 'claude.exe');
+        } catch (_) { /* Claude Desktop non installato: si usa il PATH */ }
+        return 'claude.exe';
+    }
+    return 'claude';
 }
 
 function handlePtyConnection(ws, opts) {
@@ -778,4 +801,5 @@ server.listen(PORT, '127.0.0.1', () => {
     console.log(`Bridge Ykan in ascolto su http://127.0.0.1:${PORT}`);
     console.log('  GET  /sessions?dir=...  storico sessioni (sola lettura)');
     console.log('  WS   /pty?dir=...       shell interattiva (Origin obbligatorio: ' + ALLOWED_ORIGINS.join(', ') + ')');
+    console.log('  claude usato per launch/resume: ' + resolveClaudeBin());
 });

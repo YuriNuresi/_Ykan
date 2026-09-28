@@ -20,3 +20,4 @@ Thumbs.db
 # Bridge locale: dipendenze e pacchetto generato
 bridge/node_modules/
 bridge/dist/
+bridge/*.log

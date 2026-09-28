@@ -2798,28 +2798,8 @@ $dataJson = json_encode($data);
         .pm-acc-item { display: flex; align-items: center; gap: 8px; padding: 4px 0; font-size: 13px; }
         .pm-acc-item.done span { text-decoration: line-through; color: var(--text2); }
 
-        /* Changelog Panel */
-        .changelog-btn {
-            position: fixed; bottom: 20px; right: 20px; width: 36px; height: 36px;
-            border-radius: 50%; background: var(--bg2); border: 1px solid var(--border);
-            color: var(--text2); font-size: 16px; cursor: pointer; z-index: 100;
-            display: flex; align-items: center; justify-content: center;
-            transition: all 0.2s; box-shadow: 0 2px 8px rgba(0,0,0,0.1);
-        }
-        .changelog-btn:hover { background: var(--accent); color: white; border-color: var(--accent); }
-        .changelog-panel {
-            position: fixed; bottom: 0; left: 0; right: 0; max-height: 0;
-            background: var(--bg); border-top: 1px solid var(--border);
-            overflow: hidden; transition: max-height 0.3s ease; z-index: 200;
-        }
-        .changelog-panel.active { max-height: 400px; }
-        .changelog-content {
-            padding: 20px; max-width: 800px; margin: 0 auto;
-            max-height: 380px; overflow-y: auto;
-        }
-        .changelog-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
-        .changelog-title { font-size: 18px; font-weight: 600; }
-        .changelog-close { background: none; border: none; font-size: 20px; cursor: pointer; color: var(--text2); }
+        /* Changelog: contenuto della scheda "Changelog" del terminale (vedi termInit) */
+        .changelog-content { padding: 16px 20px; max-width: 800px; }
         .changelog-version { margin-bottom: 16px; padding-bottom: 12px; border-bottom: 1px solid var(--border); }
         .changelog-version:last-of-type { border-bottom: none; }
         .changelog-version h3 { font-size: 14px; color: var(--accent); margin-bottom: 8px; }
@@ -2990,23 +2970,43 @@ $dataJson = json_encode($data);
         .sess-tool { font-size: 11px; color: var(--text2); padding: 1px 10px; }
         .sess-badge { font-size: 11px; padding: 1px 8px; border-radius: 10px; background: var(--bg2); border: 1px solid var(--border); }
         .sess-badge.done { color: #16a34a; border-color: #16a34a; }
-        /* Terminale: pannello persistente in fondo alla pagina, con tab multiple. Minimizzare
-           nasconde solo il corpo (.term-body): le WebSocket/PTY restano vive in background.
-           Chiudere una scheda invece termina davvero il processo (niente da recuperare). */
-        .term-footer { position: fixed; left: 0; right: 0; bottom: 0; z-index: 500; background: #0b0b0b; border-top: 1px solid var(--border); box-shadow: 0 -4px 16px rgba(0,0,0,.25); display: none; }
-        .term-footer.active { display: block; }
+        /* Terminale: pannello SEMPRE presente in fondo alla pagina, con tab multiple. Minimizzare
+           nasconde solo il corpo (.term-body) e lascia la barra per riaprirlo: le WebSocket/PTY
+           restano vive in background. Chiudere una scheda invece termina davvero il processo.
+           --term-h (impostata da JS) = altezza attuale del pannello: riserva lo spazio in fondo
+           alla pagina e alza gli elementi fissi in basso (toast, changelog) sopra al terminale. */
+        :root { --term-h: 0px; }
+        body { padding-bottom: var(--term-h); }
+        .toast-container { bottom: calc(20px + var(--term-h)); }
+        .term-footer { position: fixed; left: 0; right: 0; bottom: 0; z-index: 500; background: #0b0b0b; border-top: 1px solid var(--border); box-shadow: 0 -4px 16px rgba(0,0,0,.25); }
         .term-tabbar { display: flex; align-items: center; gap: 4px; padding: 4px 6px; background: var(--bg2); border-bottom: 1px solid var(--border); }
+        .term-footer.minimized .term-tabbar { cursor: pointer; border-bottom: 0; }
+        .term-lane-sel { width: auto; max-width: 160px; padding: 2px 4px; font-size: 12px; flex-shrink: 0; }
+        .term-badge { background: #dc2626; color: #fff; border-radius: 9px; padding: 0 6px; font-size: 10px; line-height: 16px; }
+        /* Schede non-terminale (Changelog, Console): stessi colori del tema, non il nero di xterm */
+        .term-pane.doc { background: var(--bg); color: var(--text); overflow: auto; padding: 0; }
+        .term-pane.con { overflow: hidden; }
+        .term-pane.con.active { display: flex; flex-direction: column; }
+        .con-bar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 4px 10px; border-bottom: 1px solid var(--border); background: var(--bg2); font-size: 12px; flex-shrink: 0; }
+        .con-bar label { display: flex; align-items: center; gap: 4px; cursor: pointer; color: var(--text2); }
+        .con-bar input { width: auto; margin: 0; }
+        .con-list { flex: 1; overflow-y: auto; padding: 4px 10px; font: 12px/1.5 ui-monospace, Consolas, monospace; }
+        .con-line { display: flex; gap: 8px; white-space: pre-wrap; word-break: break-word; }
+        .con-t { color: var(--text2); flex-shrink: 0; }
+        .lvl-error { color: #ef4444; } .lvl-warn { color: #d97706; } .lvl-net { color: #3b82f6; } .lvl-debug { color: var(--text2); }
+        .con-list.hide-net .lvl-net, .con-list.hide-warn .lvl-warn, .con-list.hide-error .lvl-error,
+        .con-list.hide-log .lvl-log, .con-list.hide-log .lvl-info, .con-list.hide-log .lvl-debug { display: none; }
         .term-tabs { display: flex; gap: 2px; overflow-x: auto; flex: 1; min-width: 0; }
         .term-tab { display: flex; align-items: center; gap: 7px; padding: 5px 8px 5px 12px; font-size: 12px; border-radius: 6px 6px 0 0; background: var(--bg); color: var(--text2); cursor: pointer; white-space: nowrap; flex-shrink: 0; }
         .term-tab.active { background: #000; color: #fff; }
         .term-tab.dead { opacity: .55; }
         .term-tab-x { opacity: .6; padding: 0 4px; border-radius: 4px; line-height: 1.4; }
         .term-tab-x:hover { opacity: 1; background: rgba(255,255,255,.18); }
-        .term-body { height: 340px; }
+        .term-body { height: min(340px, 38vh); min-height: 120px; }
         .term-footer.minimized .term-body { display: none; }
         .term-pane { display: none; height: 100%; background: #000; padding: 4px; box-sizing: border-box; }
         .term-pane.active { display: block; }
-        @media (max-width: 720px) { .term-body { height: 260px; } }
+        @media (max-width: 720px) { .term-body { height: min(260px, 38vh); } }
     </style>
     <!-- Custom theme overrides (populated on load + when switching themes) -->
     <style id="customThemeStyle"><?= !empty($data['config']['theme_file']) ? ykanThemeCss($data['config']['theme_file']) : '' ?></style>
@@ -3378,7 +3378,7 @@ $dataJson = json_encode($data);
                         <option value="desktop">Claude Desktop (locale, richiede l'app installata)</option>
                         <option value="cloud">Cloud (claude.ai, nel browser)</option>
                     </select>
-                    <small style="color:var(--text2);font-size:11px">Vale per "▶️ Lavora ora" e per aprire una sessione nuova. "↩️ Riprendi" una sessione esistente resta sempre nel terminale: né Claude Desktop né claude.ai supportano il resume di una sessione locale via link.</small>
+                    <small style="color:var(--text2);font-size:11px">Vale per "▶️ Lavora ora", per le sessioni nuove e per "▶️ Riprendi" una sessione esistente. Con <b>Claude Desktop</b> il resume importa/riapre la sessione nell'app; con <b>Cloud</b> il resume resta nel terminale (claude.ai non può riagganciare una sessione locale).</small>
                 </div>
             </div>
 
@@ -3555,10 +3555,12 @@ $dataJson = json_encode($data);
     <!-- Terminale: pannello persistente in fondo alla pagina, non un modal — minimizzare non
          chiude le WebSocket (i processi restano vivi), solo la × su una scheda li termina. -->
     <div id="termFooter" class="term-footer">
-        <div class="term-tabbar">
+        <div class="term-tabbar" onclick="if (this.parentElement.classList.contains('minimized')) termSetMin(false)">
             <div id="termTabs" class="term-tabs"></div>
+            <select id="termLaneSel" class="term-lane-sel" title="Progetto in cui aprire una nuova shell" onmousedown="termRefreshLaneSelect()" onclick="event.stopPropagation()"></select>
+            <button type="button" class="btn btn-icon" onclick="event.stopPropagation();termNewShell()" title="Nuova shell nel progetto selezionato">＋</button>
             <span style="flex:1"></span>
-            <button type="button" class="btn btn-icon" onclick="termToggleMinimize()" id="termMinBtn" title="Riduci a icona">⌄</button>
+            <button type="button" class="btn btn-icon" onclick="event.stopPropagation();termSetMin(!document.getElementById('termFooter').classList.contains('minimized'))" id="termMinBtn" title="Abbassa il terminale (resta la barra per riaprirlo)">⌄</button>
         </div>
         <div id="termBody" class="term-body"></div>
     </div>
@@ -3599,6 +3601,58 @@ $dataJson = json_encode($data);
 
     <script>
     // === STATE ===
+    // === CONSOLE CAPTURE ===
+    // Tutto quello che passa per la console del browser (log/warn/error, errori non gestiti, risorse
+    // che non si caricano, promise rifiutate) più ogni richiesta fetch (le azioni della board sono
+    // POST ?api=<azione>) finisce in ykanLog e si vede nella scheda "Console" del terminale.
+    // Installato per primo per non perdere gli errori di avvio. Nei body i valori che sembrano
+    // segreti (key/token/secret/password) vengono oscurati.
+    const ykanLog = { entries: [], max: 1000, listeners: [] };
+    function ykanLogAdd(level, text) {
+        const e = { t: new Date(), level, text: String(text).slice(0, 2000) };
+        ykanLog.entries.push(e);
+        if (ykanLog.entries.length > ykanLog.max) ykanLog.entries.shift();
+        ykanLog.listeners.forEach(fn => { try { fn(e); } catch (_) {} });
+    }
+    (function () {
+        const fmt = a => {
+            if (a instanceof Error) return a.stack || (a.name + ': ' + a.message);
+            if (typeof a === 'string') return a;
+            try { return JSON.stringify(a, (k, v) => typeof v === 'function' ? '[fn]' : v); } catch (_) { return String(a); }
+        };
+        ['log', 'info', 'warn', 'error', 'debug'].forEach(level => {
+            const orig = console[level].bind(console);
+            console[level] = (...args) => { orig(...args); ykanLogAdd(level, args.map(fmt).join(' ')); };
+        });
+        window.addEventListener('error', e => {
+            const t = e.target;
+            if (t && t !== window && (t.src || t.href)) ykanLogAdd('error', 'Risorsa non caricata: ' + (t.src || t.href));
+            else ykanLogAdd('error', (e.message || 'Errore') + (e.filename ? ` (${e.filename.split('/').pop()}:${e.lineno})` : ''));
+        }, true);
+        window.addEventListener('unhandledrejection', e => ykanLogAdd('error', 'Promise rifiutata: ' + fmt(e.reason)));
+
+        const redact = (k, v) => /key|token|secret|pass/i.test(k) ? '***' : v;
+        const origFetch = window.fetch.bind(window);
+        window.fetch = function (input, init) {
+            const url = typeof input === 'string' ? input : ((input && input.url) || String(input));
+            const method = ((init && init.method) || (input && input.method) || 'GET').toUpperCase();
+            const api = url.match(/^\?api=([\w-]+)/);
+            let label = api ? 'api ' + api[1] : method + ' ' + url.replace(location.origin, '');
+            if (init && typeof init.body === 'string' && init.body !== '{}') {
+                try { label += ' ' + JSON.stringify(JSON.parse(init.body), redact).slice(0, 160); } catch (_) {}
+            }
+            ykanLogAdd('net', '→ ' + label);
+            const t0 = performance.now();
+            return origFetch(input, init).then(res => {
+                ykanLogAdd(res.ok ? 'net' : 'error', '← ' + res.status + ' ' + (api ? api[1] : url.replace(location.origin, '').slice(0, 80)) + ' (' + Math.round(performance.now() - t0) + ' ms)');
+                return res;
+            }, err => {
+                ykanLogAdd('error', '✖ ' + (api ? api[1] : url.slice(0, 80)) + ': ' + (err && err.message || err));
+                throw err;
+            });
+        };
+    })();
+
     let boardData = <?= $dataJson ?>;
     // true when the server .env provides GITHUB_TOKEN (the value itself never reaches the browser)
     const ykanGithubEnvToken = <?= ykanEnv('GITHUB_TOKEN') !== '' ? 'true' : 'false' ?>;
@@ -5100,10 +5154,10 @@ $dataJson = json_encode($data);
         } else if (st) {
             act.innerHTML = `
                 <button class="btn" onclick="sessReopen()">↩️ Riapri</button>
-                <button class="btn btn-primary" onclick="sessResume()">▶️ Riprendi</button>`;
+                <button class="btn btn-primary" onclick="sessResume()">${sessResumeLabel()}</button>`;
         } else {
             act.innerHTML = `
-                <button class="btn" onclick="sessResume()">▶️ Riprendi</button>
+                <button class="btn" onclick="sessResume()">${sessResumeLabel()}</button>
                 <button class="btn" onclick="sessConclude()">✅ Archivia come conclusa</button>
                 <button class="btn btn-primary" id="sessSplitBtn" onclick="sessSplit()">🧩 Scomponi in task e chiudi</button>`;
         }
@@ -5112,8 +5166,11 @@ $dataJson = json_encode($data);
     function sessResume() {
         const { lane, s } = sessView;
         closeSessionPanel();
-        openTerminalModal(lane.id, { launch: 'resume', sessionId: s.id });
+        resumeSession(lane, s.id);
     }
+
+    // Etichetta del pulsante Riprendi: dice dove si aprirà la sessione (vedi Settings → Claude Code)
+    const sessResumeLabel = () => '▶️ Riprendi' + ((boardData.config.session_open_mode || 'terminal') === 'desktop' ? ' in Desktop' : ' nel terminale');
 
     async function sessSetConcluded(how, extra) {
         const { s } = sessView;
@@ -5314,11 +5371,13 @@ $dataJson = json_encode($data);
     }
 
     // === TERMINAL (live shell via local Bridge, xterm.js) ===
-    // Pannello persistente in fondo alla pagina, con una scheda per sessione: aprirne una nuova
-    // non chiude le altre. Minimizzare (⌄) nasconde solo il corpo, le WebSocket restano aperte
+    // Pannello persistente in fondo alla pagina. Schede fisse (non chiudibili): Changelog e Console
+    // (log del browser + richieste); poi una scheda per sessione shell: aprirne una nuova non
+    // chiude le altre. Minimizzare (⌄) nasconde solo il corpo, le WebSocket restano aperte
     // e i processi vivi in background. Solo la × su una scheda chiude davvero quella sessione
     // (il Bridge termina il processo alla chiusura della WebSocket, vedi bridge-server.js).
     let termSessions = []; // { id, laneId, term, fitAddon, socket, tabEl, paneEl }
+    let termSpecial = [];  // schede fisse non-PTY: { id, tabEl, paneEl, onShow }
     let termActiveId = null;
 
     window.addEventListener('resize', () => {
@@ -5332,9 +5391,7 @@ $dataJson = json_encode($data);
 
     // Apre una nuova sessione Claude nella modalità scelta in Settings (session_open_mode):
     // terminale locale (default, via Bridge), Claude Desktop (deep link claude://code/new) o
-    // cloud (claude://claude.ai/new). Il resume di una sessione esistente NON passa da qui:
-    // né Claude Desktop né claude.ai sanno riagganciare una sessione CLI locale via link, quindi
-    // sessResume() continua a usare sempre openTerminalModal direttamente.
+    // cloud (claude://claude.ai/new). Il resume di una sessione esistente passa da resumeSession().
     function launchSession(lane, context) {
         context = context || {};
         const mode = boardData.config.session_open_mode || 'terminal';
@@ -5350,6 +5407,19 @@ $dataJson = json_encode($data);
         window.location.href = 'claude://claude.ai/new?q=' + encodeURIComponent(cloudPrompt);
     }
 
+    // Riprende una sessione esistente secondo session_open_mode: 'desktop' la importa/riapre in
+    // Claude Desktop (deep link claude://resume?session=<id>, gestito dall'app con importCliSession);
+    // 'terminal' e 'cloud' la riprendono nel terminale della board (claude.ai non può riagganciare
+    // una sessione locale). Il Bridge lancia la claude.exe più recente: quella nel PATH può essere
+    // troppo vecchia per leggere le sessioni di Desktop.
+    function resumeSession(lane, sessionId) {
+        if ((boardData.config.session_open_mode || 'terminal') === 'desktop') {
+            window.location.href = 'claude://resume?session=' + encodeURIComponent(sessionId);
+            return;
+        }
+        openTerminalModal(lane.id, { launch: 'resume', sessionId });
+    }
+
     // Apre sempre una scheda NUOVA (mai riusa/chiude quelle esistenti): lanciare più cose in
     // parallelo deve dare più terminali distinti, non sostituire quello che stava girando.
     function openTerminalModal(laneId, context) {
@@ -5358,9 +5428,8 @@ $dataJson = json_encode($data);
         context = context || {}; // { launch: 'claude', prompt: '...' } to seed Claude Code with a task's context
 
         const id = 'term_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7);
-        const footer = document.getElementById('termFooter');
-        footer.classList.add('active');
-        footer.classList.remove('minimized');
+        termLastLaneId = laneId;
+        if (!context.noFocus) termSetMin(false, true); // aprire una sessione mostra il pannello
 
         const tabEl = document.createElement('div');
         tabEl.className = 'term-tab';
@@ -5393,7 +5462,9 @@ $dataJson = json_encode($data);
         if (context.sessionId) wsUrl += '&sessionId=' + encodeURIComponent(context.sessionId);
         const socket = new WebSocket(wsUrl);
         sess.socket = socket;
+        ykanLogAdd('net', 'Terminale: connessione a ' + lane.name + (context.launch ? ' (' + context.launch + ')' : ''));
         socket.onopen = () => {
+            ykanLogAdd('net', 'Terminale aperto: ' + lane.name);
             fitAddon.fit();
             socket.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
         };
@@ -5402,19 +5473,23 @@ $dataJson = json_encode($data);
             if (msg.type === 'data') term.write(msg.data);
             else if (msg.type === 'exit') { term.writeln('\r\n[processo terminato, codice ' + msg.code + ']'); tabEl.classList.add('dead'); }
         };
+        socket.onclose = () => ykanLogAdd('net', 'Terminale chiuso: ' + lane.name);
         socket.onerror = () => {
+            ykanLogAdd('error', 'Terminale: Bridge locale non raggiungibile su ws://127.0.0.1:51820');
             term.writeln('\r\nBridge locale non raggiungibile su ws://127.0.0.1:51820. Avvialo con: node bridge/bridge-server.js');
         };
 
-        termSwitchTab(id);
+        termSwitchTab(id, !context.noFocus);
     }
 
-    function termSwitchTab(id) {
+    function termSwitchTab(id, focus) {
         termActiveId = id;
-        termSessions.forEach(s => {
+        [...termSpecial, ...termSessions].forEach(s => {
             s.tabEl.classList.toggle('active', s.id === id);
             s.paneEl.classList.toggle('active', s.id === id);
         });
+        const spec = termSpecial.find(s => s.id === id);
+        if (spec && spec.onShow) spec.onShow();
         const sess = termSessions.find(s => s.id === id);
         if (!sess) return;
         setTimeout(() => { // il pane deve essere visibile (display:block) prima che fit() misuri le dimensioni
@@ -5422,7 +5497,7 @@ $dataJson = json_encode($data);
             if (sess.socket && sess.socket.readyState === WebSocket.OPEN) {
                 sess.socket.send(JSON.stringify({ type: 'resize', cols: sess.term.cols, rows: sess.term.rows }));
             }
-            sess.term.focus();
+            if (focus !== false) sess.term.focus();
         }, 0);
     }
 
@@ -5437,16 +5512,135 @@ $dataJson = json_encode($data);
         termSessions.splice(idx, 1);
         if (termActiveId !== id) return;
         const next = termSessions[termSessions.length - 1];
-        if (next) termSwitchTab(next.id);
-        else { termActiveId = null; document.getElementById('termFooter').classList.remove('active'); }
+        termSwitchTab(next ? next.id : 'term_console', !!next);
     }
 
-    function termToggleMinimize() {
+    let termLastLaneId = null;
+    try { termLastLaneId = localStorage.getItem('ykan_term_lane'); } catch (_) {}
+
+    // Progetti con cartella locale: sono gli unici in cui il Bridge può aprire una shell.
+    function termRefreshLaneSelect() {
+        const sel = document.getElementById('termLaneSel');
+        const lanes = [...boardData.swimlanes].filter(l => l.local_path).sort((a, b) => a.position - b.position);
+        const want = sel.value || termLastLaneId;
+        sel.innerHTML = lanes.map(l => `<option value="${escHtml(l.id)}">${escHtml(l.name)}</option>`).join('');
+        sel.style.display = lanes.length ? '' : 'none';
+        if (lanes.some(l => l.id === want)) sel.value = want;
+    }
+
+    function termNewShell(opts) {
+        termRefreshLaneSelect();
+        const laneId = document.getElementById('termLaneSel').value;
+        if (!laneId) { toast('Collega un progetto a una cartella locale (Kanban → 🔗 Projects) per aprire una shell', 'error'); return; }
+        try { localStorage.setItem('ykan_term_lane', laneId); } catch (_) {}
+        openTerminalModal(laneId, opts);
+    }
+
+    // Abbassa/riapre il pannello (lo stato si ricorda tra i ricarichi). Riaprendolo senza nessuna
+    // shell parte una shell nel progetto selezionato, ma solo se il Bridge risponde: altrimenti
+    // lo scrive nella Console invece di aprire una shell che non si connette. skipAuto: chi
+    // chiama sta già per aprire una sessione sua.
+    function termSetMin(min, skipAuto) {
         const footer = document.getElementById('termFooter');
-        const min = footer.classList.toggle('minimized');
-        document.getElementById('termMinBtn').textContent = min ? '⌃' : '⌄';
-        document.getElementById('termMinBtn').title = min ? 'Espandi' : 'Riduci a icona';
-        if (!min) termSwitchTab(termActiveId); // torna visibile: rifai il fit
+        footer.classList.toggle('minimized', min);
+        const btn = document.getElementById('termMinBtn');
+        btn.textContent = min ? '⌃' : '⌄';
+        btn.title = min ? 'Riapri il terminale' : 'Abbassa il terminale (resta la barra per riaprirlo)';
+        try { localStorage.setItem('ykan_term_min', min ? '1' : '0'); } catch (_) {}
+        termSyncH();
+        if (min) return;
+        if (termSessions.length) { termSwitchTab(termActiveId, false); return; } // torna visibile: rifai il fit
+        if (skipAuto) return;
+        fetch(BRIDGE_URL + '/reviews', { cache: 'no-store' })
+            .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); if (!termSessions.length) termNewShell({ noFocus: true }); })
+            .catch(() => console.warn("Bridge locale non raggiungibile: nessuna shell avviata. Avvialo (bridge/start-bridge.bat, o l'icona nella tray) e riapri il terminale con ＋."));
+    }
+
+    // Altezza attuale del pannello → --term-h (spazio riservato in fondo alla pagina)
+    function termSyncH() {
+        document.documentElement.style.setProperty('--term-h', document.getElementById('termFooter').offsetHeight + 'px');
+    }
+
+    // Scheda fissa (non chiudibile, niente processo dietro): build(spec) riempie spec.paneEl.
+    function termAddSpecial(id, label, build) {
+        const tabEl = document.createElement('div');
+        tabEl.className = 'term-tab';
+        tabEl.innerHTML = `<span>${label}</span>`;
+        tabEl.addEventListener('click', () => termSwitchTab(id));
+        document.getElementById('termTabs').appendChild(tabEl);
+        const paneEl = document.createElement('div');
+        paneEl.className = 'term-pane doc';
+        document.getElementById('termBody').appendChild(paneEl);
+        const spec = { id, tabEl, paneEl, onShow: null };
+        termSpecial.push(spec);
+        build(spec);
+    }
+
+    function termBuildChangelog(spec) {
+        spec.paneEl.appendChild(document.getElementById('changelogTpl').content.cloneNode(true));
+    }
+
+    // Console: mostra ykanLog (log del browser + richieste). Lo scroll segue le righe nuove solo
+    // se eri già in fondo; il badge rosso sulla scheda conta gli errori arrivati mentre era nascosta.
+    function termBuildConsole(spec) {
+        const pane = spec.paneEl;
+        pane.classList.add('con');
+        pane.innerHTML = `<div class="con-bar">
+                ${[['net', 'richieste'], ['log', 'log'], ['warn', 'warning'], ['error', 'errori']].map(([k, l]) =>
+                    `<label><input type="checkbox" data-hide="${k}" checked> ${l}</label>`).join('')}
+                <span style="flex:1"></span>
+                <button type="button" class="btn" style="padding:1px 8px;font-size:11px" data-act="copy">Copia</button>
+                <button type="button" class="btn" style="padding:1px 8px;font-size:11px" data-act="clear">Svuota</button>
+            </div><div class="con-list"></div>`;
+        const list = pane.querySelector('.con-list');
+        const badge = document.createElement('span');
+        badge.className = 'term-badge';
+        badge.style.display = 'none';
+        spec.tabEl.appendChild(badge);
+        let unread = 0;
+
+        const addLine = e => {
+            const nearEnd = list.scrollHeight - list.scrollTop - list.clientHeight < 40;
+            const row = document.createElement('div');
+            row.className = 'con-line lvl-' + e.level;
+            const t = document.createElement('span');
+            t.className = 'con-t';
+            t.textContent = e.t.toLocaleTimeString('it-IT') + '.' + String(e.t.getMilliseconds()).padStart(3, '0');
+            const m = document.createElement('span');
+            m.textContent = e.text;
+            row.append(t, m);
+            list.appendChild(row);
+            while (list.childElementCount > ykanLog.max) list.firstChild.remove();
+            if (nearEnd) list.scrollTop = list.scrollHeight;
+            if (e.level === 'error' && termActiveId !== spec.id) {
+                unread++;
+                badge.textContent = unread;
+                badge.style.display = '';
+            }
+        };
+        ykanLog.entries.forEach(addLine);
+        ykanLog.listeners.push(addLine);
+
+        pane.querySelectorAll('input[data-hide]').forEach(cb => cb.addEventListener('change', () =>
+            list.classList.toggle('hide-' + cb.dataset.hide, !cb.checked)));
+        pane.querySelector('[data-act="clear"]').addEventListener('click', () => { ykanLog.entries.length = 0; list.innerHTML = ''; });
+        pane.querySelector('[data-act="copy"]').addEventListener('click', () => {
+            const txt = ykanLog.entries.map(e => e.t.toISOString().slice(11, 23) + ' [' + e.level + '] ' + e.text).join('\n');
+            navigator.clipboard.writeText(txt).then(() => toast('Console copiata'), () => toast('Copia non riuscita', 'error'));
+        });
+        spec.onShow = () => { unread = 0; badge.style.display = 'none'; list.scrollTop = list.scrollHeight; };
+    }
+
+    function termInit() {
+        const footer = document.getElementById('termFooter');
+        if (window.ResizeObserver) new ResizeObserver(termSyncH).observe(footer);
+        termRefreshLaneSelect();
+        termAddSpecial('term_changelog', '📜 Changelog', termBuildChangelog);
+        termAddSpecial('term_console', '🧾 Console', termBuildConsole);
+        termSwitchTab('term_console', false); // finché la shell non parte (o se il Bridge non c'è) si vede la Console
+        let min = false;
+        try { min = localStorage.getItem('ykan_term_min') === '1'; } catch (_) {}
+        termSetMin(min);
     }
 
     // === PROJECT DOCS (files the AI studies before working) ===
@@ -7337,6 +7531,9 @@ ${epicRows}</div>`);
         try { v = localStorage.getItem('ykan_view') || 'kanban'; } catch (_) {}
         showView(v);
     }, 0);
+    // pannello terminale sempre presente in fondo; a DOM completo perché il <template> del changelog sta dopo lo script
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', termInit);
+    else termInit();
 
     // Enter key for Gemini custom input
     document.getElementById('geminiCustom').addEventListener('keypress', (e) => {
@@ -7713,20 +7910,11 @@ ${epicRows}</div>`);
         document.body.appendChild(div);
     }
 
-    // Changelog toggle
-    function toggleChangelog() {
-        document.getElementById('changelogPanel').classList.toggle('active');
-    }
     </script>
 
-    <!-- Changelog Button & Panel -->
-    <button class="changelog-btn" onclick="toggleChangelog()" title="Changelog">?</button>
-    <div id="changelogPanel" class="changelog-panel">
+    <!-- Contenuto della scheda "Changelog" del terminale (clonato da termInit) -->
+    <template id="changelogTpl">
         <div class="changelog-content">
-            <div class="changelog-header">
-                <span class="changelog-title">_Ykan Changelog</span>
-                <button class="changelog-close" onclick="toggleChangelog()">&times;</button>
-            </div>
 
             <div class="changelog-version">
                 <h3>v1.9.0 - September 2026</h3>
@@ -7861,6 +8049,6 @@ ${epicRows}</div>`);
                 Developed by <strong>Yuri Nuresi</strong> &bull; <a href="mailto:yurrena@gmail.com">yurrena@gmail.com</a>
             </div>
         </div>
-    </div>
+    </template>
 </body>
 </html>
