@@ -316,6 +316,7 @@ const YKAN_BRIDGE_ONLINE_SECS = 60;
 const YKAN_RELAY_PATHS = ['/sessions', '/session', '/reviews', '/git', '/claude/skills', '/claude/skill',
     '/claude/memory', '/claude/memory/file', '/claude/memory/write', '/claude/memory/delete',
     '/claude/skill/write', '/claude/skill/override', '/claude/skill/copy', '/claude/plugins', '/claude/plugins/toggle',
+    '/rc', '/rc/start', '/rc/stop', '/rc/answer', '/rc/autostart',
     '/desktop-archive', '/desktop/new', '/desktop/resume'];
 const YKAN_RELAY_WAIT_SECS = 25; // quanto la board aspetta la risposta del PC
 const YKAN_POLL_HOLD_SECS = 8;   // quanto una ?bridge=poll resta aperta se non ci sono comandi
@@ -642,8 +643,39 @@ const YKAN_MEMORY_MAX_TOTAL = 1500000;
 const YKAN_MEMORY_KINDS = ['duplicate', 'stale', 'contradiction', 'broken_link', 'cleanup', 'other'];
 
 function ykanPublicData(array $data): array {
-    unset($data['memory_reviews']);
+    unset($data['memory_reviews'], $data['routine_tokens']);
     return $data;
+}
+
+// === ROUTINE DI CLAUDE CODE: registro e «Esegui ora» ===
+// Ogni routine con un trigger API ha un URL /fire e un token (si generano su claude.ai/code/routines,
+// Modifica → Aggiungi trigger → API). Il token resta qui sul server in $data['routine_tokens'] e non
+// viene mai mandato al browser; la board chiede l'avvio e il server fa la chiamata.
+const YKAN_ROUTINE_BETA = 'experimental-cc-routine-2026-04-01';
+
+function ykanRoutineFire(string $fireUrl, string $token, string $text): array {
+    $ch = curl_init($fireUrl);
+    curl_setopt_array($ch, [
+        CURLOPT_POST => true,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT => 30,
+        CURLOPT_HTTPHEADER => ['Authorization: Bearer ' . $token, 'anthropic-beta: ' . YKAN_ROUTINE_BETA,
+            'anthropic-version: 2023-06-01', 'Content-Type: application/json'],
+        CURLOPT_POSTFIELDS => json_encode($text !== '' ? ['text' => $text] : new stdClass()),
+    ]);
+    $body = curl_exec($ch);
+    $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $err = curl_error($ch);
+    curl_close($ch);
+    if ($body === false) return ['ok' => false, 'error' => 'Connessione non riuscita: ' . $err];
+    $j = json_decode((string)$body, true);
+    if ($code >= 200 && $code < 300 && !empty($j['claude_code_session_url'])) {
+        return ['ok' => true, 'session_url' => (string)$j['claude_code_session_url']];
+    }
+    $msg = is_array($j) ? ($j['error']['message'] ?? $j['error'] ?? $j['message'] ?? '') : '';
+    if (is_array($msg)) $msg = json_encode($msg);
+    if ($code === 401) $msg = 'token non valido o revocato: generane uno nuovo su claude.ai/code/routines';
+    return ['ok' => false, 'error' => "HTTP $code" . ($msg !== '' ? ": $msg" : '')];
 }
 
 function ykanMemoryFileKey(string $source, string $file): string {
@@ -1630,6 +1662,61 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['api'])) {
                 }
                 saveData($data);
                 return ['success' => true];
+            })(),
+
+            // Routine di Claude Code: registro, token (solo sul server) e «Esegui ora»
+            'routine_save' => (function() use (&$data, $input) {
+                $name = trim(mb_substr((string)($input['name'] ?? ''), 0, 80));
+                $fire = trim((string)($input['fire_url'] ?? ''));
+                $page = trim((string)($input['routine_url'] ?? ''));
+                $token = trim((string)($input['token'] ?? ''));
+                if ($name === '') return ['success' => false, 'error' => 'Dai un nome alla routine'];
+                if ($fire !== '' && !preg_match('~^https://api\.anthropic\.com/v1/claude_code/routines/trig_[A-Za-z0-9]+/fire$~', $fire))
+                    return ['success' => false, 'error' => 'L\'URL API deve essere https://api.anthropic.com/v1/claude_code/routines/trig_…/fire'];
+                if ($page !== '' && !preg_match('~^https://claude\.ai/[\w\-./?=&%#]+$~', $page)) return ['success' => false, 'error' => 'La pagina della routine deve essere un link claude.ai'];
+                if ($token !== '' && !preg_match('/^sk-ant-[\w-]{10,300}$/', $token)) return ['success' => false, 'error' => 'Il token deve iniziare con sk-ant-'];
+                $laneId = (string)($input['lane_id'] ?? '');
+                if ($laneId !== '' && !in_array($laneId, array_column($data['swimlanes'], 'id'), true)) $laneId = '';
+                $data['routines'] = $data['routines'] ?? [];
+                $id = (string)($input['id'] ?? '');
+                $idx = null;
+                foreach ($data['routines'] as $k => $r) if (($r['id'] ?? '') === $id) { $idx = $k; break; }
+                if ($idx === null) {
+                    $id = generateId('rtn');
+                    $data['routines'][] = ['id' => $id, 'created_at' => date('Y-m-d H:i:s'), 'runs' => []];
+                    $idx = count($data['routines']) - 1;
+                }
+                $data['routines'][$idx] = array_merge($data['routines'][$idx], ['name' => $name, 'lane_id' => $laneId,
+                    'routine_url' => $page, 'fire_url' => $fire, 'default_text' => mb_substr((string)($input['default_text'] ?? ''), 0, 2000)]);
+                if ($token !== '') $data['routine_tokens'][$id] = $token;
+                $data['routines'][$idx]['has_token'] = !empty($data['routine_tokens'][$id]);
+                saveData($data);
+                return ['success' => true, 'routine' => $data['routines'][$idx]];
+            })(),
+
+            'routine_delete' => (function() use (&$data, $input) {
+                $id = (string)($input['id'] ?? '');
+                $data['routines'] = array_values(array_filter($data['routines'] ?? [], fn($r) => ($r['id'] ?? '') !== $id));
+                unset($data['routine_tokens'][$id]);
+                saveData($data);
+                return ['success' => true];
+            })(),
+
+            'routine_fire' => (function() use (&$data, $input) {
+                $id = (string)($input['id'] ?? '');
+                foreach (($data['routines'] ?? []) as $k => $r) {
+                    if (($r['id'] ?? '') !== $id) continue;
+                    $token = (string)($data['routine_tokens'][$id] ?? '');
+                    if (empty($r['fire_url']) || $token === '') return ['success' => false, 'error' => 'Manca l\'URL API o il token: aggiungili modificando la routine'];
+                    $res = ykanRoutineFire($r['fire_url'], $token, mb_substr(trim((string)($input['text'] ?? '')), 0, 8000));
+                    $run = ['at' => date('Y-m-d H:i:s'), 'ok' => $res['ok'], 'session_url' => $res['session_url'] ?? '', 'error' => $res['error'] ?? ''];
+                    $runs = array_slice(array_merge([$run], $r['runs'] ?? []), 0, 5);
+                    $data['routines'][$k]['runs'] = $runs;
+                    saveData($data);
+                    return $res['ok'] ? ['success' => true, 'session_url' => $run['session_url'], 'runs' => $runs]
+                                      : ['success' => false, 'error' => $res['error'], 'runs' => $runs];
+                }
+                return ['success' => false, 'error' => 'Routine non trovata'];
             })(),
 
             // Memoria Claude: snapshot dei file (dal Bridge) e stato delle proposte
@@ -4378,6 +4465,8 @@ $dataJson = json_encode(ykanPublicData($data));
             <button data-tab="skills" class="active" onclick="claudeTab('skills')">Skills <span class="dash-count"></span></button>
             <button data-tab="plugins" onclick="claudeTab('plugins')">Plugin <span class="dash-count"></span></button>
             <button data-tab="memory" onclick="claudeTab('memory')">Memoria <span class="dash-count"></span></button>
+            <button data-tab="rc" onclick="claudeTab('rc')">Remote Control <span class="dash-count"></span></button>
+            <button data-tab="routines" onclick="claudeTab('routines')">Routine <span class="dash-count"></span></button>
         </div>
         <div id="claudeBody"></div>
     </section>
@@ -6637,7 +6726,11 @@ $dataJson = json_encode(ykanPublicData($data));
     function resumeSession(lane, sessionId) {
         if (bridgeIsRemote()) { remoteDesktop('/desktop/resume', { sessionId }); return; }
         if ((boardData.config.session_open_mode || 'terminal') === 'desktop') {
-            window.location.href = 'claude://resume?session=' + encodeURIComponent(sessionId);
+            // Bridge 0.7.0: `claude --desktop --resume` (importa anche le sessioni del terminale);
+            // Bridge spento o vecchio: deep link come prima.
+            bridgeFetch('/desktop/resume', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sessionId, dir: lane.local_path || '' }) })
+                .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); })
+                .catch(() => { window.location.href = 'claude://resume?session=' + encodeURIComponent(sessionId); });
             return;
         }
         openTerminalModal(lane.id, { launch: 'resume', sessionId });
@@ -7742,6 +7835,7 @@ $dataJson = json_encode(ykanPublicData($data));
 
     function claudeTab(name) {
         claudeTabName = name;
+        if (name === 'rc') rcFetch();
         document.querySelectorAll('#claudeView .dash-tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
         claudeRenderBody();
     }
@@ -7815,7 +7909,9 @@ $dataJson = json_encode(ykanPublicData($data));
         const body = document.getElementById('claudeBody');
         const memNow = claudeMemory[document.getElementById('claudeMemProject').value];
         const counts = { skills: claudeSkills ? claudeSkills.length : '', plugins: Array.isArray(claudePlugins) ? claudePlugins.length : '',
-            memory: memNow && memNow.files ? memNow.files.length : '' };
+            memory: memNow && memNow.files ? memNow.files.length : '',
+            rc: Array.isArray(rcServers) ? rcServers.filter(x => ['running', 'starting', 'waiting'].includes(x.status)).length || '' : '',
+            routines: (boardData.routines || []).length || '' };
         if (claudeTabName === 'skills') {
             if (claudeSkills === null) body.innerHTML = '<div class="dash-empty">Bridge locale non raggiungibile: avvialo per vedere le skill installate.</div>';
             else if (!claudeSkills.length) body.innerHTML = '<div class="dash-empty">Nessuna skill trovata in ~/.claude/skills.</div>';
@@ -7825,6 +7921,10 @@ $dataJson = json_encode(ykanPublicData($data));
             }
         } else if (claudeTabName === 'plugins') {
             body.innerHTML = pluginsHtml();
+        } else if (claudeTabName === 'rc') {
+            body.innerHTML = rcHtml();
+        } else if (claudeTabName === 'routines') {
+            body.innerHTML = routinesHtml();
         } else {
             const laneId = document.getElementById('claudeMemProject').value;
             const mem = claudeMemory[laneId];
@@ -8072,6 +8172,162 @@ $dataJson = json_encode(ykanPublicData($data));
             toast(id + (enabled ? ' attivato' : ' disattivato'), 'success');
         } catch (e) { toast('Non riuscito: ' + e.message, 'error'); }
         if (!Array.isArray(claudePlugins)) await claudeFetchPlugins(); else claudeRenderBody();
+    }
+
+    // === REMOTE CONTROL (Bridge 0.7.0) ===
+    // Un server `claude remote-control` per cartella di progetto, gestito dal Bridge: i Claude Projects
+    // possono far girare lì un thread ("Work locally") e le sessioni si comandano dal telefono.
+    // Alla prima volta Claude Code fa domande (attivare Remote Control, fidarsi della cartella):
+    // compaiono qui con Sì/No. Mentre la scheda è aperta lo stato si aggiorna da solo.
+    let rcServers = undefined; // undefined = non caricato, null = Bridge irraggiungibile, 'old' = Bridge vecchio
+    let rcPollTimer = null;
+    const RC_STATES = { running: ['🟢', 'Attivo'], starting: ['🟡', 'Avvio…'], waiting: ['🙋', 'Aspetta una risposta'],
+        stopped: ['⚪', 'Spento'], error: ['🔴', 'Terminato con errore'] };
+
+    async function rcFetch() {
+        clearTimeout(rcPollTimer);
+        try {
+            const r = await bridgeFetch('/rc');
+            if (r.status === 404) rcServers = 'old';
+            else { const j = await r.json(); rcServers = r.ok ? (j.servers || []) : null; }
+        } catch (_) { rcServers = null; }
+        if (claudeTabName === 'rc') {
+            claudeRenderBody();
+            if (Array.isArray(rcServers) && rcServers.some(x => ['starting', 'waiting', 'running'].includes(x.status)))
+                rcPollTimer = setTimeout(rcFetch, bridgeIsRemote() ? 6000 : 3000);
+        }
+    }
+
+    function rcHtml() {
+        if (rcServers === undefined) return '<div class="dash-empty">Carico…</div>';
+        if (rcServers === null) return '<div class="dash-empty">Bridge locale non raggiungibile.</div>';
+        if (rcServers === 'old') return '<div class="dash-empty">Aggiorna il Bridge alla 0.7.0 per gestire Remote Control da qui.</div>';
+        const lanes = boardData.swimlanes.filter(l => l.local_path);
+        if (!lanes.length) return '<div class="dash-empty">Collega un progetto a una cartella locale (Kanban → 🔗 Projects).</div>';
+        return `<div class="dash-sub" style="margin-bottom:10px">Con Remote Control attivo su una cartella, i thread dei Claude Projects possono lavorare su ${escHtml(memWhere())} («Work locally») e le sessioni si seguono dal telefono. Gira finché il Bridge è acceso; «worktree» dà a ogni sessione la sua copia del repository.</div>`
+            + lanes.map(l => {
+                const st = rcServers.find(x => x.dir === l.local_path) || { status: 'stopped', spawn: 'same-dir', autostart: false, output: '' };
+                const [icon, label] = RC_STATES[st.status] || ['⚪', st.status];
+                const on = ['running', 'starting', 'waiting'].includes(st.status);
+                const id = escHtml(l.id);
+                return `<div class="dash-projcard">
+                    <div class="dash-projhead">
+                        <b>${escHtml(l.name)}</b><span class="sess-badge">${icon} ${label}</span>
+                        ${st.url ? `<a href="${escHtml(st.url)}" target="_blank" rel="noopener" style="font-size:12px">apri su claude.ai</a>` : ''}
+                        <span style="flex:1"></span>
+                        <label style="font-size:12px" title="Ogni sessione lavora in una sua git worktree (serve un repository git)"><input type="checkbox" id="rcWt_${id}" ${st.spawn === 'worktree' ? 'checked' : ''} ${on ? 'disabled' : ''}> worktree</label>
+                        <label style="font-size:12px" title="Riavvia Remote Control su questa cartella ogni volta che parte il Bridge"><input type="checkbox" ${st.autostart ? 'checked' : ''} onchange="rcAutostart('${id}', this.checked)"> all'avvio del Bridge</label>
+                        ${on ? `<button class="btn" style="padding:2px 10px;font-size:12px" onclick="rcCmd('${id}','stop')">⏹ Ferma</button>`
+                             : `<button class="btn btn-primary" style="padding:2px 10px;font-size:12px" onclick="rcCmd('${id}','start')">▶ Avvia</button>`}
+                    </div>
+                    <div class="dash-sub">${escHtml(l.local_path)}</div>
+                    ${st.status === 'waiting' ? `<div style="display:flex;gap:8px;align-items:center;margin-top:6px;padding:6px 8px;border:1px solid var(--accent);border-radius:6px">
+                        <span style="flex:1;font-size:13px">Claude Code chiede: <b>${escHtml(st.question)}</b></span>
+                        <button class="btn btn-primary" style="padding:2px 12px" onclick="rcCmd('${id}','yes')">Sì</button>
+                        <button class="btn" style="padding:2px 12px" onclick="rcCmd('${id}','no')">No</button></div>` : ''}
+                    ${st.output ? `<details style="margin-top:4px"><summary style="font-size:12px;cursor:pointer">Output</summary><div class="mem-pre" style="max-height:220px">${escHtml(st.output.split('\n').slice(-40).join('\n'))}</div></details>` : ''}
+                </div>`;
+            }).join('');
+    }
+
+    async function rcCmd(laneId, cmd) {
+        const lane = boardData.swimlanes.find(l => l.id === laneId);
+        if (!lane) return;
+        const wt = document.getElementById('rcWt_' + laneId);
+        if (cmd === 'start' && !confirm('Avviare Remote Control su «' + lane.name + '» (' + memWhere() + ')?\nDal tuo account claude.ai si potrà far lavorare Claude in questa cartella.')) return;
+        const path = { start: '/rc/start', stop: '/rc/stop', yes: '/rc/answer', no: '/rc/answer' }[cmd];
+        try {
+            await claudeBridgePost(path, { dir: lane.local_path, name: lane.name, spawn: wt && wt.checked ? 'worktree' : 'same-dir', yes: cmd === 'yes' }, 'gestire Remote Control');
+        } catch (e) { toast('Non riuscito: ' + e.message, 'error'); }
+        setTimeout(rcFetch, 600);
+    }
+
+    async function rcAutostart(laneId, on) {
+        const lane = boardData.swimlanes.find(l => l.id === laneId);
+        const wt = document.getElementById('rcWt_' + laneId);
+        if (!lane) return;
+        try {
+            await claudeBridgePost('/rc/autostart', { dir: lane.local_path, name: lane.name, spawn: wt && wt.checked ? 'worktree' : 'same-dir', autostart: on }, 'gestire Remote Control');
+            toast(on ? 'Remote Control partirà con il Bridge su ' + lane.name : 'Avvio automatico tolto', 'success');
+        } catch (e) { toast('Non riuscito: ' + e.message, 'error'); }
+        rcFetch();
+    }
+
+    // === ROUTINE DI CLAUDE CODE: registro ed «Esegui ora» ===
+    // Il token del trigger API resta sul server (mai nel browser): qui solo nome, link e storico.
+    let routineEditing = null; // id della routine in modifica, 'new' per una nuova
+
+    function routinesHtml() {
+        const list = boardData.routines || [];
+        const lanes = boardData.swimlanes;
+        const form = r => `<div class="dash-projcard">
+            <div class="form-group" style="margin-bottom:6px"><label style="font-size:11px">Nome</label><input type="text" id="rtnName" value="${escHtml(r.name || '')}" placeholder="es. Claude Do"></div>
+            <div class="form-group" style="margin-bottom:6px"><label style="font-size:11px">Progetto (facoltativo)</label>
+                <select id="rtnLane"><option value="">—</option>${lanes.map(l => `<option value="${escHtml(l.id)}" ${l.id === r.lane_id ? 'selected' : ''}>${escHtml(l.name)}</option>`).join('')}</select></div>
+            <div class="form-group" style="margin-bottom:6px"><label style="font-size:11px">Pagina della routine (claude.ai/code/routines/…)</label><input type="text" id="rtnPage" value="${escHtml(r.routine_url || '')}" placeholder="https://claude.ai/code/routines/..."></div>
+            <div class="form-group" style="margin-bottom:6px"><label style="font-size:11px">URL API del trigger</label><input type="text" id="rtnFire" value="${escHtml(r.fire_url || '')}" placeholder="https://api.anthropic.com/v1/claude_code/routines/trig_.../fire"></div>
+            <div class="form-group" style="margin-bottom:6px"><label style="font-size:11px">Token del trigger ${r.has_token ? '(già salvato: lascia vuoto per non cambiarlo)' : ''}</label><input type="password" id="rtnToken" autocomplete="off" placeholder="sk-ant-..."></div>
+            <div class="form-group" style="margin-bottom:6px"><label style="font-size:11px">Testo da passare a ogni «Esegui ora» (facoltativo)</label><input type="text" id="rtnText" value="${escHtml(r.default_text || '')}"></div>
+            <div class="dash-sub">URL e token: su claude.ai/code/routines apri la routine → Modifica → Aggiungi trigger → API → copia l'URL e genera il token (si vede una volta sola). Il token resta sul server di _Ykan.</div>
+            <div style="display:flex;gap:8px;margin-top:6px"><button class="btn btn-primary" onclick="routineSave('${escHtml(r.id || '')}')">Salva</button><button class="btn" onclick="routineEditing=null;claudeRenderBody()">Annulla</button></div>
+        </div>`;
+        return `<div style="display:flex;gap:8px;align-items:center;margin-bottom:10px">
+                <button class="btn btn-primary" onclick="routineEditing='new';claudeRenderBody()">＋ Aggiungi routine</button>
+                <a href="https://claude.ai/code/routines" target="_blank" rel="noopener" style="font-size:12px">Le tue routine su claude.ai</a>
+            </div>`
+            + (routineEditing === 'new' ? form({}) : '')
+            + (list.length ? list.map(r => {
+                if (routineEditing === r.id) return form(r);
+                const lane = lanes.find(l => l.id === r.lane_id);
+                const last = (r.runs || [])[0];
+                return `<div class="dash-projcard">
+                    <div class="dash-projhead">
+                        <b>${escHtml(r.name)}</b>${lane ? `<span class="git-tag">${escHtml(lane.name)}</span>` : ''}
+                        ${r.routine_url ? `<a href="${escHtml(r.routine_url)}" target="_blank" rel="noopener" style="font-size:12px">pagina</a>` : ''}
+                        <span style="flex:1"></span>
+                        <button class="btn btn-primary" style="padding:2px 10px;font-size:12px" ${r.fire_url && r.has_token ? '' : 'disabled title="Serve URL API e token"'} onclick="routineFire('${escHtml(r.id)}')">▶ Esegui ora</button>
+                        <button class="btn" style="padding:2px 8px;font-size:12px" onclick="routineEditing='${escHtml(r.id)}';claudeRenderBody()">✏️</button>
+                        <button class="btn btn-danger" style="padding:2px 8px;font-size:12px" onclick="routineDelete('${escHtml(r.id)}')">🗑️</button>
+                    </div>
+                    ${last ? `<div class="dash-sub">Ultimo avvio ${escHtml(last.at)}: ${last.ok ? `<a href="${escHtml(last.session_url)}" target="_blank" rel="noopener">apri la sessione</a>` : '<span style="color:#dc2626">' + escHtml(last.error) + '</span>'}</div>`
+                          : (!r.fire_url || !r.has_token ? '<div class="dash-sub">Manca il trigger API: modifica la routine per aggiungere URL e token.</div>' : '')}
+                </div>`;
+            }).join('') : (routineEditing === 'new' ? '' : '<div class="dash-empty">Nessuna routine registrata. Aggiungi ad esempio «Claude Do» o «Sistema Vacanze» per avviarle da qui.</div>'));
+    }
+
+    async function routineSave(id) {
+        const payload = { id, name: document.getElementById('rtnName').value, lane_id: document.getElementById('rtnLane').value,
+            routine_url: document.getElementById('rtnPage').value, fire_url: document.getElementById('rtnFire').value,
+            token: document.getElementById('rtnToken').value, default_text: document.getElementById('rtnText').value };
+        const res = await api('routine_save', payload);
+        if (!res.success) return;
+        boardData.routines = boardData.routines || [];
+        const i = boardData.routines.findIndex(r => r.id === res.routine.id);
+        if (i >= 0) boardData.routines[i] = res.routine; else boardData.routines.push(res.routine);
+        routineEditing = null;
+        claudeRenderBody();
+    }
+
+    async function routineDelete(id) {
+        const r = (boardData.routines || []).find(x => x.id === id);
+        if (!r || !confirm('Togliere «' + r.name + '» da _Ykan? La routine su claude.ai resta com\'è.')) return;
+        const res = await api('routine_delete', { id });
+        if (!res.success) return;
+        boardData.routines = boardData.routines.filter(x => x.id !== id);
+        claudeRenderBody();
+    }
+
+    async function routineFire(id) {
+        const r = (boardData.routines || []).find(x => x.id === id);
+        if (!r) return;
+        const text = prompt('Avvio «' + r.name + '». Testo da passare alla routine (facoltativo):', r.default_text || '');
+        if (text === null) return;
+        const win = window.open('about:blank', '_blank');
+        const res = await api('routine_fire', { id, text });
+        if (res.runs) r.runs = res.runs;
+        claudeRenderBody();
+        if (res.success && res.session_url) { if (win) win.location.href = res.session_url; }
+        else if (win) win.close();
     }
 
     // === MEMORIA: modifica dei file e ottimizzazione con Claude ===

@@ -110,6 +110,7 @@ async function heartbeat() {
 const RELAY_PATHS = new Set(['/sessions', '/session', '/reviews', '/git', '/claude/skills', '/claude/skill',
     '/claude/memory', '/claude/memory/file', '/claude/memory/write', '/claude/memory/delete',
     '/claude/skill/write', '/claude/skill/override', '/claude/skill/copy', '/claude/plugins', '/claude/plugins/toggle',
+    '/rc', '/rc/start', '/rc/stop', '/rc/answer', '/rc/autostart',
     '/desktop-archive', '/desktop/new', '/desktop/resume']);
 
 function selfRequest(method, p, body, origin) {
@@ -187,7 +188,10 @@ function startRemoteSession(dir, prompt, name) {
 function openUrl(u) {
     const [cmd, args] = process.platform === 'win32' ? ['rundll32.exe', ['url.dll,FileProtocolHandler', u]]
         : process.platform === 'darwin' ? ['open', [u]] : ['xdg-open', [u]];
-    spawnProcess(cmd, args, { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+    const child = spawnProcess(cmd, args, { detached: true, stdio: 'ignore', windowsHide: true });
+    // senza questo, un apri-link mancante (es. xdg-open) farebbe cadere tutto il Bridge
+    child.on('error', e => console.error('Link non aperto (' + cmd + '): ' + e.message));
+    child.unref();
 }
 
 function linkInfo() {
@@ -1000,6 +1004,107 @@ function resolveClaudeBin() {
     return 'claude';
 }
 
+// === CLAUDE DESKTOP: riapre una sessione con `claude --desktop --resume <id>` (Claude Code
+// 2.1.285+, importa anche le sessioni nate nel terminale). Se la versione sul PC non lo conosce o
+// fallisce, si torna al deep link claude://resume come prima.
+function openInDesktop(sessionId, dir) {
+    const { execFile } = require('child_process');
+    const cwd = dir && fs.existsSync(dir) ? dir : os.homedir();
+    return new Promise(resolve => {
+        execFile(resolveClaudeBin(), ['--desktop', '--resume', sessionId], { cwd, timeout: 20000, windowsHide: true }, err => {
+            if (!err) return resolve({ via: 'cli' });
+            openUrl('claude://resume?session=' + encodeURIComponent(sessionId));
+            resolve({ via: 'deeplink' });
+        });
+    });
+}
+
+// === REMOTE CONTROL: un server `claude remote-control` per cartella di progetto ===
+// Così i Claude Projects possono far girare un thread su questo PC ("Work locally") e le sessioni
+// si comandano anche dal telefono. Gira in un terminale virtuale (node-pty) perché alla prima volta
+// Claude Code chiede conferme (attivare Remote Control, fidarsi della cartella): la domanda arriva
+// alla board, che mostra Sì/No; il Bridge non risponde mai da solo. Configurazione (cartelle con
+// avvio automatico) in ~/.ykan-bridge-rc.json.
+const RC_FILE = path.join(os.homedir(), '.ykan-bridge-rc.json');
+const rcServers = new Map(); // dir -> stato del server in esecuzione (o appena terminato)
+
+function rcConfig() {
+    try { const c = JSON.parse(fs.readFileSync(RC_FILE, 'utf8')); return Array.isArray(c) ? c : []; } catch (_) { return []; }
+}
+
+function rcSaveConfig(list) {
+    fs.writeFileSync(RC_FILE, JSON.stringify(list, null, 2));
+}
+
+const stripAnsi = t => t.replace(/\x1b\[[0-9;?]*[ -\/]*[@-~]/g, '').replace(/\x1b\][^\x07]*(\x07|\x1b\\)/g, '').replace(/\r/g, '');
+
+function rcPublic(st) {
+    return { dir: st.dir, name: st.name, spawn: st.spawn, status: st.status, url: st.url || '', question: st.question || '',
+        startedAt: st.startedAt, exitCode: st.exitCode ?? null, output: st.output.slice(-3000) };
+}
+
+function rcList() {
+    const cfg = rcConfig();
+    const out = [...rcServers.values()].map(st => ({ ...rcPublic(st), autostart: cfg.some(c => c.dir === st.dir && c.autostart) }));
+    for (const c of cfg) if (!rcServers.has(c.dir)) out.push({ dir: c.dir, name: c.name || '', spawn: c.spawn || 'same-dir', status: 'stopped', url: '', question: '', output: '', autostart: !!c.autostart });
+    return out;
+}
+
+function rcStart(dir, name, spawnMode) {
+    if (!dir || !fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) throw new Error('cartella del progetto inesistente su questo PC: ' + (dir || '(nessuna)'));
+    const cur = rcServers.get(dir);
+    if (cur && ['starting', 'running', 'waiting'].includes(cur.status)) return rcPublic(cur);
+    spawnMode = spawnMode === 'worktree' ? 'worktree' : 'same-dir';
+    if (spawnMode === 'worktree' && !fs.existsSync(path.join(dir, '.git'))) throw new Error('«worktree» richiede che la cartella sia un repository git');
+    name = String(name || path.basename(dir)).slice(0, 80);
+    const args = ['remote-control', '--name', name];
+    if (spawnMode === 'worktree') args.push('--spawn', 'worktree');
+    const st = { dir, name, spawn: spawnMode, status: 'starting', url: '', question: '', output: '', startedAt: new Date().toISOString(), exitCode: null };
+    st.term = pty.spawn(resolveClaudeBin(), args, { name: 'xterm-color', cols: 120, rows: 30, cwd: dir, env: process.env });
+    st.term.onData(data => {
+        st.output = (st.output + stripAnsi(data)).slice(-20000);
+        const urls = st.output.match(/https:\/\/claude\.ai\/code[^\s"'<>)]*/g);
+        if (urls) st.url = urls[urls.length - 1];
+        const lines = st.output.split('\n').map(l => l.trim()).filter(Boolean);
+        const last = lines[lines.length - 1] || '';
+        if (/\?\s*[\[(]?\s*y\s*\/\s*n\s*[\])]?\s*:?\s*$/i.test(last)) { st.status = 'waiting'; st.question = last; }
+        else if (st.status !== 'stopped') { st.status = st.url ? 'running' : 'starting'; st.question = ''; }
+    });
+    st.term.onExit(({ exitCode }) => {
+        st.status = st.stopping || exitCode === 0 ? 'stopped' : 'error';
+        st.exitCode = exitCode; st.term = null; st.question = '';
+    });
+    rcServers.set(dir, st);
+    console.log(`Remote Control avviato in ${dir} (${spawnMode})`);
+    return rcPublic(st);
+}
+
+function rcStop(dir) {
+    const st = rcServers.get(dir);
+    if (!st) return { ok: true };
+    st.stopping = true;
+    try { if (st.term) st.term.kill(); } catch (_) { /* gia' terminato */ }
+    st.status = 'stopped';
+    return rcPublic(st);
+}
+
+function rcAnswer(dir, yes) {
+    const st = rcServers.get(dir);
+    if (!st || !st.term || st.status !== 'waiting') throw new Error('nessuna domanda in attesa per questa cartella');
+    st.term.write(yes ? 'y\r' : 'n\r');
+    st.status = 'starting'; st.question = '';
+    return rcPublic(st);
+}
+
+function rcSetAutostart(dir, name, spawnMode, autostart) {
+    const cfg = rcConfig().filter(c => c.dir !== dir);
+    if (autostart) cfg.push({ dir, name: String(name || '').slice(0, 80), spawn: spawnMode === 'worktree' ? 'worktree' : 'same-dir', autostart: true });
+    rcSaveConfig(cfg);
+    return { ok: true };
+}
+
+process.on('exit', () => { for (const st of rcServers.values()) { try { if (st.term) st.term.kill(); } catch (_) { } } });
+
 function handlePtyConnection(ws, opts) {
     const { localPath, launch, prompt, sessionId } = opts;
     let cwd = os.homedir();
@@ -1109,9 +1214,27 @@ const server = http.createServer((req, res) => {
             }
             const id = String(b.sessionId || '');
             if (!/^[a-zA-Z0-9_-]{1,80}$/.test(id)) return json(400, { error: 'sessione non valida' });
-            openUrl('claude://resume?session=' + encodeURIComponent(id));
-            json(200, { ok: true, host: os.hostname() });
+            openInDesktop(id, String(b.dir || '')).then(r => json(200, { ok: true, host: os.hostname(), via: r.via }));
         }).catch(e => json(500, { error: String((e && e.message) || e) }));
+        return;
+    }
+
+    // Server Remote Control per cartella: stato (GET) e comandi (POST, solo board ammessa e JSON).
+    if (req.method === 'GET' && parsed.pathname === '/rc') {
+        if (!isAllowedOrigin(origin)) return json(403, { error: 'origin non ammessa' });
+        return json(200, { servers: rcList() });
+    }
+    if (req.method === 'POST' && ['/rc/start', '/rc/stop', '/rc/answer', '/rc/autostart'].includes(parsed.pathname)) {
+        if (!isAllowedOrigin(origin)) return json(403, { error: 'origin non ammessa' });
+        if (!/^application\/json/.test(req.headers['content-type'] || '')) return json(415, { error: 'serve application/json' });
+        readBody(req, 5000).then(raw => {
+            const b = JSON.parse(raw || '{}');
+            const dir = String(b.dir || '');
+            if (parsed.pathname === '/rc/start') return json(200, rcStart(dir, b.name, b.spawn));
+            if (parsed.pathname === '/rc/stop') return json(200, rcStop(dir));
+            if (parsed.pathname === '/rc/answer') return json(200, rcAnswer(dir, !!b.yes));
+            return json(200, rcSetAutostart(dir, b.name, b.spawn, !!b.autostart));
+        }).catch(e => json(400, { error: String((e && e.message) || e) }));
         return;
     }
 
@@ -1288,6 +1411,9 @@ server.listen(PORT, '127.0.0.1', () => {
     heartbeat();
     setInterval(heartbeat, HEARTBEAT_MS);
     relayLoop();
+    for (const c of rcConfig().filter(c => c.autostart)) {
+        try { rcStart(c.dir, c.name, c.spawn); } catch (e) { console.error('Remote Control non avviato in ' + c.dir + ': ' + e.message); }
+    }
 });
 
 // Collegamento da riga di comando, per un PC su cui non si apre la board:
