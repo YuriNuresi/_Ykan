@@ -311,9 +311,13 @@ const YKAN_BRIDGE_ONLINE_SECS = 60;
 // Relay: la board mette in coda un comando per un PC (ykan_bridge_cmds), il Bridge di quel PC
 // lo prende con ?bridge=poll (richiesta che resta aperta qualche secondo), lo esegue su se stesso
 // e rimanda la risposta con ?bridge=result. Solo i percorsi di questo elenco (lo stesso che il
-// Bridge controlla a sua volta): letture e l'apertura di Claude Desktop, niente shell libera.
+// Bridge controlla a sua volta): letture, apertura di Claude Desktop, file di memoria, skill e plugin
+// (con backup e conferma nella board), niente shell libera.
 const YKAN_RELAY_PATHS = ['/sessions', '/session', '/reviews', '/git', '/claude/skills', '/claude/skill',
-    '/claude/memory', '/claude/memory/file', '/desktop-archive', '/desktop/new', '/desktop/resume'];
+    '/claude/memory', '/claude/memory/file', '/claude/memory/write', '/claude/memory/delete',
+    '/claude/skill/write', '/claude/skill/override', '/claude/skill/copy', '/claude/plugins', '/claude/plugins/toggle',
+    '/rc', '/rc/start', '/rc/stop', '/rc/answer', '/rc/autostart',
+    '/desktop-archive', '/desktop/new', '/desktop/resume'];
 const YKAN_RELAY_WAIT_SECS = 25; // quanto la board aspetta la risposta del PC
 const YKAN_POLL_HOLD_SECS = 8;   // quanto una ?bridge=poll resta aperta se non ci sono comandi
 
@@ -626,6 +630,71 @@ function saveData(array $data): bool {
         return $st->execute([ykanCurrentUserId(), json_encode($data, JSON_UNESCAPED_UNICODE)]);
     }
     return file_put_contents(DATA_FILE, json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE)) !== false;
+}
+
+// === MEMORIA CLAUDE: snapshot e proposte di ottimizzazione ===
+// La board raccoglie dal Bridge i file di memoria di un progetto (snapshot) e li salva qui;
+// un thread Claude Code li legge con il tool MCP memory_snapshot e lascia le sue proposte con
+// memory_propose. Le proposte si approvano dalla board, che le applica sul PC tramite Bridge.
+// Sta in $data['memory_reviews'][laneId] ma non viaggia con la board (vedi ykanPublicData).
+const YKAN_MEMORY_SOURCES = ['memory', 'project', 'user'];
+const YKAN_MEMORY_MAX_FILE = 200000;
+const YKAN_MEMORY_MAX_TOTAL = 1500000;
+const YKAN_MEMORY_KINDS = ['duplicate', 'stale', 'contradiction', 'broken_link', 'cleanup', 'other'];
+
+function ykanPublicData(array $data): array {
+    unset($data['memory_reviews'], $data['routine_tokens']);
+    return $data;
+}
+
+// === ROUTINE DI CLAUDE CODE: registro e «Esegui ora» ===
+// Ogni routine con un trigger API ha un URL /fire e un token (si generano su claude.ai/code/routines,
+// Modifica → Aggiungi trigger → API). Il token resta qui sul server in $data['routine_tokens'] e non
+// viene mai mandato al browser; la board chiede l'avvio e il server fa la chiamata.
+const YKAN_ROUTINE_BETA = 'experimental-cc-routine-2026-04-01';
+
+function ykanRoutineFire(string $fireUrl, string $token, string $text): array {
+    $ch = curl_init($fireUrl);
+    curl_setopt_array($ch, [
+        CURLOPT_POST => true,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT => 30,
+        CURLOPT_HTTPHEADER => ['Authorization: Bearer ' . $token, 'anthropic-beta: ' . YKAN_ROUTINE_BETA,
+            'anthropic-version: 2023-06-01', 'Content-Type: application/json'],
+        CURLOPT_POSTFIELDS => json_encode($text !== '' ? ['text' => $text] : new stdClass()),
+    ]);
+    $body = curl_exec($ch);
+    $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $err = curl_error($ch);
+    curl_close($ch);
+    if ($body === false) return ['ok' => false, 'error' => 'Connessione non riuscita: ' . $err];
+    $j = json_decode((string)$body, true);
+    if ($code >= 200 && $code < 300 && !empty($j['claude_code_session_url'])) {
+        return ['ok' => true, 'session_url' => (string)$j['claude_code_session_url']];
+    }
+    $msg = is_array($j) ? ($j['error']['message'] ?? $j['error'] ?? $j['message'] ?? '') : '';
+    if (is_array($msg)) $msg = json_encode($msg);
+    if ($code === 401) $msg = 'token non valido o revocato: generane uno nuovo su claude.ai/code/routines';
+    return ['ok' => false, 'error' => "HTTP $code" . ($msg !== '' ? ": $msg" : '')];
+}
+
+function ykanMemoryFileKey(string $source, string $file): string {
+    return $source . ':' . $file;
+}
+
+function ykanMemoryValidFile(string $source, string $file): bool {
+    if (!in_array($source, YKAN_MEMORY_SOURCES, true)) return false;
+    if ($source === 'memory') return (bool)preg_match('/^[\w.-]+\.md$/', $file);
+    if ($source === 'project') return in_array($file, ['CLAUDE.md', 'CLAUDE.local.md', '.claude/CLAUDE.md'], true);
+    return $file === 'CLAUDE.md';
+}
+
+/** Riepilogo senza i contenuti dei file, per la board. */
+function ykanMemoryReviewSummary(?array $r): ?array {
+    if (!$r) return null;
+    $files = array_map(fn($f) => array_diff_key($f, ['content' => 1]), $r['files'] ?? []);
+    return ['snapshot_at' => $r['snapshot_at'] ?? null, 'pc' => $r['pc'] ?? '', 'files' => $files,
+        'summary' => $r['summary'] ?? '', 'proposed_at' => $r['proposed_at'] ?? null, 'proposals' => $r['proposals'] ?? []];
 }
 
 /** Stato per Settings → Generale: modalità, cartella .env, candidate, esito della connessione. Mai i valori. */
@@ -1314,6 +1383,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['api'])) {
                         if (array_key_exists('path', $input)) $lane['path'] = $input['path'];
                         if (array_key_exists('url', $input)) $lane['url'] = $input['url'];
                         if (array_key_exists('local_path', $input)) $lane['local_path'] = $input['local_path'];
+                        // Claude Code Project collegato (1 swimlane = 1 Project): solo link claude.ai
+                        if (array_key_exists('claude_project_url', $input) && preg_match('~^(https://claude\.ai/[\w\-./?=&%#]+)?$~', (string)$input['claude_project_url'])) $lane['claude_project_url'] = $input['claude_project_url'];
                         if (array_key_exists('github_repo', $input) && preg_match('/^([\w.-]+\/[\w.-]+)?$/', (string)$input['github_repo'])) $lane['github_repo'] = $input['github_repo'];
                         // Doc/structure files the AI should study before working
                         if (array_key_exists('doc_files', $input)) $lane['doc_files'] = array_values($input['doc_files'] ?? []);
@@ -1593,9 +1664,106 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['api'])) {
                 return ['success' => true];
             })(),
 
+            // Routine di Claude Code: registro, token (solo sul server) e «Esegui ora»
+            'routine_save' => (function() use (&$data, $input) {
+                $name = trim(mb_substr((string)($input['name'] ?? ''), 0, 80));
+                $fire = trim((string)($input['fire_url'] ?? ''));
+                $page = trim((string)($input['routine_url'] ?? ''));
+                $token = trim((string)($input['token'] ?? ''));
+                if ($name === '') return ['success' => false, 'error' => 'Dai un nome alla routine'];
+                if ($fire !== '' && !preg_match('~^https://api\.anthropic\.com/v1/claude_code/routines/trig_[A-Za-z0-9]+/fire$~', $fire))
+                    return ['success' => false, 'error' => 'L\'URL API deve essere https://api.anthropic.com/v1/claude_code/routines/trig_…/fire'];
+                if ($page !== '' && !preg_match('~^https://claude\.ai/[\w\-./?=&%#]+$~', $page)) return ['success' => false, 'error' => 'La pagina della routine deve essere un link claude.ai'];
+                if ($token !== '' && !preg_match('/^sk-ant-[\w-]{10,300}$/', $token)) return ['success' => false, 'error' => 'Il token deve iniziare con sk-ant-'];
+                $laneId = (string)($input['lane_id'] ?? '');
+                if ($laneId !== '' && !in_array($laneId, array_column($data['swimlanes'], 'id'), true)) $laneId = '';
+                $data['routines'] = $data['routines'] ?? [];
+                $id = (string)($input['id'] ?? '');
+                $idx = null;
+                foreach ($data['routines'] as $k => $r) if (($r['id'] ?? '') === $id) { $idx = $k; break; }
+                if ($idx === null) {
+                    $id = generateId('rtn');
+                    $data['routines'][] = ['id' => $id, 'created_at' => date('Y-m-d H:i:s'), 'runs' => []];
+                    $idx = count($data['routines']) - 1;
+                }
+                $data['routines'][$idx] = array_merge($data['routines'][$idx], ['name' => $name, 'lane_id' => $laneId,
+                    'routine_url' => $page, 'fire_url' => $fire, 'default_text' => mb_substr((string)($input['default_text'] ?? ''), 0, 2000)]);
+                if ($token !== '') $data['routine_tokens'][$id] = $token;
+                $data['routines'][$idx]['has_token'] = !empty($data['routine_tokens'][$id]);
+                saveData($data);
+                return ['success' => true, 'routine' => $data['routines'][$idx]];
+            })(),
+
+            'routine_delete' => (function() use (&$data, $input) {
+                $id = (string)($input['id'] ?? '');
+                $data['routines'] = array_values(array_filter($data['routines'] ?? [], fn($r) => ($r['id'] ?? '') !== $id));
+                unset($data['routine_tokens'][$id]);
+                saveData($data);
+                return ['success' => true];
+            })(),
+
+            'routine_fire' => (function() use (&$data, $input) {
+                $id = (string)($input['id'] ?? '');
+                foreach (($data['routines'] ?? []) as $k => $r) {
+                    if (($r['id'] ?? '') !== $id) continue;
+                    $token = (string)($data['routine_tokens'][$id] ?? '');
+                    if (empty($r['fire_url']) || $token === '') return ['success' => false, 'error' => 'Manca l\'URL API o il token: aggiungili modificando la routine'];
+                    $res = ykanRoutineFire($r['fire_url'], $token, mb_substr(trim((string)($input['text'] ?? '')), 0, 8000));
+                    $run = ['at' => date('Y-m-d H:i:s'), 'ok' => $res['ok'], 'session_url' => $res['session_url'] ?? '', 'error' => $res['error'] ?? ''];
+                    $runs = array_slice(array_merge([$run], $r['runs'] ?? []), 0, 5);
+                    $data['routines'][$k]['runs'] = $runs;
+                    saveData($data);
+                    return $res['ok'] ? ['success' => true, 'session_url' => $run['session_url'], 'runs' => $runs]
+                                      : ['success' => false, 'error' => $res['error'], 'runs' => $runs];
+                }
+                return ['success' => false, 'error' => 'Routine non trovata'];
+            })(),
+
+            // Memoria Claude: snapshot dei file (dal Bridge) e stato delle proposte
+            'memory_review_get' => (function() use ($data, $input) {
+                $laneId = (string)($input['lane_id'] ?? '');
+                return ['success' => true, 'review' => ykanMemoryReviewSummary($data['memory_reviews'][$laneId] ?? null)];
+            })(),
+
+            'memory_snapshot_save' => (function() use (&$data, $input) {
+                $laneId = (string)($input['lane_id'] ?? '');
+                if (!in_array($laneId, array_column($data['swimlanes'], 'id'), true)) return ['success' => false, 'error' => 'Progetto non trovato'];
+                $files = []; $total = 0;
+                foreach (array_slice((array)($input['files'] ?? []), 0, 80) as $f) {
+                    $source = (string)($f['source'] ?? ''); $file = (string)($f['file'] ?? '');
+                    $content = (string)($f['content'] ?? '');
+                    if (!ykanMemoryValidFile($source, $file)) continue;
+                    if (strlen($content) > YKAN_MEMORY_MAX_FILE) return ['success' => false, 'error' => "$file è troppo grande"];
+                    $total += strlen($content);
+                    if ($total > YKAN_MEMORY_MAX_TOTAL) return ['success' => false, 'error' => 'Memoria troppo grande per lo snapshot'];
+                    $files[] = ['source' => $source, 'file' => $file, 'content' => $content,
+                        'sha' => hash('sha256', $content), 'modified' => (string)($f['modified'] ?? '')];
+                }
+                if (!$files) return ['success' => false, 'error' => 'Nessun file di memoria da analizzare'];
+                $data['memory_reviews'][$laneId] = ['snapshot_at' => date('Y-m-d H:i:s'),
+                    'pc' => mb_substr((string)($input['pc'] ?? ''), 0, 60), 'files' => $files,
+                    'summary' => '', 'proposed_at' => null, 'proposals' => []];
+                saveData($data);
+                return ['success' => true, 'review' => ykanMemoryReviewSummary($data['memory_reviews'][$laneId])];
+            })(),
+
+            'memory_proposal_state' => (function() use (&$data, $input) {
+                $laneId = (string)($input['lane_id'] ?? '');
+                $status = (string)($input['status'] ?? '');
+                if (!in_array($status, ['pending', 'applied', 'rejected'], true)) return ['success' => false, 'error' => 'Stato non valido'];
+                foreach (($data['memory_reviews'][$laneId]['proposals'] ?? []) as $k => $pr) {
+                    if (($pr['id'] ?? '') !== (string)($input['id'] ?? '')) continue;
+                    $data['memory_reviews'][$laneId]['proposals'][$k]['status'] = $status;
+                    $data['memory_reviews'][$laneId]['proposals'][$k]['decided_at'] = date('Y-m-d H:i:s');
+                    saveData($data);
+                    return ['success' => true];
+                }
+                return ['success' => false, 'error' => 'Proposta non trovata'];
+            })(),
+
             // Get all data
             'get_data' => (function() use ($data) {
-                return ['success' => true, 'data' => $data];
+                return ['success' => true, 'data' => ykanPublicData($data)];
             })(),
 
             // === AI-FRIENDLY ENDPOINTS ===
@@ -2912,6 +3080,14 @@ PROMPT;
                         $add('overdue', 'high', $c, 'Scaduta il ' . $c['due_date'], strtotime($c['due_date']));
                     if (!$done && !empty($c['next_check']) && strtotime($c['next_check']) <= $now)
                         $add('check_due', 'medium', $c, 'Controllo previsto il ' . $c['next_check'], strtotime($c['next_check']));
+                    foreach (($c['threads'] ?? []) as $t) {
+                        $tName = $t['name'] ?? 'Thread';
+                        $tWhen = strtotime($t['updated_at'] ?? '') ?: null;
+                        $tSum = !empty($t['summary']) ? ': ' . $t['summary'] : '';
+                        if (($t['state'] ?? '') === 'waiting') $add('thread_waiting', 'high', $c, "$tName aspetta una tua risposta$tSum", $tWhen);
+                        elseif (($t['state'] ?? '') === 'failed') $add('thread_failed', 'high', $c, "$tName si è fermato$tSum", $tWhen);
+                        elseif (($t['state'] ?? '') === 'review') $add('thread_review', 'medium', $c, "$tName: pull request pronta per la review", $tWhen);
+                    }
                     $acc = $c['acceptance'] ?? [];
                     if ($acc) {
                         $accDone = count(array_filter($acc, fn($a) => !empty($a['done'])));
@@ -3217,7 +3393,7 @@ try {
        . "<p>Il .env letto è: <code>{$envs}</code>. Correggi i DB_* oppure togli <code>YKAN_STORAGE=mysql</code> per tornare al file JSON.</p></body>";
     exit;
 }
-$dataJson = json_encode($data);
+$dataJson = json_encode(ykanPublicData($data));
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -3703,6 +3879,13 @@ $dataJson = json_encode($data);
         .sess-tool { font-size: 11px; color: var(--text2); padding: 1px 10px; }
         .sess-badge { font-size: 11px; padding: 1px 8px; border-radius: 10px; background: var(--bg2); border: 1px solid var(--border); }
         .sess-badge.done { color: #16a34a; border-color: #16a34a; }
+        .mem-pre { white-space: pre-wrap; font-family: ui-monospace, Consolas, monospace; font-size: 12px; max-height: 420px; overflow-y: auto; }
+        .mem-edit { width: 100%; min-height: 320px; font-family: ui-monospace, Consolas, monospace; font-size: 12px; padding: 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--text); box-sizing: border-box; }
+        .mem-diff { font-family: ui-monospace, Consolas, monospace; font-size: 12px; white-space: pre-wrap; max-height: 360px; overflow-y: auto; border: 1px solid var(--border); border-radius: 6px; padding: 6px; margin-top: 4px; }
+        .mem-diff-add { background: rgba(22, 163, 74, .16); }
+        .mem-diff-del { background: rgba(220, 38, 38, .16); text-decoration: line-through; text-decoration-color: rgba(220, 38, 38, .5); }
+        .mem-diff-skip { color: var(--text2); font-style: italic; }
+        .dash-projcard.skill-off b { opacity: .55; text-decoration: line-through; }
         /* Terminale: pannello SEMPRE presente in fondo alla pagina, con tab multiple. Minimizzare
            nasconde solo il corpo (.term-body) e lascia la barra per riaprirlo: le WebSocket/PTY
            restano vive in background. Chiudere una scheda invece termina davvero il processo.
@@ -4032,12 +4215,16 @@ $dataJson = json_encode($data);
                         <span style="font-size:11px;color:var(--text2);margin-left:8px">0 = immediate</span>
                     </div>
                 </div>
-                <div class="modal-actions">
-                    <button type="button" class="btn btn-warning" id="deleteCardBtn" onclick="deleteCard()" style="display:none">📦 Archive</button>
+                <!-- Riga Claude: i modi di far lavorare Claude sul task (solo su una card esistente) -->
+                <div class="modal-actions" id="cardClaudeActions" style="display:none;justify-content:flex-start;flex-wrap:wrap;padding-bottom:12px;border-bottom:1px solid var(--border)">
+                    <button type="button" class="btn" id="executeClaudeBtn" onclick="executeWithClaude()" style="display:none;background:linear-gradient(135deg,#d97706,#ea580c);color:white;border:none" title="Esegue il task con l'Agent API di Claude direttamente sul server">🏖️ Claude Agent API</button>
+                    <button type="button" class="btn" id="openClaudeAppBtn" onclick="openInClaudeApp()" style="display:none;background:linear-gradient(135deg,#7c3aed,#6d28d9);color:white;border:none" title="Copia il prompt del task e apre claude.ai">🌐 Claude Web</button>
+                    <button type="button" class="btn" id="playLocalBtn" onclick="playCardInTerminal()" style="display:none;background:linear-gradient(135deg,#059669,#10b981);color:white;border:none" title="Avvia Claude Code nel terminale interno di Ykan, sul contesto di questo task">⌨️ Claude Terminale</button>
+                    <button type="button" class="btn" id="openClaudeDesktopBtn" onclick="openCardInClaudeDesktop()" style="display:none;background:linear-gradient(135deg,#c2410c,#9a3412);color:white;border:none" title="Avvia il task in Claude Desktop, nella cartella del progetto">🖥️ Claude Desktop</button>
                     <button type="button" class="btn" id="verifyCardBtn" onclick="verifyTaskWithAI()" style="display:none;background:linear-gradient(135deg,#667eea,#764ba2);color:white;border:none">🤖 AI Verify</button>
-                    <button type="button" class="btn" id="executeClaudeBtn" onclick="executeWithClaude()" style="display:none;background:linear-gradient(135deg,#d97706,#ea580c);color:white;border:none">🏖️ Claude Go</button>
-                    <button type="button" class="btn" id="openClaudeAppBtn" onclick="openInClaudeApp()" style="display:none;background:linear-gradient(135deg,#7c3aed,#6d28d9);color:white;border:none">📱 Claude App</button>
-                    <button type="button" class="btn" id="playLocalBtn" onclick="playCardInTerminal()" style="display:none;background:linear-gradient(135deg,#059669,#10b981);color:white;border:none" title="Apre un terminale locale con Claude Code già avviato sul contesto di questo task">▶️ PLAY locale</button>
+                </div>
+                <div class="modal-actions" style="margin-top:12px">
+                    <button type="button" class="btn btn-warning" id="deleteCardBtn" onclick="deleteCard()" style="display:none">📦 Archive</button>
                     <span style="flex:1"></span>
                     <button type="button" class="btn" onclick="closeCardModal()">Cancel</button>
                     <button type="submit" class="btn btn-primary">Save</button>
@@ -4051,6 +4238,7 @@ $dataJson = json_encode($data);
                     </div>
                     <div id="claudeRunsList" style="display:none;max-height:300px;overflow-y:auto"></div>
                 </div>
+                <div id="cardThreads" style="display:none;margin-top:12px;border:1px solid var(--border);border-radius:8px;padding:10px 12px"></div>
                 <div id="cardSessions" style="display:none;margin-top:12px;border:1px solid var(--border);border-radius:8px;padding:10px 12px"></div>
             </form>
         </div>
@@ -4269,13 +4457,16 @@ $dataJson = json_encode($data);
             <h2>🤖 Claude</h2>
             <span id="claudeBridge" class="dash-bridge"></span>
             <span style="flex:1"></span>
-            <label style="font-size:12px;color:var(--text2)">Progetto (memoria)
-                <select id="claudeMemProject" onchange="claudeFetchMemory()" style="width:auto;padding:2px 4px;max-width:200px"></select></label>
+            <label style="font-size:12px;color:var(--text2)">Progetto
+                <select id="claudeMemProject" onchange="claudeProjectChanged()" style="width:auto;padding:2px 4px;max-width:200px"></select></label>
             <button class="btn" onclick="loadClaudeView()">↻ Aggiorna</button>
         </div>
         <div class="dash-tabs">
             <button data-tab="skills" class="active" onclick="claudeTab('skills')">Skills <span class="dash-count"></span></button>
+            <button data-tab="plugins" onclick="claudeTab('plugins')">Plugin <span class="dash-count"></span></button>
             <button data-tab="memory" onclick="claudeTab('memory')">Memoria <span class="dash-count"></span></button>
+            <button data-tab="rc" onclick="claudeTab('rc')">Remote Control <span class="dash-count"></span></button>
+            <button data-tab="routines" onclick="claudeTab('routines')">Routine <span class="dash-count"></span></button>
         </div>
         <div id="claudeBody"></div>
     </section>
@@ -4511,7 +4702,7 @@ $dataJson = json_encode($data);
             });
             if (res.status === 401 && YKAN_USER) { location.reload(); return { success: false }; } // sessione scaduta: torna alla pagina di accesso
             const result = await res.json();
-            const silentActions = ['get_data', 'gemini_analyze', 'claude_execute', 'claude_status', 'list_themes', 'burndown_data', 'loose_ends', 'link_session', 'session_state', 'github_repo_status', 'bridge_list', 'bridge_pair_code'];
+            const silentActions = ['get_data', 'gemini_analyze', 'claude_execute', 'claude_status', 'list_themes', 'burndown_data', 'loose_ends', 'link_session', 'session_state', 'github_repo_status', 'bridge_list', 'bridge_pair_code', 'memory_review_get', 'memory_snapshot_save', 'memory_proposal_state'];
             if (result.success) {
                 if (!silentActions.includes(action)) {
                     toast('Salvato', 'success');
@@ -4648,6 +4839,7 @@ $dataJson = json_encode($data);
                     ${hasFiles ? `<span title="${card.files.length} file associati" style="font-size:12px">📁</span>` : ''}
                     ${isRecurring ? '<span title="Task autorigenerante" style="font-size:12px">🔄</span>' : ''}
                     ${runBadge}
+                    ${threadBadge(card)}
                 </div>
                 ${label ? `<span class="card-label" style="background:${label.color}">${escHtml(label.name)}</span>` : ''}
                 ${pmBadges}
@@ -4866,9 +5058,15 @@ $dataJson = json_encode($data);
                     <label style="font-size:11px">Local folder (on this machine, e.g. for the local Bridge)</label>
                     <input type="text" id="proj-local-${lane.id}" value="${escHtml(lane.local_path || '')}" placeholder="e.g. C:\\Script locali\\clienteA">
                 </div>
-                <div style="display:flex;gap:8px">
+                <div class="form-group" style="margin-bottom:6px">
+                    <label style="font-size:11px">Claude Code Project (link claude.ai, opzionale)</label>
+                    <input type="text" id="proj-claude-${lane.id}" value="${escHtml(lane.claude_project_url || '')}" placeholder="https://claude.ai/code/projects/...">
+                </div>
+                <div style="display:flex;gap:8px;flex-wrap:wrap">
                     <button class="btn btn-primary" onclick="saveProjectLink('${lane.id}')">Save link</button>
                     <button class="btn" onclick="openDocsModal('${lane.id}')" title="Documentazione del progetto (file per l'AI)">📄 Documentazione</button>
+                    <button class="btn" onclick="copyProjectInstructions('${lane.id}')" title="Copia le istruzioni da incollare in Project settings › Memory › Project instructions">📋 Istruzioni Project</button>
+                    ${lane.claude_project_url ? `<a class="btn" href="${escHtml(lane.claude_project_url)}" target="_blank" rel="noopener">🧵 Apri Project</a>` : ''}
                 </div>
             </div>
         `).join('');
@@ -4878,11 +5076,86 @@ $dataJson = json_encode($data);
         const path = document.getElementById('proj-path-' + id).value.trim();
         const url = document.getElementById('proj-url-' + id).value.trim();
         const local_path = document.getElementById('proj-local-' + id).value.trim();
+        const claude_project_url = document.getElementById('proj-claude-' + id).value.trim();
+        if (claude_project_url && !/^https:\/\/claude\.ai\//.test(claude_project_url)) { toast('Il link del Project deve iniziare con https://claude.ai/', 'error'); return; }
         const lane = boardData.swimlanes.find(l => l.id === id);
-        if (lane) { lane.path = path; lane.url = url; lane.local_path = local_path; }
-        await api('update_swimlane', { id, path, url, local_path });
+        if (lane) { lane.path = path; lane.url = url; lane.local_path = local_path; lane.claude_project_url = claude_project_url; }
+        await api('update_swimlane', { id, path, url, local_path, claude_project_url });
         renderProjectsManager();
         render();
+    }
+
+    // === CLAUDE CODE PROJECTS: thread collegati alle card ===
+    // I thread di un Project riferiscono a _Ykan con il tool MCP thread_report; qui li mostriamo.
+    const THREAD_STATES = {
+        waiting:  ['🙋', 'Aspetta te', '#dc2626'],
+        failed:   ['💥', 'Fermo su errore', '#dc2626'],
+        review:   ['👀', 'PR da rivedere', '#7c3aed'],
+        landing:  ['🛬', 'In merge', '#0891b2'],
+        working:  ['⚙️', 'Al lavoro', '#d97706'],
+        idle:     ['💤', 'Finito, fermo', '#64748b'],
+        resolved: ['✅', 'Concluso', '#16a34a']
+    };
+    const THREAD_ORDER = Object.keys(THREAD_STATES);
+
+    // Il badge sulla card mostra lo stato che richiede più attenzione tra i thread collegati.
+    function threadBadge(card) {
+        const ts = card.threads || [];
+        if (!ts.length) return '';
+        const top = ts.map(t => t.state).sort((a, b) => THREAD_ORDER.indexOf(a) - THREAD_ORDER.indexOf(b))[0];
+        const [icon, label, color] = THREAD_STATES[top] || ['🧵', top, '#64748b'];
+        return `<span title="Thread Claude: ${escHtml(label)} (${ts.length})" style="font-size:11px;padding:1px 5px;border-radius:8px;background:${color};color:white;cursor:help">${icon}${ts.length > 1 ? '×' + ts.length : ''}</span>`;
+    }
+
+    function renderCardThreads(card) {
+        const box = document.getElementById('cardThreads');
+        const ts = [...(card.threads || [])].sort((a, b) => (b.updated_at || '').localeCompare(a.updated_at || ''));
+        if (!ts.length) { box.style.display = 'none'; return; }
+        box.style.display = 'block';
+        const safeUrl = u => /^https:\/\//.test(u || '') ? escHtml(u) : '#';
+        box.innerHTML = '<div style="font-size:13px;font-weight:500;margin-bottom:4px">🧵 Thread Claude Code (' + ts.length + ')</div>'
+            + ts.map(t => {
+                const [icon, label] = THREAD_STATES[t.state] || ['🧵', t.state || '?'];
+                return `<div style="padding:4px 0;border-top:1px solid var(--border)">
+                    <div style="display:flex;gap:8px;align-items:center">
+                        <span class="sess-badge">${icon} ${escHtml(label)}</span>
+                        <span style="font-size:13px;flex:1">${escHtml(t.name || 'Thread')}${t.branch ? ` <code style="font-size:11px">${escHtml(t.branch)}</code>` : ''}</span>
+                        <span style="font-size:11px;color:var(--text2);white-space:nowrap">${escHtml(t.updated_at || '')}</span>
+                        ${t.pr_url ? `<a class="btn" style="padding:2px 8px;font-size:11px" href="${safeUrl(t.pr_url)}" target="_blank" rel="noopener">PR</a>` : ''}
+                        <a class="btn" style="padding:2px 8px;font-size:11px" href="${safeUrl(t.url)}" target="_blank" rel="noopener">Apri</a>
+                    </div>
+                    ${t.summary ? `<div style="font-size:12px;color:var(--text2);margin-top:2px">${escHtml(t.summary)}</div>` : ''}
+                </div>`;
+            }).join('');
+    }
+
+    // Testo per Project settings › Memory › Project instructions (max 16.000 caratteri):
+    // insegna ai thread a collegarsi alle card con il connettore MCP di _Ykan.
+    function projectInstructions(lane) {
+        const doing = (boardData.columns.find(c => /progress|doing|corso|lavor/i.test(c.name)) || {}).name || 'In corso';
+        const n = lane.name;
+        return [
+            `Questo Project lavora sul progetto «${n}» della board _Ykan${lane.github_repo ? ` (repository ${lane.github_repo})` : ''}.`,
+            `I task arrivano dalla board e hanno un id breve (#N). In ogni thread è disponibile il connettore MCP di _Ykan, con gli strumenti get_task, move_task, complete_task, add_task e thread_report.`,
+            ``,
+            `Quando un thread lavora su un task #N:`,
+            `- All'avvio: leggi il task con get_task(id: "N", project: "${n}"), spostalo in "${doing}" con move_task e chiama thread_report(id: "N", project: "${n}", thread_url: <URL di questa sessione su claude.ai>, state: "working", name: <titolo breve>, branch: <branch>).`,
+            `- Se ti serve una mia risposta o approvazione: thread_report con state "waiting" e in summary cosa ti serve.`,
+            `- Quando apri la pull request: thread_report con state "review", pr_url e in summary cosa hai fatto.`,
+            `- Se ti fermi su un errore che non sai risolvere: thread_report con state "failed" e il motivo in summary.`,
+            `- Quando la pull request è mergiata: thread_report con state "resolved", poi complete_task(id: "N", project: "${n}").`,
+            `- Lavoro nuovo scoperto fuori dallo scopo del task: aggiungilo con add_task(project: "${n}") invece di farlo.`,
+            `Se un task non ha un #N, cercalo con list_tasks(project: "${n}") o crealo con add_task prima di iniziare.`,
+            `Se il connettore _Ykan non risponde, dillo nel primo messaggio e prosegui comunque con il lavoro sul codice.`
+        ].join('\n');
+    }
+
+    function copyProjectInstructions(id) {
+        const lane = boardData.swimlanes.find(l => l.id === id);
+        if (!lane) return;
+        navigator.clipboard.writeText(projectInstructions(lane)).then(
+            () => toast('Istruzioni copiate: incollale in Project settings › Memory › Project instructions'),
+            () => toast('Copia non riuscita', 'error'));
     }
 
     // === DASHBOARD (schede: Da riprendere / Ultimi 7 giorni / Revisione sessioni) ===
@@ -4893,7 +5166,9 @@ $dataJson = json_encode($data);
         check_due: ['🔔', 'Controllo da fare'],
         session_question: ['💬', 'Sessione in attesa di tua risposta'],
         session_unanswered: ['✋', 'Sessione interrotta'],
-        session_open_task: ['🧵', 'Sessione su task ancora aperto']
+        session_open_task: ['🧵', 'Sessione su task ancora aperto'],
+        thread_waiting: ['🙋', 'Thread in attesa di te'], thread_failed: ['💥', 'Thread fermo su un errore'],
+        thread_review: ['👀', 'PR del thread da rivedere']
     };
     const DASH_DONE_RE = /done|fatto|chius|completat/i;
     const DASH_DOING_RE = /progress|doing|corso|lavor/i;
@@ -6451,7 +6726,11 @@ $dataJson = json_encode($data);
     function resumeSession(lane, sessionId) {
         if (bridgeIsRemote()) { remoteDesktop('/desktop/resume', { sessionId }); return; }
         if ((boardData.config.session_open_mode || 'terminal') === 'desktop') {
-            window.location.href = 'claude://resume?session=' + encodeURIComponent(sessionId);
+            // Bridge 0.7.0: `claude --desktop --resume` (importa anche le sessioni del terminale);
+            // Bridge spento o vecchio: deep link come prima.
+            bridgeFetch('/desktop/resume', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sessionId, dir: lane.local_path || '' }) })
+                .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); })
+                .catch(() => { window.location.href = 'claude://resume?session=' + encodeURIComponent(sessionId); });
             return;
         }
         openTerminalModal(lane.id, { launch: 'resume', sessionId });
@@ -6945,7 +7224,10 @@ $dataJson = json_encode($data);
             document.getElementById('openClaudeAppBtn').style.display = 'block';
             const cardLane = boardData.swimlanes.find(l => l.id === card.swimlane_id);
             document.getElementById('playLocalBtn').style.display = (cardLane && cardLane.local_path) ? 'block' : 'none';
+            document.getElementById('openClaudeDesktopBtn').style.display = cardLane ? 'block' : 'none';
+            document.getElementById('cardClaudeActions').style.display = 'flex';
             renderClaudeRuns(card);
+            renderCardThreads(card);
             renderCardSessions(card);
             document.getElementById('templateGroup').style.display = 'none';
         } else {
@@ -6971,7 +7253,10 @@ $dataJson = json_encode($data);
             claudeBtn.style.display = 'none';
             document.getElementById('openClaudeAppBtn').style.display = 'none';
             document.getElementById('playLocalBtn').style.display = 'none';
+            document.getElementById('openClaudeDesktopBtn').style.display = 'none';
+            document.getElementById('cardClaudeActions').style.display = 'none';
             document.getElementById('cardSessions').style.display = 'none';
+            document.getElementById('cardThreads').style.display = 'none';
             document.getElementById('claudeRunsPanel').style.display = 'none';
             document.getElementById('templateGroup').style.display = 'block';
             document.getElementById('cardTemplate').value = '';
@@ -7158,13 +7443,7 @@ $dataJson = json_encode($data);
         if (!card) return;
         const lane = boardData.swimlanes.find(l => l.id === card.swimlane_id);
         if (!lane || !lane.local_path) return;
-
-        const label = card.label_id ? boardData.labels.find(l => l.id === card.label_id) : null;
-        let prompt = `Task Ykan #${card.seq || ''} — ${card.title}\n`;
-        if (label) prompt += `[${label.name}] `;
-        prompt += `Priorità: ${card.priority}\n`;
-        if (card.description) prompt += `\n${card.description}\n`;
-        if (card.files && card.files.length > 0) prompt += `\nFile: ${card.files.join(', ')}\n`;
+        const prompt = cardTaskPrompt(card);
 
         // Fixed session id: lets the Dashboard know this session belongs to this task
         const sessionId = crypto.randomUUID();
@@ -7173,6 +7452,38 @@ $dataJson = json_encode($data);
 
         closeCardModal();
         openTerminalModal(lane.id, { launch: 'claude', prompt, sessionId });
+    }
+
+    // Prompt con il contesto del task, lo stesso per terminale interno e Claude Desktop
+    function cardTaskPrompt(card) {
+        const label = card.label_id ? boardData.labels.find(l => l.id === card.label_id) : null;
+        let prompt = `Task Ykan #${card.seq || ''} — ${card.title}\n`;
+        if (label) prompt += `[${label.name}] `;
+        prompt += `Priorità: ${card.priority}\n`;
+        if (card.description) prompt += `\n${card.description}\n`;
+        if (card.files && card.files.length > 0) prompt += `\nFile: ${card.files.join(', ')}\n`;
+        return prompt;
+    }
+
+    // Claude Desktop sempre, qualunque sia session_open_mode: su questo PC deep link
+    // claude://code/new con la cartella del progetto (Desktop chiede conferma), su un PC
+    // collegato il Bridge lancia Claude Code e a fine lavoro apre la sessione in Desktop.
+    function openCardInClaudeDesktop() {
+        const cardId = document.getElementById('cardId').value;
+        if (!cardId) return;
+        const card = boardData.cards.find(c => c.id === cardId);
+        if (!card) return;
+        const lane = boardData.swimlanes.find(l => l.id === card.swimlane_id);
+        if (!lane) return;
+        const prompt = cardTaskPrompt(card);
+        closeCardModal();
+        if (bridgeIsRemote()) {
+            remoteDesktop('/desktop/new', { prompt, dir: lane.local_path || '', name: lane.name || '' });
+            return;
+        }
+        let url = 'claude://code/new?q=' + encodeURIComponent(prompt);
+        if (lane.local_path) url += '&folder=' + encodeURIComponent(lane.local_path);
+        window.location.href = url;
     }
 
     function executeWithClaudeManual(card) {
@@ -7516,7 +7827,7 @@ $dataJson = json_encode($data);
         toast('✅ Chiave Gemini valida', 'success');
     }
 
-    // === PANNELLO CLAUDE (skills + memoria, sola lettura via Bridge) ===
+    // === PANNELLO CLAUDE (skill, plugin e memoria del PC, via Bridge) ===
     let claudeSkills = null; // null = non ancora caricato/non raggiungibile, [] = caricato ma vuoto
     let claudeMemory = {}; // laneId -> { exists, files } | null (bridge irraggiungibile)
     let claudeTabName = 'skills';
@@ -7524,6 +7835,7 @@ $dataJson = json_encode($data);
 
     function claudeTab(name) {
         claudeTabName = name;
+        if (name === 'rc') rcFetch();
         document.querySelectorAll('#claudeView .dash-tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
         claudeRenderBody();
     }
@@ -7539,14 +7851,19 @@ $dataJson = json_encode($data);
 
         document.querySelectorAll('#claudeView .dash-tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === claudeTabName));
         claudeRenderBody();
-        await Promise.all([claudeFetchSkills(), claudeFetchMemory()]);
+        await Promise.all([claudeFetchSkills(), claudeFetchMemory(), claudeFetchPlugins()]);
+    }
+
+    function claudeProjectChanged() {
+        claudeFetchMemory(); claudeFetchSkills(); claudeFetchPlugins();
     }
 
     async function claudeFetchSkills() {
         try {
-            const r = await bridgeFetch('/claude/skills');
+            const lane = claudeSelectedLane();
+            const r = await bridgeFetch('/claude/skills' + (lane ? '?dir=' + encodeURIComponent(lane.local_path) : ''));
             if (!r.ok) throw new Error('HTTP ' + r.status);
-            claudeSkills = (await r.json()).skills || [];
+            claudeSkills = ((await r.json()).skills || []).map(sk => ({ source: 'user', overrides: null, effective: 'on', ...sk }));
         } catch (_) { claudeSkills = null; }
         claudeUpdateBridgeBadge();
         claudeRenderBody();
@@ -7556,11 +7873,13 @@ $dataJson = json_encode($data);
         const laneId = document.getElementById('claudeMemProject').value;
         const lane = boardData.swimlanes.find(l => l.id === laneId);
         if (!lane || !lane.local_path) { claudeRenderBody(); return; }
+        const review = api('memory_review_get', { lane_id: laneId }).then(r => { claudeReview[laneId] = r.success ? r.review : null; });
         try {
             const r = await bridgeFetch('/claude/memory?dir=' + encodeURIComponent(lane.local_path));
             if (!r.ok) throw new Error('HTTP ' + r.status);
             claudeMemory[laneId] = await r.json();
         } catch (_) { claudeMemory[laneId] = null; }
+        await review;
         claudeUpdateBridgeBadge();
         claudeRenderBody();
     }
@@ -7588,57 +7907,685 @@ $dataJson = json_encode($data);
 
     function claudeRenderBody() {
         const body = document.getElementById('claudeBody');
-        const counts = { skills: claudeSkills ? claudeSkills.length : '', memory: 0 };
+        const memNow = claudeMemory[document.getElementById('claudeMemProject').value];
+        const counts = { skills: claudeSkills ? claudeSkills.length : '', plugins: Array.isArray(claudePlugins) ? claudePlugins.length : '',
+            memory: memNow && memNow.files ? memNow.files.length : '',
+            rc: Array.isArray(rcServers) ? rcServers.filter(x => ['running', 'starting', 'waiting'].includes(x.status)).length || '' : '',
+            routines: (boardData.routines || []).length || '' };
         if (claudeTabName === 'skills') {
             if (claudeSkills === null) body.innerHTML = '<div class="dash-empty">Bridge locale non raggiungibile: avvialo per vedere le skill installate.</div>';
             else if (!claudeSkills.length) body.innerHTML = '<div class="dash-empty">Nessuna skill trovata in ~/.claude/skills.</div>';
-            else body.innerHTML = claudeSkills.map(s => claudeCard('skill|' + s.id, '', s.name, s.description, s.modified)).join('');
+            else {
+                body.innerHTML = skillsHeaderHtml() + claudeSkills.map(skillCardHtml).join('');
+                claudeExpanded.forEach(k => { if (k.startsWith('skill|')) skillRenderFile(k); });
+            }
+        } else if (claudeTabName === 'plugins') {
+            body.innerHTML = pluginsHtml();
+        } else if (claudeTabName === 'rc') {
+            body.innerHTML = rcHtml();
+        } else if (claudeTabName === 'routines') {
+            body.innerHTML = routinesHtml();
         } else {
             const laneId = document.getElementById('claudeMemProject').value;
             const mem = claudeMemory[laneId];
             if (!laneId) body.innerHTML = '<div class="dash-empty">Collega un progetto a una cartella locale per vedere la sua memoria (Kanban → 🔗 Projects).</div>';
             else if (mem === undefined) body.innerHTML = '<div class="dash-empty">Carico…</div>';
-            else if (mem === null) body.innerHTML = '<div class="dash-empty">Bridge locale non raggiungibile.</div>';
+            else if (mem === null) body.innerHTML = memReviewHtml(laneId) + '<div class="dash-empty">Bridge locale non raggiungibile.</div>';
             else if (!mem.exists || !mem.files.length) body.innerHTML = '<div class="dash-empty">Nessuna memoria per questo progetto — Claude non ha ancora salvato nulla qui.</div>';
             else {
                 counts.memory = mem.files.length;
-                body.innerHTML = mem.files.map(f => claudeCard(
-                    'mem|' + laneId + '|' + f.file,
-                    f.type ? `<span class="git-tag">${escHtml(f.type)}</span>` : '',
-                    f.name, f.description, f.modified
+                const order = { project: 0, user: 1, memory: 2 };
+                const files = [...mem.files].sort((a, b) => (order[a.source || 'memory'] - order[b.source || 'memory']) || (b.index - a.index) || b.modified.localeCompare(a.modified));
+                body.innerHTML = memReviewHtml(laneId) + files.map(f => claudeCard(
+                    'mem|' + laneId + '|' + (f.source || 'memory') + '|' + f.file,
+                    memSourceBadge(f) + (f.type ? ` <span class="git-tag">${escHtml(f.type)}</span>` : ''),
+                    f.source === 'memory' || !f.source ? f.name : f.file, f.description, f.modified
                 )).join('');
+                claudeExpanded.forEach(k => { if (k.startsWith('mem|' + laneId + '|')) memRenderFile(k); });
             }
         }
         document.querySelectorAll('#claudeView .dash-tabs button').forEach(b => {
-            const c = b.dataset.tab === 'skills' ? counts.skills : counts.memory;
+            const c = counts[b.dataset.tab] ?? '';
             b.querySelector('.dash-count').textContent = c === '' ? '' : c;
         });
     }
 
     async function claudeToggle(key) {
-        if (claudeExpanded.has(key)) { claudeExpanded.delete(key); claudeRenderBody(); return; }
+        if (claudeExpanded.has(key)) { claudeExpanded.delete(key); memEditing.delete(key); skillEditing.delete(key); claudeRenderBody(); return; }
         claudeExpanded.add(key);
         claudeRenderBody();
         const safeId = 'claudeContent_' + key.replace(/[^\w]/g, '_');
         const parts = key.split('|');
         try {
-            let url;
             if (parts[0] === 'skill') {
-                url = '/claude/skill?id=' + encodeURIComponent(parts[1]);
-            } else {
-                const lane = boardData.swimlanes.find(l => l.id === parts[1]);
-                if (!lane) throw new Error('progetto non trovato');
-                url = '/claude/memory/file?dir=' + encodeURIComponent(lane.local_path) + '&file=' + encodeURIComponent(parts[2]);
+                await skillLoadFile(key);
+                skillRenderFile(key);
+                return;
             }
-            const r = await bridgeFetch(url);
-            if (!r.ok) throw new Error('HTTP ' + r.status);
-            const { content } = await r.json();
-            const el = document.getElementById(safeId);
-            if (el) el.innerHTML = `<div style="white-space:pre-wrap;font-family:ui-monospace,Consolas,monospace;font-size:12px;max-height:420px;overflow-y:auto">${escHtml(content.replace(/^---[\s\S]*?---\r?\n/, ''))}</div>`;
+            await memLoadFile(key);
+            memRenderFile(key);
         } catch (e) {
             const el = document.getElementById(safeId);
             if (el) el.innerHTML = '<div class="dash-empty">Errore nel caricamento: ' + escHtml(e.message) + '</div>';
         }
+    }
+
+    // === SKILL E PLUGIN (Bridge 0.6.0) ===
+    // Stato delle skill: skillOverrides nei settings di Claude Code. Ambito "user" = ~/.claude/settings.json
+    // (tutti i progetti), "local" = .claude/settings.local.json del progetto scelto (solo per te).
+    // Plugin: claude plugin enable/disable sul PC. Valgono dalle prossime sessioni di Claude Code.
+    let claudeSkillScope = 'user';
+    let claudePlugins = undefined;   // undefined = non caricati, null = Bridge irraggiungibile, 'old' = Bridge vecchio, [] = lista
+    let claudePluginsError = '';
+    const skillFiles = {};           // "skill|source|id" -> { content, sha }
+    const skillEditing = new Set();
+    const SKILL_STATES = { on: 'Attiva', 'name-only': 'Solo nome', 'user-invocable-only': 'Solo con /comando', off: 'Disattivata' };
+    const SKILL_SOURCES = { user: ['utente', '~/.claude/skills: vale in tutti i progetti'],
+        synced: ['claude.ai', 'Sincronizzata dal tuo account claude.ai'], project: ['progetto', '.claude/skills del progetto: la caricano anche i thread cloud'] };
+
+    function claudeSelectedLane() {
+        const lane = boardData.swimlanes.find(l => l.id === document.getElementById('claudeMemProject').value);
+        return lane && lane.local_path ? lane : null;
+    }
+
+    function claudeBridgeOldError(r, what) {
+        if (r.status === 404) return new Error('il Bridge di ' + memWhere() + ' è di una versione precedente: aggiornalo alla 0.6.0 per ' + what);
+        return null;
+    }
+
+    async function claudeBridgePost(path, payload, what) {
+        const r = await bridgeFetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+        let j = {};
+        try { j = await r.json(); } catch (_) { }
+        const old = claudeBridgeOldError(r, what);
+        if (old) throw old;
+        if (r.status === 409) throw new Error('il file è cambiato nel frattempo: ricaricalo e riprova');
+        if (!r.ok) throw new Error(j.error || 'HTTP ' + r.status);
+        return j;
+    }
+
+    function skillsHeaderHtml() {
+        const lane = claudeSelectedLane();
+        const old = claudeSkills.some(sk => !sk.overrides);
+        return `<div class="dash-sub" style="display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
+            <span>Cambia lo stato per:</span>
+            <label><input type="radio" name="skillScope" value="user" ${claudeSkillScope === 'user' ? 'checked' : ''} onchange="claudeSkillScope='user';claudeRenderBody()"> tutti i progetti <span style="color:var(--text2)">(~/.claude/settings.json)</span></label>
+            <label title="${lane ? '' : 'Scegli in alto un progetto collegato a una cartella'}"><input type="radio" name="skillScope" value="local" ${claudeSkillScope === 'local' ? 'checked' : ''} ${lane ? '' : 'disabled'} onchange="claudeSkillScope='local';claudeRenderBody()"> solo ${lane ? '«' + escHtml(lane.name) + '»' : 'questo progetto'}, per me <span style="color:var(--text2)">(.claude/settings.local.json)</span></label>
+            <span style="color:var(--text2)">Vale dalle prossime sessioni di Claude Code.</span>
+            ${old ? '<span style="color:#dc2626">Aggiorna il Bridge alla 0.6.0 per cambiare lo stato delle skill.</span>' : ''}
+        </div>`;
+    }
+
+    function skillCardHtml(sk) {
+        const key = 'skill|' + sk.source + '|' + sk.id;
+        const scope = claudeSkillScope === 'local' && claudeSelectedLane() ? 'local' : 'user';
+        const cur = sk.overrides ? (sk.overrides[scope] || 'on') : 'on';
+        const [srcLabel, srcTitle] = SKILL_SOURCES[sk.source] || [sk.source, ''];
+        const from = sk.overrides ? (sk.overrides.local ? 'per te in questo progetto' : sk.overrides.project ? 'dal settings.json del progetto' : sk.overrides.user ? 'per tutti i progetti' : '') : '';
+        const differs = sk.effective !== cur;
+        const k = escHtml(key);
+        return `<div class="dash-projcard${sk.effective === 'off' ? ' skill-off' : ''}">
+            <div class="dash-projhead">
+                <span class="git-tag" title="${escHtml(srcTitle)}">${escHtml(srcLabel)}</span>
+                <b style="cursor:pointer" onclick="claudeToggle('${k}')">${escHtml(sk.name)}</b>
+                ${sk.effective !== 'on' ? `<span class="sess-badge" title="Stato in uso ${escHtml(from)}">${escHtml(SKILL_STATES[sk.effective] || sk.effective)}${differs ? ' · ' + escHtml(from) : ''}</span>` : ''}
+                <span style="flex:1"></span>
+                <select onchange="skillSetState('${k}', this.value)" ${sk.overrides ? '' : 'disabled'} title="Stato della skill ${scope === 'local' ? 'per te in questo progetto' : 'in tutti i progetti'}" style="width:auto;padding:2px 4px;font-size:12px">
+                    ${Object.entries(SKILL_STATES).map(([v, l]) => `<option value="${v}" ${v === cur ? 'selected' : ''}>${l}</option>`).join('')}
+                </select>
+                <span class="dash-when">${escHtml(new Date(sk.modified).toLocaleDateString('it-IT'))}</span>
+            </div>
+            ${sk.description ? `<div class="dash-sub" style="cursor:pointer" onclick="claudeToggle('${k}')">${escHtml(sk.description)}</div>` : ''}
+            ${claudeExpanded.has(key) ? `<div class="focus-blockers" id="claudeContent_${key.replace(/[^\w]/g, '_')}"><div class="dash-empty">Carico…</div></div>` : ''}
+        </div>`;
+    }
+
+    function skillParseKey(key) {
+        const [, source, id] = key.split('|');
+        return { source, id, sk: (claudeSkills || []).find(x => x.source === source && x.id === id) };
+    }
+
+    function skillUrl(source, id) {
+        const lane = claudeSelectedLane();
+        return '/claude/skill?id=' + encodeURIComponent(id) + '&source=' + encodeURIComponent(source) + (lane ? '&dir=' + encodeURIComponent(lane.local_path) : '');
+    }
+
+    async function skillLoadFile(key) {
+        const { source, id } = skillParseKey(key);
+        const r = await bridgeFetch(skillUrl(source, id));
+        const j = await r.json();
+        if (!r.ok) throw new Error(j.error || 'HTTP ' + r.status);
+        skillFiles[key] = { content: j.content, sha: j.sha || null };
+    }
+
+    function skillRenderFile(key) {
+        const el = document.getElementById('claudeContent_' + key.replace(/[^\w]/g, '_'));
+        const f = skillFiles[key];
+        if (!el || !f) return;
+        const { source } = skillParseKey(key);
+        const k = escHtml(key);
+        if (skillEditing.has(key)) {
+            el.innerHTML = `<textarea id="skillEdit_${key.replace(/[^\w]/g, '_')}" class="mem-edit" spellcheck="false">${escHtml(f.content)}</textarea>
+                <div style="display:flex;gap:8px;margin-top:6px">
+                    <button class="btn btn-primary" onclick="skillSave('${k}')">💾 Salva</button>
+                    <button class="btn" onclick="skillEditing.delete('${k}');skillRenderFile('${k}')">Annulla</button>
+                    <span style="font-size:11px;color:var(--text2);align-self:center">Prima di salvare il Bridge fa una copia in ~/.ykan-bridge-backups/skills</span>
+                </div>`;
+            return;
+        }
+        const lane = claudeSelectedLane();
+        el.innerHTML = `<div class="mem-pre">${escHtml(f.content)}</div>
+            <div style="display:flex;gap:8px;margin-top:6px;flex-wrap:wrap">
+                ${source !== 'synced' && f.sha ? `<button class="btn" onclick="skillEditing.add('${k}');skillRenderFile('${k}')">✏️ Modifica</button>` : ''}
+                ${source === 'user' && lane ? `<button class="btn" onclick="skillCopyToProject('${k}')" title="Copia la skill in .claude/skills di «${escHtml(lane.name)}»: dopo il commit la usano anche i thread cloud dei Claude Projects">📦 Copia nel progetto</button>` : ''}
+                ${source === 'synced' ? '<span style="font-size:12px;color:var(--text2)">Sincronizzata da claude.ai: si modifica su claude.ai.</span>' : ''}
+            </div>`;
+    }
+
+    async function skillSetState(key, state) {
+        const { sk } = skillParseKey(key);
+        const lane = claudeSelectedLane();
+        const scope = claudeSkillScope === 'local' && lane ? 'local' : 'user';
+        if (!sk) return;
+        if (bridgeIsRemote() && !confirm('Cambiare lo stato di «' + sk.name + '» su ' + memWhere() + '?')) { claudeRenderBody(); return; }
+        try {
+            await claudeBridgePost('/claude/skill/override', { scope, dir: lane ? lane.local_path : '', name: sk.name, state }, 'cambiare lo stato delle skill');
+            toast('«' + sk.name + '»: ' + SKILL_STATES[state] + (scope === 'local' ? ' in ' + lane.name : ' in tutti i progetti'), 'success');
+        } catch (e) { toast('Non cambiato: ' + e.message, 'error'); }
+        claudeFetchSkills();
+    }
+
+    async function skillSave(key) {
+        const { source, id } = skillParseKey(key);
+        const ta = document.getElementById('skillEdit_' + key.replace(/[^\w]/g, '_'));
+        const lane = claudeSelectedLane();
+        if (!ta || !skillFiles[key]) return;
+        if (bridgeIsRemote() && !confirm('Salvare SKILL.md di «' + id + '» su ' + memWhere() + '?')) return;
+        try {
+            const j = await claudeBridgePost('/claude/skill/write', { id, source, dir: lane ? lane.local_path : '', content: ta.value, base_sha: skillFiles[key].sha }, 'modificare le skill');
+            skillFiles[key] = { content: ta.value, sha: j.sha };
+            skillEditing.delete(key);
+            toast('Salvata la skill ' + id, 'success');
+            claudeFetchSkills();
+        } catch (e) { toast('Non salvata: ' + e.message, 'error'); }
+    }
+
+    async function skillCopyToProject(key) {
+        const { id } = skillParseKey(key);
+        const lane = claudeSelectedLane();
+        if (!lane || !confirm('Copiare la skill «' + id + '» in ' + lane.local_path + '/.claude/skills su ' + memWhere() + '?\nPoi fai commit e push: i thread cloud la caricano dal repository.')) return;
+        try {
+            await claudeBridgePost('/claude/skill/copy', { id, dir: lane.local_path }, 'copiare le skill nel progetto');
+            toast('Copiata in .claude/skills/' + id + ': ricordati commit e push', 'success');
+            claudeFetchSkills();
+        } catch (e) { toast('Non copiata: ' + e.message, 'error'); }
+    }
+
+    async function claudeFetchPlugins() {
+        const lane = claudeSelectedLane();
+        claudePluginsError = '';
+        try {
+            const r = await bridgeFetch('/claude/plugins' + (lane ? '?dir=' + encodeURIComponent(lane.local_path) : ''));
+            if (r.status === 404) { claudePlugins = 'old'; }
+            else {
+                const j = await r.json();
+                if (!r.ok) { claudePlugins = []; claudePluginsError = j.error || 'HTTP ' + r.status; }
+                else claudePlugins = j.plugins || [];
+            }
+        } catch (_) { claudePlugins = null; }
+        claudeRenderBody();
+    }
+
+    function pluginsHtml() {
+        if (claudePlugins === undefined) return '<div class="dash-empty">Carico…</div>';
+        if (claudePlugins === null) return '<div class="dash-empty">Bridge locale non raggiungibile.</div>';
+        if (claudePlugins === 'old') return '<div class="dash-empty">Aggiorna il Bridge alla 0.6.0 per vedere e gestire i plugin.</div>';
+        if (claudePluginsError) return '<div class="dash-empty">Non riesco a leggere i plugin: ' + escHtml(claudePluginsError) + '</div>';
+        if (!claudePlugins.length) return '<div class="dash-empty">Nessun plugin installato. Si installano con /plugin in Claude Code.</div>';
+        const lane = claudeSelectedLane();
+        return `<div class="dash-sub" style="margin-bottom:10px">Plugin installati su ${escHtml(memWhere())}${lane ? ' (visti dalla cartella di «' + escHtml(lane.name) + '»)' : ''}. Attivare o disattivare vale dalle prossime sessioni, o dopo /reload-plugins. I plugin dei thread cloud si scelgono in Project settings › Plugins.</div>`
+            + claudePlugins.map(p => {
+                const fixed = ['synced', 'session', 'managed'].includes(p.scope) || /@(inline|skills-dir|synced)$/.test(p.id);
+                const [name, mk] = p.id.split('@');
+                return `<div class="dash-projcard${p.enabled ? '' : ' skill-off'}">
+                    <div class="dash-projhead">
+                        <label class="switch-row" title="${fixed ? 'Non gestibile da qui' : (p.enabled ? 'Disattiva' : 'Attiva')}">
+                            <input type="checkbox" ${p.enabled ? 'checked' : ''} ${fixed ? 'disabled' : ''} onchange="pluginToggle('${escHtml(p.id)}','${escHtml(p.scope)}',this.checked)">
+                        </label>
+                        <b>${escHtml(name)}</b><span style="font-size:12px;color:var(--text2)">@${escHtml(mk || '')}</span>
+                        <span class="git-tag" title="Dove è installato">${escHtml(p.scope)}</span>
+                        ${p.version && p.version !== 'unknown' ? `<span style="font-size:11px;color:var(--text2)">v${escHtml(p.version)}</span>` : ''}
+                        <span style="flex:1"></span>
+                        ${p.errors.length ? `<span class="sess-badge" style="color:#dc2626;border-color:#dc2626" title="${escHtml(p.errors.join('\n'))}">⚠ errori</span>` : ''}
+                    </div>
+                    ${p.errors.length ? `<div class="dash-sub" style="color:#dc2626">${escHtml(p.errors[0])}</div>` : ''}
+                </div>`;
+            }).join('');
+    }
+
+    async function pluginToggle(id, scope, enabled) {
+        const lane = claudeSelectedLane();
+        if (!confirm((enabled ? 'Attivare' : 'Disattivare') + ' il plugin ' + id + ' su ' + memWhere() + '?')) { claudeRenderBody(); return; }
+        try {
+            const j = await claudeBridgePost('/claude/plugins/toggle', { id, enabled, scope, dir: lane ? lane.local_path : '' }, 'gestire i plugin');
+            if (Array.isArray(j.plugins)) claudePlugins = j.plugins;
+            toast(id + (enabled ? ' attivato' : ' disattivato'), 'success');
+        } catch (e) { toast('Non riuscito: ' + e.message, 'error'); }
+        if (!Array.isArray(claudePlugins)) await claudeFetchPlugins(); else claudeRenderBody();
+    }
+
+    // === REMOTE CONTROL (Bridge 0.7.0) ===
+    // Un server `claude remote-control` per cartella di progetto, gestito dal Bridge: i Claude Projects
+    // possono far girare lì un thread ("Work locally") e le sessioni si comandano dal telefono.
+    // Alla prima volta Claude Code fa domande (attivare Remote Control, fidarsi della cartella):
+    // compaiono qui con Sì/No. Mentre la scheda è aperta lo stato si aggiorna da solo.
+    let rcServers = undefined; // undefined = non caricato, null = Bridge irraggiungibile, 'old' = Bridge vecchio
+    let rcPollTimer = null;
+    const RC_STATES = { running: ['🟢', 'Attivo'], starting: ['🟡', 'Avvio…'], waiting: ['🙋', 'Aspetta una risposta'],
+        stopped: ['⚪', 'Spento'], error: ['🔴', 'Terminato con errore'] };
+
+    async function rcFetch() {
+        clearTimeout(rcPollTimer);
+        try {
+            const r = await bridgeFetch('/rc');
+            if (r.status === 404) rcServers = 'old';
+            else { const j = await r.json(); rcServers = r.ok ? (j.servers || []) : null; }
+        } catch (_) { rcServers = null; }
+        if (claudeTabName === 'rc') {
+            claudeRenderBody();
+            if (Array.isArray(rcServers) && rcServers.some(x => ['starting', 'waiting', 'running'].includes(x.status)))
+                rcPollTimer = setTimeout(rcFetch, bridgeIsRemote() ? 6000 : 3000);
+        }
+    }
+
+    function rcHtml() {
+        if (rcServers === undefined) return '<div class="dash-empty">Carico…</div>';
+        if (rcServers === null) return '<div class="dash-empty">Bridge locale non raggiungibile.</div>';
+        if (rcServers === 'old') return '<div class="dash-empty">Aggiorna il Bridge alla 0.7.0 per gestire Remote Control da qui.</div>';
+        const lanes = boardData.swimlanes.filter(l => l.local_path);
+        if (!lanes.length) return '<div class="dash-empty">Collega un progetto a una cartella locale (Kanban → 🔗 Projects).</div>';
+        return `<div class="dash-sub" style="margin-bottom:10px">Con Remote Control attivo su una cartella, i thread dei Claude Projects possono lavorare su ${escHtml(memWhere())} («Work locally») e le sessioni si seguono dal telefono. Gira finché il Bridge è acceso; «worktree» dà a ogni sessione la sua copia del repository.</div>`
+            + lanes.map(l => {
+                const st = rcServers.find(x => x.dir === l.local_path) || { status: 'stopped', spawn: 'same-dir', autostart: false, output: '' };
+                const [icon, label] = RC_STATES[st.status] || ['⚪', st.status];
+                const on = ['running', 'starting', 'waiting'].includes(st.status);
+                const id = escHtml(l.id);
+                return `<div class="dash-projcard">
+                    <div class="dash-projhead">
+                        <b>${escHtml(l.name)}</b><span class="sess-badge">${icon} ${label}</span>
+                        ${st.url ? `<a href="${escHtml(st.url)}" target="_blank" rel="noopener" style="font-size:12px">apri su claude.ai</a>` : ''}
+                        <span style="flex:1"></span>
+                        <label style="font-size:12px" title="Ogni sessione lavora in una sua git worktree (serve un repository git)"><input type="checkbox" id="rcWt_${id}" ${st.spawn === 'worktree' ? 'checked' : ''} ${on ? 'disabled' : ''}> worktree</label>
+                        <label style="font-size:12px" title="Riavvia Remote Control su questa cartella ogni volta che parte il Bridge"><input type="checkbox" ${st.autostart ? 'checked' : ''} onchange="rcAutostart('${id}', this.checked)"> all'avvio del Bridge</label>
+                        ${on ? `<button class="btn" style="padding:2px 10px;font-size:12px" onclick="rcCmd('${id}','stop')">⏹ Ferma</button>`
+                             : `<button class="btn btn-primary" style="padding:2px 10px;font-size:12px" onclick="rcCmd('${id}','start')">▶ Avvia</button>`}
+                    </div>
+                    <div class="dash-sub">${escHtml(l.local_path)}</div>
+                    ${st.status === 'waiting' ? `<div style="display:flex;gap:8px;align-items:center;margin-top:6px;padding:6px 8px;border:1px solid var(--accent);border-radius:6px">
+                        <span style="flex:1;font-size:13px">Claude Code chiede: <b>${escHtml(st.question)}</b></span>
+                        <button class="btn btn-primary" style="padding:2px 12px" onclick="rcCmd('${id}','yes')">Sì</button>
+                        <button class="btn" style="padding:2px 12px" onclick="rcCmd('${id}','no')">No</button></div>` : ''}
+                    ${st.output ? `<details style="margin-top:4px"><summary style="font-size:12px;cursor:pointer">Output</summary><div class="mem-pre" style="max-height:220px">${escHtml(st.output.split('\n').slice(-40).join('\n'))}</div></details>` : ''}
+                </div>`;
+            }).join('');
+    }
+
+    async function rcCmd(laneId, cmd) {
+        const lane = boardData.swimlanes.find(l => l.id === laneId);
+        if (!lane) return;
+        const wt = document.getElementById('rcWt_' + laneId);
+        if (cmd === 'start' && !confirm('Avviare Remote Control su «' + lane.name + '» (' + memWhere() + ')?\nDal tuo account claude.ai si potrà far lavorare Claude in questa cartella.')) return;
+        const path = { start: '/rc/start', stop: '/rc/stop', yes: '/rc/answer', no: '/rc/answer' }[cmd];
+        try {
+            await claudeBridgePost(path, { dir: lane.local_path, name: lane.name, spawn: wt && wt.checked ? 'worktree' : 'same-dir', yes: cmd === 'yes' }, 'gestire Remote Control');
+        } catch (e) { toast('Non riuscito: ' + e.message, 'error'); }
+        setTimeout(rcFetch, 600);
+    }
+
+    async function rcAutostart(laneId, on) {
+        const lane = boardData.swimlanes.find(l => l.id === laneId);
+        const wt = document.getElementById('rcWt_' + laneId);
+        if (!lane) return;
+        try {
+            await claudeBridgePost('/rc/autostart', { dir: lane.local_path, name: lane.name, spawn: wt && wt.checked ? 'worktree' : 'same-dir', autostart: on }, 'gestire Remote Control');
+            toast(on ? 'Remote Control partirà con il Bridge su ' + lane.name : 'Avvio automatico tolto', 'success');
+        } catch (e) { toast('Non riuscito: ' + e.message, 'error'); }
+        rcFetch();
+    }
+
+    // === ROUTINE DI CLAUDE CODE: registro ed «Esegui ora» ===
+    // Il token del trigger API resta sul server (mai nel browser): qui solo nome, link e storico.
+    let routineEditing = null; // id della routine in modifica, 'new' per una nuova
+
+    function routinesHtml() {
+        const list = boardData.routines || [];
+        const lanes = boardData.swimlanes;
+        const form = r => `<div class="dash-projcard">
+            <div class="form-group" style="margin-bottom:6px"><label style="font-size:11px">Nome</label><input type="text" id="rtnName" value="${escHtml(r.name || '')}" placeholder="es. Claude Do"></div>
+            <div class="form-group" style="margin-bottom:6px"><label style="font-size:11px">Progetto (facoltativo)</label>
+                <select id="rtnLane"><option value="">—</option>${lanes.map(l => `<option value="${escHtml(l.id)}" ${l.id === r.lane_id ? 'selected' : ''}>${escHtml(l.name)}</option>`).join('')}</select></div>
+            <div class="form-group" style="margin-bottom:6px"><label style="font-size:11px">Pagina della routine (claude.ai/code/routines/…)</label><input type="text" id="rtnPage" value="${escHtml(r.routine_url || '')}" placeholder="https://claude.ai/code/routines/..."></div>
+            <div class="form-group" style="margin-bottom:6px"><label style="font-size:11px">URL API del trigger</label><input type="text" id="rtnFire" value="${escHtml(r.fire_url || '')}" placeholder="https://api.anthropic.com/v1/claude_code/routines/trig_.../fire"></div>
+            <div class="form-group" style="margin-bottom:6px"><label style="font-size:11px">Token del trigger ${r.has_token ? '(già salvato: lascia vuoto per non cambiarlo)' : ''}</label><input type="password" id="rtnToken" autocomplete="off" placeholder="sk-ant-..."></div>
+            <div class="form-group" style="margin-bottom:6px"><label style="font-size:11px">Testo da passare a ogni «Esegui ora» (facoltativo)</label><input type="text" id="rtnText" value="${escHtml(r.default_text || '')}"></div>
+            <div class="dash-sub">URL e token: su claude.ai/code/routines apri la routine → Modifica → Aggiungi trigger → API → copia l'URL e genera il token (si vede una volta sola). Il token resta sul server di _Ykan.</div>
+            <div style="display:flex;gap:8px;margin-top:6px"><button class="btn btn-primary" onclick="routineSave('${escHtml(r.id || '')}')">Salva</button><button class="btn" onclick="routineEditing=null;claudeRenderBody()">Annulla</button></div>
+        </div>`;
+        return `<div style="display:flex;gap:8px;align-items:center;margin-bottom:10px">
+                <button class="btn btn-primary" onclick="routineEditing='new';claudeRenderBody()">＋ Aggiungi routine</button>
+                <a href="https://claude.ai/code/routines" target="_blank" rel="noopener" style="font-size:12px">Le tue routine su claude.ai</a>
+            </div>`
+            + (routineEditing === 'new' ? form({}) : '')
+            + (list.length ? list.map(r => {
+                if (routineEditing === r.id) return form(r);
+                const lane = lanes.find(l => l.id === r.lane_id);
+                const last = (r.runs || [])[0];
+                return `<div class="dash-projcard">
+                    <div class="dash-projhead">
+                        <b>${escHtml(r.name)}</b>${lane ? `<span class="git-tag">${escHtml(lane.name)}</span>` : ''}
+                        ${r.routine_url ? `<a href="${escHtml(r.routine_url)}" target="_blank" rel="noopener" style="font-size:12px">pagina</a>` : ''}
+                        <span style="flex:1"></span>
+                        <button class="btn btn-primary" style="padding:2px 10px;font-size:12px" ${r.fire_url && r.has_token ? '' : 'disabled title="Serve URL API e token"'} onclick="routineFire('${escHtml(r.id)}')">▶ Esegui ora</button>
+                        <button class="btn" style="padding:2px 8px;font-size:12px" onclick="routineEditing='${escHtml(r.id)}';claudeRenderBody()">✏️</button>
+                        <button class="btn btn-danger" style="padding:2px 8px;font-size:12px" onclick="routineDelete('${escHtml(r.id)}')">🗑️</button>
+                    </div>
+                    ${last ? `<div class="dash-sub">Ultimo avvio ${escHtml(last.at)}: ${last.ok ? `<a href="${escHtml(last.session_url)}" target="_blank" rel="noopener">apri la sessione</a>` : '<span style="color:#dc2626">' + escHtml(last.error) + '</span>'}</div>`
+                          : (!r.fire_url || !r.has_token ? '<div class="dash-sub">Manca il trigger API: modifica la routine per aggiungere URL e token.</div>' : '')}
+                </div>`;
+            }).join('') : (routineEditing === 'new' ? '' : '<div class="dash-empty">Nessuna routine registrata. Aggiungi ad esempio «Claude Do» o «Sistema Vacanze» per avviarle da qui.</div>'));
+    }
+
+    async function routineSave(id) {
+        const payload = { id, name: document.getElementById('rtnName').value, lane_id: document.getElementById('rtnLane').value,
+            routine_url: document.getElementById('rtnPage').value, fire_url: document.getElementById('rtnFire').value,
+            token: document.getElementById('rtnToken').value, default_text: document.getElementById('rtnText').value };
+        const res = await api('routine_save', payload);
+        if (!res.success) return;
+        boardData.routines = boardData.routines || [];
+        const i = boardData.routines.findIndex(r => r.id === res.routine.id);
+        if (i >= 0) boardData.routines[i] = res.routine; else boardData.routines.push(res.routine);
+        routineEditing = null;
+        claudeRenderBody();
+    }
+
+    async function routineDelete(id) {
+        const r = (boardData.routines || []).find(x => x.id === id);
+        if (!r || !confirm('Togliere «' + r.name + '» da _Ykan? La routine su claude.ai resta com\'è.')) return;
+        const res = await api('routine_delete', { id });
+        if (!res.success) return;
+        boardData.routines = boardData.routines.filter(x => x.id !== id);
+        claudeRenderBody();
+    }
+
+    async function routineFire(id) {
+        const r = (boardData.routines || []).find(x => x.id === id);
+        if (!r) return;
+        const text = prompt('Avvio «' + r.name + '». Testo da passare alla routine (facoltativo):', r.default_text || '');
+        if (text === null) return;
+        const win = window.open('about:blank', '_blank');
+        const res = await api('routine_fire', { id, text });
+        if (res.runs) r.runs = res.runs;
+        claudeRenderBody();
+        if (res.success && res.session_url) { if (win) win.location.href = res.session_url; }
+        else if (win) win.close();
+    }
+
+    // === MEMORIA: modifica dei file e ottimizzazione con Claude ===
+    // Fonti (dal Bridge): memory = auto memory del progetto (MEMORY.md è l'indice),
+    // project = CLAUDE.md nella cartella, user = ~/.claude/CLAUDE.md (vale per tutti i progetti).
+    // Le scritture passano dal Bridge, che fa un backup e rifiuta se il file è cambiato nel frattempo.
+    let claudeReview = {};          // laneId -> riepilogo snapshot/proposte (memory_review_get)
+    const memFiles = {};            // chiave "mem|lane|source|file" -> { content, sha }
+    const memEditing = new Set();   // chiavi in modifica
+
+    function memSourceBadge(f) {
+        const src = f.source || 'memory';
+        if (src === 'project') return '<span class="git-tag" title="CLAUDE.md nella cartella del progetto">progetto</span>';
+        if (src === 'user') return '<span class="git-tag" title="~/.claude/CLAUDE.md: vale per tutti i progetti">utente · globale</span>';
+        return f.index ? '<span class="git-tag" title="Indice della memoria: Claude lo legge a ogni sessione">indice</span>' : '';
+    }
+
+    function memParseKey(key) {
+        const [, laneId, source, ...rest] = key.split('|');
+        return { laneId, source, file: rest.join('|'), lane: boardData.swimlanes.find(l => l.id === laneId) };
+    }
+
+    function memFileUrl(lane, source, file) {
+        return '/claude/memory/file?dir=' + encodeURIComponent(lane.local_path) + '&source=' + encodeURIComponent(source) + '&file=' + encodeURIComponent(file);
+    }
+
+    async function memLoadFile(key) {
+        const { lane, source, file } = memParseKey(key);
+        if (!lane) throw new Error('progetto non trovato');
+        const r = await bridgeFetch(memFileUrl(lane, source, file));
+        const j = await r.json();
+        if (!r.ok) throw new Error(j.error || 'HTTP ' + r.status);
+        memFiles[key] = { content: j.content, sha: j.sha };
+        return memFiles[key];
+    }
+
+    function memWhere() { return bridgeIsRemote() ? '«' + bridgeTargetName() + '»' : 'questo PC'; }
+
+    function memRenderFile(key) {
+        const el = document.getElementById('claudeContent_' + key.replace(/[^\w]/g, '_'));
+        const f = memFiles[key];
+        if (!el || !f) return;
+        const { source, file } = memParseKey(key);
+        const k = escHtml(key).replace(/'/g, '&#39;');
+        if (memEditing.has(key)) {
+            el.innerHTML = `<textarea id="memEdit_${key.replace(/[^\w]/g, '_')}" class="mem-edit" spellcheck="false">${escHtml(f.content)}</textarea>
+                <div style="display:flex;gap:8px;margin-top:6px">
+                    <button class="btn btn-primary" onclick="memSave('${k}')">💾 Salva</button>
+                    <button class="btn" onclick="memEditing.delete('${k}');memRenderFile('${k}')">Annulla</button>
+                    <span style="font-size:11px;color:var(--text2);align-self:center">Prima di salvare il Bridge fa una copia in ~/.ykan-bridge-backups/memory</span>
+                </div>`;
+            return;
+        }
+        const canDelete = source === 'memory' && file !== 'MEMORY.md';
+        el.innerHTML = `<div class="mem-pre">${escHtml(f.content)}</div>
+            <div style="display:flex;gap:8px;margin-top:6px">
+                <button class="btn" onclick="memEditing.add('${k}');memRenderFile('${k}')">✏️ Modifica</button>
+                ${canDelete ? `<button class="btn btn-danger" onclick="memDelete('${k}')">🗑️ Elimina</button>` : ''}
+            </div>`;
+    }
+
+    // Scrive (o elimina) tramite Bridge. base_sha: hash del contenuto di partenza ('' = il file non deve esistere).
+    async function memBridgeWrite(lane, source, file, op, content, baseSha) {
+        const path = op === 'delete' ? '/claude/memory/delete' : '/claude/memory/write';
+        const r = await bridgeFetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ dir: lane.local_path, source, file, content, base_sha: baseSha }) });
+        let j = {};
+        try { j = await r.json(); } catch (_) { }
+        if (r.status === 404) throw new Error('il Bridge di ' + memWhere() + ' è di una versione precedente: aggiornalo alla 0.5.0 (Settings → Strumenti)');
+        if (r.status === 409) throw new Error('il file è cambiato nel frattempo: ricaricalo e riprova');
+        if (!r.ok) throw new Error(j.error || 'HTTP ' + r.status);
+        return j;
+    }
+
+    async function memSave(key) {
+        const { lane, source, file } = memParseKey(key);
+        const ta = document.getElementById('memEdit_' + key.replace(/[^\w]/g, '_'));
+        if (!lane || !ta || !memFiles[key]) return;
+        if (source === 'user' && !confirm('~/.claude/CLAUDE.md vale per TUTTI i progetti. Salvare la modifica su ' + memWhere() + '?')) return;
+        if (source !== 'user' && bridgeIsRemote() && !confirm('Salvare ' + file + ' su ' + memWhere() + '?')) return;
+        try {
+            const j = await memBridgeWrite(lane, source, file, 'write', ta.value, memFiles[key].sha);
+            memFiles[key] = { content: ta.value, sha: j.sha };
+            memEditing.delete(key);
+            toast('Salvato ' + file, 'success');
+            claudeFetchMemory();
+        } catch (e) { toast('Non salvato: ' + e.message, 'error'); }
+    }
+
+    async function memDelete(key) {
+        const { lane, source, file } = memParseKey(key);
+        if (!lane || !memFiles[key]) return;
+        if (!confirm('Eliminare ' + file + ' su ' + memWhere() + '? Il Bridge ne tiene una copia in ~/.ykan-bridge-backups/memory.\nRicordati di togliere la sua voce da MEMORY.md.')) return;
+        try {
+            await memBridgeWrite(lane, source, file, 'delete', '', memFiles[key].sha);
+            claudeExpanded.delete(key); delete memFiles[key];
+            toast('Eliminato ' + file, 'success');
+            claudeFetchMemory();
+        } catch (e) { toast('Non eliminato: ' + e.message, 'error'); }
+    }
+
+    // Prompt per il thread che analizza la memoria: legge lo snapshot via MCP e lascia proposte.
+    function memOptimizePrompt(lane) {
+        const n = lane.name;
+        return [
+            `Ottimizza la memoria di Claude Code del progetto «${n}» della board _Ykan. Non modificare nessun file direttamente: lavori solo con il connettore MCP di _Ykan.`,
+            ``,
+            `1. Chiama memory_snapshot(project: "${n}"). Contiene i CLAUDE.md del progetto, il CLAUDE.md utente (vale per tutti i progetti), l'indice MEMORY.md con i suoi file di memoria, i task aperti e quelli chiusi negli ultimi 90 giorni.`,
+            `2. Cerca:`,
+            `   - informazioni duplicate in più file;`,
+            `   - informazioni superate: cose descritte come da fare o in corso che risultano chiuse fra i task, decisioni poi cambiate${lane.github_repo ? `, dettagli che non corrispondono più al codice del repository ${lane.github_repo} (se serve controllalo)` : ''};`,
+            `   - contraddizioni tra file;`,
+            `   - voci di MEMORY.md che puntano a file inesistenti, o file di memoria senza voce nell'indice;`,
+            `   - testo prolisso che si può dire in meno righe senza perdere informazioni.`,
+            `3. Chiama memory_propose(project: "${n}", summary, proposals) con al massimo una proposta per file:`,
+            `   - action "edit" con il contenuto completo nuovo del file in new_content (mantieni il frontmatter YAML dei file di memoria);`,
+            `   - action "delete" per un file di memoria da eliminare dopo averne spostato altrove il contenuto ancora utile (mai MEMORY.md);`,
+            `   - action "create" per un nuovo file di memoria;`,
+            `   - per ognuna kind (duplicate, stale, contradiction, broken_link, cleanup) e reason: una riga in italiano.`,
+            `Regole: non togliere informazioni ancora valide; unendo duplicati tieni il testo nel posto più adatto (regole valide ovunque nel CLAUDE.md utente, regole del repository nel CLAUDE.md del progetto, il resto nei file di memoria) e aggiorna MEMORY.md di conseguenza; tocca il CLAUDE.md utente solo se serve davvero, perché vale per tutti i progetti.`,
+            `Alla fine scrivimi un riepilogo breve. Applicherò io le proposte dalla board.`
+        ].join('\n');
+    }
+
+    async function memOptimize() {
+        const laneId = document.getElementById('claudeMemProject').value;
+        const lane = boardData.swimlanes.find(l => l.id === laneId);
+        const mem = claudeMemory[laneId];
+        if (!lane || !mem || !mem.files || !mem.files.length) { toast('Nessuna memoria da analizzare per questo progetto', 'error'); return; }
+        const win = window.open('about:blank', '_blank'); // subito, prima degli await: altrimenti il browser blocca il popup
+        try {
+            toast('Raccolgo i file di memoria…', 'info');
+            const files = await Promise.all(mem.files.map(async f => {
+                const r = await bridgeFetch(memFileUrl(lane, f.source || 'memory', f.file));
+                const j = await r.json();
+                if (!r.ok) throw new Error(f.file + ': ' + (j.error || 'HTTP ' + r.status));
+                return { source: f.source || 'memory', file: f.file, content: j.content, modified: f.modified };
+            }));
+            const res = await api('memory_snapshot_save', { lane_id: laneId, files, pc: bridgeIsRemote() ? bridgeTargetName() : '' });
+            if (!res.success) throw new Error(res.error || 'snapshot non salvato');
+            claudeReview[laneId] = res.review;
+            claudeRenderBody();
+            await navigator.clipboard.writeText(memOptimizePrompt(lane)).catch(() => {});
+            if (win) win.location.href = lane.claude_project_url || 'https://claude.ai/code';
+            toast('Snapshot salvato e prompt copiato: incollalo nella sessione Claude appena aperta', 'success');
+        } catch (e) {
+            if (win) win.close();
+            toast('Ottimizzazione non avviata: ' + e.message, 'error');
+        }
+    }
+
+    function memCopyPrompt() {
+        const lane = boardData.swimlanes.find(l => l.id === document.getElementById('claudeMemProject').value);
+        if (!lane) return;
+        navigator.clipboard.writeText(memOptimizePrompt(lane)).then(() => toast('Prompt copiato'), () => toast('Copia non riuscita', 'error'));
+    }
+
+    async function memRefreshReview() {
+        const laneId = document.getElementById('claudeMemProject').value;
+        const r = await api('memory_review_get', { lane_id: laneId });
+        claudeReview[laneId] = r.success ? r.review : null;
+        claudeRenderBody();
+    }
+
+    const MEM_KINDS = { duplicate: '🔁 Duplicato', stale: '🕰️ Superato', contradiction: '⚔️ Contraddizione',
+        broken_link: '🔗 Indice', cleanup: '🧹 Pulizia', other: '📝 Altro' };
+    const MEM_ACTIONS = { edit: 'modifica', delete: 'elimina', create: 'nuovo file' };
+
+    // Differenze riga per riga (LCS): i file di memoria sono piccoli, basta e avanza.
+    function memLineDiff(a, b) {
+        const x = a.split('\n'), y = b.split('\n');
+        if (x.length * y.length > 4e6) return [...x.map(s => ['-', s]), ...y.map(s => ['+', s])];
+        const m = x.length, n = y.length;
+        const L = Array.from({ length: m + 1 }, () => new Uint32Array(n + 1));
+        for (let i = m - 1; i >= 0; i--) for (let j = n - 1; j >= 0; j--)
+            L[i][j] = x[i] === y[j] ? L[i + 1][j + 1] + 1 : Math.max(L[i + 1][j], L[i][j + 1]);
+        const out = []; let i = 0, j = 0;
+        while (i < m && j < n) {
+            if (x[i] === y[j]) { out.push([' ', x[i]]); i++; j++; }
+            else if (L[i + 1][j] >= L[i][j + 1]) out.push(['-', x[i++]]);
+            else out.push(['+', y[j++]]);
+        }
+        while (i < m) out.push(['-', x[i++]]);
+        while (j < n) out.push(['+', y[j++]]);
+        return out;
+    }
+
+    function memDiffHtml(p) {
+        const rows = memLineDiff(p.old_content || '', p.action === 'delete' ? '' : (p.new_content || ''));
+        // Le righe uguali lontane dai cambiamenti si comprimono
+        const near = rows.map((r, i) => r[0] !== ' ' || rows.slice(Math.max(0, i - 2), i + 3).some(q => q[0] !== ' '));
+        let html = '', skipped = 0;
+        rows.forEach((r, i) => {
+            if (!near[i]) { skipped++; return; }
+            if (skipped) { html += `<div class="mem-diff-skip">… ${skipped} righe uguali …</div>`; skipped = 0; }
+            html += `<div class="${r[0] === '+' ? 'mem-diff-add' : r[0] === '-' ? 'mem-diff-del' : ''}">${r[0]} ${escHtml(r[1])}</div>`;
+        });
+        if (skipped) html += `<div class="mem-diff-skip">… ${skipped} righe uguali …</div>`;
+        return `<div class="mem-diff">${html}</div>`;
+    }
+
+    function memReviewHtml(laneId) {
+        const rv = claudeReview[laneId];
+        const head = `<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
+            <button class="btn btn-primary" onclick="memOptimize()" title="Salva uno snapshot dei file di memoria e apre Claude con il prompt per analizzarli">🧹 Ottimizza con Claude</button>
+            ${rv ? `<button class="btn" onclick="memCopyPrompt()">📋 Copia prompt</button>
+                    <button class="btn" onclick="memRefreshReview()">↻ Proposte</button>
+                    <span style="font-size:12px;color:var(--text2)">Snapshot del ${escHtml(rv.snapshot_at || '')}${rv.pc ? ' da ' + escHtml(rv.pc) : ''}${rv.proposed_at ? ' · proposte del ' + escHtml(rv.proposed_at) : ' · in attesa delle proposte di Claude'}</span>` : ''}
+        </div>`;
+        if (!rv || !(rv.proposals || []).length) return head;
+        const pending = rv.proposals.filter(p => p.status === 'pending');
+        const done = rv.proposals.length - pending.length;
+        return head + `<div class="dash-projcard" style="margin-bottom:12px">
+            <div class="dash-projhead"><b>Proposte di Claude</b><span style="flex:1"></span>
+                <span class="dash-when">${pending.length} da decidere${done ? ' · ' + done + ' già decise' : ''}</span></div>
+            ${rv.summary ? `<div class="dash-sub" style="white-space:pre-wrap">${escHtml(rv.summary)}</div>` : ''}
+            ${rv.proposals.map(p => `<div style="border-top:1px solid var(--border);padding:8px 0">
+                <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+                    <span class="sess-badge">${MEM_KINDS[p.kind] || p.kind}</span>
+                    <b style="font-size:13px">${escHtml(p.file)}</b>
+                    ${memSourceBadge({ source: p.source, index: p.source === 'memory' && p.file === 'MEMORY.md' })}
+                    <span style="font-size:11px;color:var(--text2)">${MEM_ACTIONS[p.action] || p.action}</span>
+                    <span style="flex:1"></span>
+                    ${p.status === 'pending'
+                        ? `<button class="btn btn-primary" style="padding:2px 10px;font-size:12px" onclick="memApplyProposal('${escHtml(laneId)}','${escHtml(p.id)}')">Applica</button>
+                           <button class="btn" style="padding:2px 10px;font-size:12px" onclick="memDecide('${escHtml(laneId)}','${escHtml(p.id)}','rejected')">Scarta</button>`
+                        : `<span class="sess-badge${p.status === 'applied' ? ' done' : ''}">${p.status === 'applied' ? '✔ applicata' : '✕ scartata'}</span>`}
+                </div>
+                ${p.reason ? `<div style="font-size:12px;color:var(--text2);margin-top:2px">${escHtml(p.reason)}</div>` : ''}
+                ${p.status === 'pending' ? `<details style="margin-top:4px"><summary style="font-size:12px;cursor:pointer">Mostra le modifiche</summary>${memDiffHtml(p)}</details>` : ''}
+            </div>`).join('')}
+        </div>`;
+    }
+
+    async function memDecide(laneId, id, status) {
+        const r = await api('memory_proposal_state', { lane_id: laneId, id, status });
+        if (!r.success) return;
+        const p = (claudeReview[laneId]?.proposals || []).find(x => x.id === id);
+        if (p) p.status = status;
+        claudeRenderBody();
+    }
+
+    async function memApplyProposal(laneId, id) {
+        const lane = boardData.swimlanes.find(l => l.id === laneId);
+        const p = (claudeReview[laneId]?.proposals || []).find(x => x.id === id);
+        if (!lane || !p) return;
+        const what = p.action === 'delete' ? 'Eliminare ' + p.file : p.action === 'create' ? 'Creare ' + p.file : 'Modificare ' + p.file;
+        if (!confirm(what + ' su ' + memWhere() + '?' + (p.source === 'user' ? '\n~/.claude/CLAUDE.md vale per TUTTI i progetti.' : '') + '\nIl Bridge fa prima una copia del file.')) return;
+        try {
+            await memBridgeWrite(lane, p.source, p.file, p.action === 'delete' ? 'delete' : 'write', p.new_content, p.action === 'create' ? '' : p.base_sha);
+        } catch (e) {
+            toast('Non applicata: ' + e.message.replace('ricaricalo e riprova', 'rilancia «Ottimizza con Claude»'), 'error');
+            return;
+        }
+        Object.keys(memFiles).forEach(k => { if (k.startsWith('mem|' + laneId + '|')) delete memFiles[k]; });
+        await memDecide(laneId, id, 'applied');
+        toast('Applicata: ' + p.file, 'success');
+        claudeFetchMemory();
     }
 
     // === BADGE CONSUMO CLAUDE (via estensione Chrome "Ykan Usage Badge", vedi extension/) ===

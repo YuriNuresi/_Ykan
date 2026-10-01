@@ -105,9 +105,13 @@ async function heartbeat() {
 // Il Bridge chiede alla board "ci sono comandi per me?" (?bridge=poll, la richiesta resta aperta
 // qualche secondo), esegue ogni comando su se stesso come se arrivasse dalla board (stessi
 // controlli di sempre) e rimanda la risposta (?bridge=result). Solo i percorsi di questo elenco,
-// lo stesso che controlla il server: letture e apertura di Claude Desktop, niente shell.
+// lo stesso che controlla il server: letture, apertura di Claude Desktop e file di memoria
+// (solo quelli ammessi da memoryPath, con backup), niente shell.
 const RELAY_PATHS = new Set(['/sessions', '/session', '/reviews', '/git', '/claude/skills', '/claude/skill',
-    '/claude/memory', '/claude/memory/file', '/desktop-archive', '/desktop/new', '/desktop/resume']);
+    '/claude/memory', '/claude/memory/file', '/claude/memory/write', '/claude/memory/delete',
+    '/claude/skill/write', '/claude/skill/override', '/claude/skill/copy', '/claude/plugins', '/claude/plugins/toggle',
+    '/rc', '/rc/start', '/rc/stop', '/rc/answer', '/rc/autostart',
+    '/desktop-archive', '/desktop/new', '/desktop/resume']);
 
 function selfRequest(method, p, body, origin) {
     return new Promise(resolve => {
@@ -184,7 +188,10 @@ function startRemoteSession(dir, prompt, name) {
 function openUrl(u) {
     const [cmd, args] = process.platform === 'win32' ? ['rundll32.exe', ['url.dll,FileProtocolHandler', u]]
         : process.platform === 'darwin' ? ['open', [u]] : ['xdg-open', [u]];
-    spawnProcess(cmd, args, { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+    const child = spawnProcess(cmd, args, { detached: true, stdio: 'ignore', windowsHide: true });
+    // senza questo, un apri-link mancante (es. xdg-open) farebbe cadere tutto il Bridge
+    child.on('error', e => console.error('Link non aperto (' + cmd + '): ' + e.message));
+    child.unref();
 }
 
 function linkInfo() {
@@ -200,7 +207,7 @@ function claudeProjectDirName(localPath) {
     return localPath.replace(/[^a-zA-Z0-9]/g, '-');
 }
 
-// === CLAUDE SKILLS & MEMORIA (pannello Claude, sola lettura da ~/.claude) ===
+// === CLAUDE SKILLS, PLUGIN & MEMORIA (pannello Claude della board) ===
 // Skills sono globali (~/.claude/skills/<nome>/SKILL.md, alcune sono symlink verso
 // ~/.agents/skills — le seguiamo). La memoria e' per-progetto: stessa cartella
 // (~/.claude/projects/<claudeProjectDirName(local_path)>/memory/) gia' usata per le
@@ -223,43 +230,278 @@ function parseFrontmatter(raw) {
     };
 }
 
-function listSkills() {
-    const dir = path.join(claudeHome(), 'skills');
-    if (!fs.existsSync(dir)) return [];
-    const out = [];
-    for (const name of fs.readdirSync(dir)) {
-        const file = path.join(dir, name, 'SKILL.md');
-        let raw, stat;
-        try { raw = fs.readFileSync(file, 'utf8'); stat = fs.statSync(file); } catch (_) { continue; }
-        const meta = parseFrontmatter(raw);
-        out.push({ id: name, name: meta.name || name, description: meta.description || '', modified: stat.mtime.toISOString() });
+// === SKILL: utente (~/.claude/skills, anche quelle sincronizzate da claude.ai in synced/) e
+// progetto (<cartella>/.claude/skills). Lo stato di ognuna viene da skillOverrides nei settings:
+// utente ~/.claude/settings.json, progetto .claude/settings.json (condiviso, qui solo letto),
+// locale .claude/settings.local.json (solo per te). Precedenza: locale > progetto > utente.
+const SKILL_STATES = ['on', 'name-only', 'user-invocable-only', 'off'];
+const SKILL_BACKUP_DIR = path.join(os.homedir(), '.ykan-bridge-backups', 'skills');
+
+function skillsRoot(source, localPath) {
+    if (source === 'user') return path.join(claudeHome(), 'skills');
+    if (source === 'synced') return path.join(claudeHome(), 'skills', 'synced');
+    if (source === 'project') {
+        if (!localPath || !fs.existsSync(localPath)) throw new Error('cartella del progetto inesistente su questo PC');
+        return path.join(localPath, '.claude', 'skills');
     }
+    throw new Error('fonte non valida');
+}
+
+function skillFile(source, localPath, id) {
+    // niente '.', '..' o nomi nascosti: il nome resta una sola cartella dentro skills/
+    if (!/^[\w-][\w.-]*$/.test(id) || id.includes('..') || id === 'synced') throw new Error('nome non valido');
+    return path.join(skillsRoot(source, localPath), id, 'SKILL.md');
+}
+
+function settingsFile(scope, localPath) {
+    if (scope === 'user') return path.join(claudeHome(), 'settings.json');
+    if (!localPath || !fs.existsSync(localPath)) throw new Error('cartella del progetto inesistente su questo PC');
+    if (scope === 'project') return path.join(localPath, '.claude', 'settings.json');
+    if (scope === 'local') return path.join(localPath, '.claude', 'settings.local.json');
+    throw new Error('ambito non valido');
+}
+
+function readSettings(file) {
+    if (!fs.existsSync(file)) return {};
+    const raw = fs.readFileSync(file, 'utf8');
+    if (!raw.trim()) return {};
+    try { return JSON.parse(raw); }
+    catch (_) { throw new Error(path.basename(file) + ' non è JSON valido: correggilo a mano prima di cambiare le skill da qui'); }
+}
+
+function skillOverridesFor(localPath) {
+    const read = scope => { try { return (readSettings(settingsFile(scope, localPath)).skillOverrides) || {}; } catch (_) { return {}; } };
+    return { user: read('user'), project: localPath ? read('project') : {}, local: localPath ? read('local') : {} };
+}
+
+function listSkills(localPath) {
+    const ov = skillOverridesFor(localPath);
+    const out = [];
+    const scan = source => {
+        let root;
+        try { root = skillsRoot(source, localPath); } catch (_) { return; }
+        if (!fs.existsSync(root)) return;
+        for (const id of fs.readdirSync(root)) {
+            if (source === 'user' && (id === 'synced' || id === '.trash')) continue;
+            const file = path.join(root, id, 'SKILL.md');
+            let raw, stat;
+            try { raw = fs.readFileSync(file, 'utf8'); stat = fs.statSync(file); } catch (_) { continue; }
+            const meta = parseFrontmatter(raw);
+            const name = meta.name || id;
+            const st = { user: ov.user[name] || null, project: ov.project[name] || null, local: ov.local[name] || null };
+            out.push({ id, source, name, description: meta.description || '', modified: stat.mtime.toISOString(),
+                overrides: st, effective: st.local || st.project || st.user || 'on' });
+        }
+    };
+    scan('user'); scan('synced');
+    if (localPath) scan('project');
     return out.sort((a, b) => a.name.localeCompare(b.name));
 }
 
-function readSkill(id) {
-    if (!/^[\w.-]+$/.test(id)) throw new Error('nome non valido');
-    return fs.readFileSync(path.join(claudeHome(), 'skills', id, 'SKILL.md'), 'utf8');
+function readSkill(id, source, localPath) {
+    const content = fs.readFileSync(skillFile(source || 'user', localPath, id), 'utf8');
+    return { content, sha: sha256(content) };
+}
+
+function backupInto(dir, abs, rel) {
+    if (!fs.existsSync(abs)) return null;
+    const stamp = new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').replace('.', '-').replace('Z', '');
+    let dest = path.join(dir, stamp, rel);
+    for (let n = 2; fs.existsSync(dest); n++) dest = path.join(dir, stamp + '-' + n, rel);
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    fs.copyFileSync(abs, dest);
+    return dest;
+}
+
+function writeSkill(id, source, localPath, content, baseSha) {
+    if (source === 'synced') throw new Error('le skill sincronizzate da claude.ai si modificano su claude.ai');
+    if (typeof content !== 'string' || !content.trim()) throw new Error('contenuto mancante');
+    if (Buffer.byteLength(content, 'utf8') > 300000) throw new Error('SKILL.md troppo grande');
+    const abs = skillFile(source, localPath, id);
+    if (!fs.existsSync(abs)) throw new Error('skill non trovata');
+    const cur = sha256(fs.readFileSync(abs, 'utf8'));
+    if (baseSha && baseSha !== cur) return { conflict: true, sha: cur };
+    const backup = backupInto(SKILL_BACKUP_DIR, abs, path.join(source, id, 'SKILL.md'));
+    fs.writeFileSync(abs + '.ykan-tmp', content, 'utf8');
+    fs.renameSync(abs + '.ykan-tmp', abs);
+    return { ok: true, sha: sha256(content), backup };
+}
+
+// Cambia lo stato di una skill in skillOverrides ("on" = togli la voce). Solo ambito utente o locale:
+// il settings.json condiviso del progetto si cambia nel repository, non da qui.
+function setSkillOverride(scope, localPath, name, state) {
+    if (!['user', 'local'].includes(scope)) throw new Error('ambito non modificabile da qui');
+    if (!/^[\w.:-]{1,100}$/.test(name)) throw new Error('nome skill non valido');
+    if (!SKILL_STATES.includes(state)) throw new Error('stato non valido');
+    const file = settingsFile(scope, localPath);
+    const settings = readSettings(file);
+    const ov = (settings.skillOverrides && typeof settings.skillOverrides === 'object') ? settings.skillOverrides : {};
+    if (state === 'on') delete ov[name]; else ov[name] = state;
+    if (Object.keys(ov).length) settings.skillOverrides = ov; else delete settings.skillOverrides;
+    const backup = backupInto(SKILL_BACKUP_DIR, file, path.join('settings', scope, path.basename(file)));
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file + '.ykan-tmp', JSON.stringify(settings, null, 2) + '\n', 'utf8');
+    fs.renameSync(file + '.ykan-tmp', file);
+    return { ok: true, file, backup };
+}
+
+// Copia una skill dell'utente nel progetto (.claude/skills/<id>): i thread cloud dei Claude Projects
+// caricano solo le skill del repository. Non sovrascrive: se esiste già, errore.
+function copySkillToProject(id, localPath) {
+    const src = path.dirname(skillFile('user', localPath, id));
+    if (!fs.existsSync(path.join(src, 'SKILL.md'))) throw new Error('skill non trovata tra quelle utente');
+    const dest = path.join(skillsRoot('project', localPath), id);
+    if (fs.existsSync(dest)) throw new Error('nel progetto esiste già una skill «' + id + '»');
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    fs.cpSync(src, dest, { recursive: true, dereference: true });
+    return { ok: true, path: dest };
+}
+
+// === PLUGIN: tramite la CLI di Claude Code (claude plugin list/enable/disable --json) ===
+function runClaude(args, cwd) {
+    const { execFile } = require('child_process');
+    return new Promise(resolve => {
+        execFile(resolveClaudeBin(), args, { cwd: cwd && fs.existsSync(cwd) ? cwd : os.homedir(), timeout: 60000,
+            windowsHide: true, maxBuffer: 8 * 1024 * 1024 }, (err, stdout, stderr) => {
+            resolve({ ok: !err, code: err ? err.code : 0, out: String(stdout || ''), err: String(stderr || (err && err.message) || '') });
+        });
+    });
+}
+
+function lastJsonLine(text) {
+    const lines = text.trim().split(/\r?\n/).reverse();
+    for (const l of lines) { try { return JSON.parse(l); } catch (_) { /* riga di testo */ } }
+    return null;
+}
+
+async function listPlugins(localPath) {
+    const r = await runClaude(['plugin', 'list', '--json'], localPath);
+    if (r.code === 'ENOENT') throw new Error('Claude Code non trovato su questo PC');
+    let list = null;
+    try { list = JSON.parse(r.out); } catch (_) { const i = r.out.indexOf('['); if (i >= 0) try { list = JSON.parse(r.out.slice(i)); } catch (_) { } }
+    if (!Array.isArray(list)) throw new Error((r.err || r.out || 'risposta non valida da claude plugin list').trim().slice(0, 300));
+    return list.map(p => ({ id: String(p.id || ''), version: String(p.version || ''), scope: String(p.scope || ''),
+        enabled: !!p.enabled, errors: Array.isArray(p.errors) ? p.errors.slice(0, 5).map(String) : [],
+        projectPath: p.projectPath || '', hasUserConfig: !!p.hasUserConfig, projectEnabled: !!p.projectEnabled }));
+}
+
+async function togglePlugin(id, enabled, scope, localPath) {
+    if (!/^[\w.@:-]{1,200}$/.test(id) || /@(inline|skills-dir|synced)$/.test(id)) throw new Error('plugin non gestibile da qui');
+    const args = ['plugin', enabled ? 'enable' : 'disable', id, '--json'];
+    if (['user', 'project', 'local'].includes(scope)) args.push('--scope', scope);
+    const r = await runClaude(args, localPath);
+    const j = lastJsonLine(r.out);
+    if (j && (j.success || j.alreadyInGoalState)) return { ok: true };
+    throw new Error(((j && (j.error || j.message)) || r.err || r.out || 'comando non riuscito').toString().trim().slice(0, 300));
+}
+
+// === MEMORIA: tutte le fonti che Claude Code legge per un progetto ===
+// source "memory"  -> ~/.claude/projects/<dir>/memory/*.md (auto memory, indice MEMORY.md)
+// source "project" -> CLAUDE.md / CLAUDE.local.md / .claude/CLAUDE.md nella cartella del progetto
+// source "user"    -> ~/.claude/CLAUDE.md (vale per tutti i progetti)
+// Le scritture passano solo da memoryPath(): niente percorsi liberi, solo questi file.
+const PROJECT_MEMORY_FILES = ['CLAUDE.md', 'CLAUDE.local.md', '.claude/CLAUDE.md'];
+const MEMORY_BACKUP_DIR = path.join(os.homedir(), '.ykan-bridge-backups', 'memory');
+const MEMORY_MAX_BYTES = 200000;
+
+function memoryDir(localPath) {
+    return path.join(claudeHome(), 'projects', claudeProjectDirName(localPath), 'memory');
+}
+
+function memoryPath(localPath, source, file) {
+    source = source || 'memory';
+    if (source === 'memory') {
+        if (!/^[\w.-]+\.md$/.test(file)) throw new Error('nome file non valido');
+        return path.join(memoryDir(localPath), file);
+    }
+    if (source === 'project') {
+        if (!PROJECT_MEMORY_FILES.includes(file)) throw new Error('file di progetto non ammesso');
+        if (!localPath || !fs.existsSync(localPath)) throw new Error('cartella del progetto inesistente su questo PC');
+        return path.join(localPath, file);
+    }
+    if (source === 'user') {
+        if (file !== 'CLAUDE.md') throw new Error('file utente non ammesso');
+        return path.join(claudeHome(), 'CLAUDE.md');
+    }
+    throw new Error('fonte non valida');
+}
+
+const sha256 = text => require('crypto').createHash('sha256').update(text, 'utf8').digest('hex');
+
+function memoryEntry(source, file, abs) {
+    try {
+        const raw = fs.readFileSync(abs, 'utf8');
+        const stat = fs.statSync(abs);
+        const meta = parseFrontmatter(raw);
+        return { source, file, name: meta.name || file.replace(/\.md$/, ''), description: meta.description || '',
+            type: meta.type || '', index: source === 'memory' && file === 'MEMORY.md',
+            modified: stat.mtime.toISOString(), size: stat.size };
+    } catch (_) { return null; }
 }
 
 function listProjectMemory(localPath) {
-    const dir = path.join(claudeHome(), 'projects', claudeProjectDirName(localPath), 'memory');
-    if (!fs.existsSync(dir)) return { exists: false, files: [] };
-    const files = fs.readdirSync(dir).filter(f => f.endsWith('.md') && f !== 'MEMORY.md');
-    const out = files.map(f => {
-        try {
-            const raw = fs.readFileSync(path.join(dir, f), 'utf8');
-            const stat = fs.statSync(path.join(dir, f));
-            const meta = parseFrontmatter(raw);
-            return { file: f, name: meta.name || f.replace(/\.md$/, ''), description: meta.description || '', type: meta.type || '', modified: stat.mtime.toISOString() };
-        } catch (_) { return null; }
-    }).filter(Boolean);
-    return { exists: true, files: out.sort((a, b) => b.modified.localeCompare(a.modified)) };
+    const dir = memoryDir(localPath);
+    const out = [];
+    if (fs.existsSync(dir)) {
+        for (const f of fs.readdirSync(dir).filter(f => f.endsWith('.md'))) out.push(memoryEntry('memory', f, path.join(dir, f)));
+    }
+    for (const f of PROJECT_MEMORY_FILES) {
+        if (localPath && fs.existsSync(path.join(localPath, f))) out.push(memoryEntry('project', f, path.join(localPath, f)));
+    }
+    const userFile = path.join(claudeHome(), 'CLAUDE.md');
+    if (fs.existsSync(userFile)) out.push(memoryEntry('user', 'CLAUDE.md', userFile));
+    const files = out.filter(Boolean).sort((a, b) => b.modified.localeCompare(a.modified));
+    return { exists: files.length > 0, files };
 }
 
-function readMemoryFile(localPath, file) {
-    if (!/^[\w.-]+\.md$/.test(file)) throw new Error('nome file non valido');
-    return fs.readFileSync(path.join(claudeHome(), 'projects', claudeProjectDirName(localPath), 'memory', file), 'utf8');
+function readMemoryFile(localPath, file, source) {
+    const content = fs.readFileSync(memoryPath(localPath, source, file), 'utf8');
+    return { content, sha: sha256(content) };
+}
+
+// Copia del file prima di cambiarlo: ~/.ykan-bridge-backups/memory/<data-ora>/<fonte>/<file>
+function backupMemoryFile(abs, source, file) {
+    if (!fs.existsSync(abs)) return null;
+    const stamp = new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').replace('.', '-').replace('Z', '');
+    let dest = path.join(MEMORY_BACKUP_DIR, stamp, source, file);
+    for (let n = 2; fs.existsSync(dest); n++) dest = path.join(MEMORY_BACKUP_DIR, stamp + '-' + n, source, file);
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    fs.copyFileSync(abs, dest);
+    return dest;
+}
+
+// base_sha = hash del contenuto da cui è partita la modifica: se nel frattempo il file è
+// cambiato (Claude ci ha scritto, o l'hai modificato altrove) la scrittura viene rifiutata.
+function checkBase(abs, baseSha) {
+    if (!fs.existsSync(abs)) return baseSha ? { conflict: true, sha: null } : { conflict: false };
+    const cur = sha256(fs.readFileSync(abs, 'utf8'));
+    return { conflict: baseSha !== undefined && baseSha !== null && baseSha !== cur, sha: cur };
+}
+
+function writeMemoryFile(localPath, source, file, content, baseSha) {
+    if (typeof content !== 'string') throw new Error('contenuto mancante');
+    if (Buffer.byteLength(content, 'utf8') > MEMORY_MAX_BYTES) throw new Error('file troppo grande');
+    const abs = memoryPath(localPath, source, file);
+    if (!fs.existsSync(abs) && source !== 'memory') throw new Error('si possono creare solo nuovi file di memoria');
+    const base = checkBase(abs, baseSha);
+    if (base.conflict) return { conflict: true, sha: base.sha };
+    const backup = backupMemoryFile(abs, source, file);
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    const tmp = abs + '.ykan-tmp';
+    fs.writeFileSync(tmp, content, 'utf8');
+    fs.renameSync(tmp, abs);
+    return { ok: true, sha: sha256(content), backup };
+}
+
+function deleteMemoryFile(localPath, source, file, baseSha) {
+    if (source !== 'memory' || file === 'MEMORY.md') throw new Error('si possono eliminare solo i file di memoria (non l\'indice MEMORY.md)');
+    const abs = memoryPath(localPath, source, file);
+    if (!fs.existsSync(abs)) return { ok: true, missing: true };
+    const base = checkBase(abs, baseSha);
+    if (base.conflict) return { conflict: true, sha: base.sha };
+    const backup = backupMemoryFile(abs, source, file);
+    fs.unlinkSync(abs);
+    return { ok: true, backup };
 }
 
 function buildTitleIndex() {
@@ -762,6 +1004,107 @@ function resolveClaudeBin() {
     return 'claude';
 }
 
+// === CLAUDE DESKTOP: riapre una sessione con `claude --desktop --resume <id>` (Claude Code
+// 2.1.285+, importa anche le sessioni nate nel terminale). Se la versione sul PC non lo conosce o
+// fallisce, si torna al deep link claude://resume come prima.
+function openInDesktop(sessionId, dir) {
+    const { execFile } = require('child_process');
+    const cwd = dir && fs.existsSync(dir) ? dir : os.homedir();
+    return new Promise(resolve => {
+        execFile(resolveClaudeBin(), ['--desktop', '--resume', sessionId], { cwd, timeout: 20000, windowsHide: true }, err => {
+            if (!err) return resolve({ via: 'cli' });
+            openUrl('claude://resume?session=' + encodeURIComponent(sessionId));
+            resolve({ via: 'deeplink' });
+        });
+    });
+}
+
+// === REMOTE CONTROL: un server `claude remote-control` per cartella di progetto ===
+// Così i Claude Projects possono far girare un thread su questo PC ("Work locally") e le sessioni
+// si comandano anche dal telefono. Gira in un terminale virtuale (node-pty) perché alla prima volta
+// Claude Code chiede conferme (attivare Remote Control, fidarsi della cartella): la domanda arriva
+// alla board, che mostra Sì/No; il Bridge non risponde mai da solo. Configurazione (cartelle con
+// avvio automatico) in ~/.ykan-bridge-rc.json.
+const RC_FILE = path.join(os.homedir(), '.ykan-bridge-rc.json');
+const rcServers = new Map(); // dir -> stato del server in esecuzione (o appena terminato)
+
+function rcConfig() {
+    try { const c = JSON.parse(fs.readFileSync(RC_FILE, 'utf8')); return Array.isArray(c) ? c : []; } catch (_) { return []; }
+}
+
+function rcSaveConfig(list) {
+    fs.writeFileSync(RC_FILE, JSON.stringify(list, null, 2));
+}
+
+const stripAnsi = t => t.replace(/\x1b\[[0-9;?]*[ -\/]*[@-~]/g, '').replace(/\x1b\][^\x07]*(\x07|\x1b\\)/g, '').replace(/\r/g, '');
+
+function rcPublic(st) {
+    return { dir: st.dir, name: st.name, spawn: st.spawn, status: st.status, url: st.url || '', question: st.question || '',
+        startedAt: st.startedAt, exitCode: st.exitCode ?? null, output: st.output.slice(-3000) };
+}
+
+function rcList() {
+    const cfg = rcConfig();
+    const out = [...rcServers.values()].map(st => ({ ...rcPublic(st), autostart: cfg.some(c => c.dir === st.dir && c.autostart) }));
+    for (const c of cfg) if (!rcServers.has(c.dir)) out.push({ dir: c.dir, name: c.name || '', spawn: c.spawn || 'same-dir', status: 'stopped', url: '', question: '', output: '', autostart: !!c.autostart });
+    return out;
+}
+
+function rcStart(dir, name, spawnMode) {
+    if (!dir || !fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) throw new Error('cartella del progetto inesistente su questo PC: ' + (dir || '(nessuna)'));
+    const cur = rcServers.get(dir);
+    if (cur && ['starting', 'running', 'waiting'].includes(cur.status)) return rcPublic(cur);
+    spawnMode = spawnMode === 'worktree' ? 'worktree' : 'same-dir';
+    if (spawnMode === 'worktree' && !fs.existsSync(path.join(dir, '.git'))) throw new Error('«worktree» richiede che la cartella sia un repository git');
+    name = String(name || path.basename(dir)).slice(0, 80);
+    const args = ['remote-control', '--name', name];
+    if (spawnMode === 'worktree') args.push('--spawn', 'worktree');
+    const st = { dir, name, spawn: spawnMode, status: 'starting', url: '', question: '', output: '', startedAt: new Date().toISOString(), exitCode: null };
+    st.term = pty.spawn(resolveClaudeBin(), args, { name: 'xterm-color', cols: 120, rows: 30, cwd: dir, env: process.env });
+    st.term.onData(data => {
+        st.output = (st.output + stripAnsi(data)).slice(-20000);
+        const urls = st.output.match(/https:\/\/claude\.ai\/code[^\s"'<>)]*/g);
+        if (urls) st.url = urls[urls.length - 1];
+        const lines = st.output.split('\n').map(l => l.trim()).filter(Boolean);
+        const last = lines[lines.length - 1] || '';
+        if (/\?\s*[\[(]?\s*y\s*\/\s*n\s*[\])]?\s*:?\s*$/i.test(last)) { st.status = 'waiting'; st.question = last; }
+        else if (st.status !== 'stopped') { st.status = st.url ? 'running' : 'starting'; st.question = ''; }
+    });
+    st.term.onExit(({ exitCode }) => {
+        st.status = st.stopping || exitCode === 0 ? 'stopped' : 'error';
+        st.exitCode = exitCode; st.term = null; st.question = '';
+    });
+    rcServers.set(dir, st);
+    console.log(`Remote Control avviato in ${dir} (${spawnMode})`);
+    return rcPublic(st);
+}
+
+function rcStop(dir) {
+    const st = rcServers.get(dir);
+    if (!st) return { ok: true };
+    st.stopping = true;
+    try { if (st.term) st.term.kill(); } catch (_) { /* gia' terminato */ }
+    st.status = 'stopped';
+    return rcPublic(st);
+}
+
+function rcAnswer(dir, yes) {
+    const st = rcServers.get(dir);
+    if (!st || !st.term || st.status !== 'waiting') throw new Error('nessuna domanda in attesa per questa cartella');
+    st.term.write(yes ? 'y\r' : 'n\r');
+    st.status = 'starting'; st.question = '';
+    return rcPublic(st);
+}
+
+function rcSetAutostart(dir, name, spawnMode, autostart) {
+    const cfg = rcConfig().filter(c => c.dir !== dir);
+    if (autostart) cfg.push({ dir, name: String(name || '').slice(0, 80), spawn: spawnMode === 'worktree' ? 'worktree' : 'same-dir', autostart: true });
+    rcSaveConfig(cfg);
+    return { ok: true };
+}
+
+process.on('exit', () => { for (const st of rcServers.values()) { try { if (st.term) st.term.kill(); } catch (_) { } } });
+
 function handlePtyConnection(ws, opts) {
     const { localPath, launch, prompt, sessionId } = opts;
     let cwd = os.homedir();
@@ -871,9 +1214,27 @@ const server = http.createServer((req, res) => {
             }
             const id = String(b.sessionId || '');
             if (!/^[a-zA-Z0-9_-]{1,80}$/.test(id)) return json(400, { error: 'sessione non valida' });
-            openUrl('claude://resume?session=' + encodeURIComponent(id));
-            json(200, { ok: true, host: os.hostname() });
+            openInDesktop(id, String(b.dir || '')).then(r => json(200, { ok: true, host: os.hostname(), via: r.via }));
         }).catch(e => json(500, { error: String((e && e.message) || e) }));
+        return;
+    }
+
+    // Server Remote Control per cartella: stato (GET) e comandi (POST, solo board ammessa e JSON).
+    if (req.method === 'GET' && parsed.pathname === '/rc') {
+        if (!isAllowedOrigin(origin)) return json(403, { error: 'origin non ammessa' });
+        return json(200, { servers: rcList() });
+    }
+    if (req.method === 'POST' && ['/rc/start', '/rc/stop', '/rc/answer', '/rc/autostart'].includes(parsed.pathname)) {
+        if (!isAllowedOrigin(origin)) return json(403, { error: 'origin non ammessa' });
+        if (!/^application\/json/.test(req.headers['content-type'] || '')) return json(415, { error: 'serve application/json' });
+        readBody(req, 5000).then(raw => {
+            const b = JSON.parse(raw || '{}');
+            const dir = String(b.dir || '');
+            if (parsed.pathname === '/rc/start') return json(200, rcStart(dir, b.name, b.spawn));
+            if (parsed.pathname === '/rc/stop') return json(200, rcStop(dir));
+            if (parsed.pathname === '/rc/answer') return json(200, rcAnswer(dir, !!b.yes));
+            return json(200, rcSetAutostart(dir, b.name, b.spawn, !!b.autostart));
+        }).catch(e => json(400, { error: String((e && e.message) || e) }));
         return;
     }
 
@@ -930,13 +1291,39 @@ const server = http.createServer((req, res) => {
     }
 
     if (req.method === 'GET' && parsed.pathname === '/claude/skills') {
-        try { return json(200, { skills: listSkills() }); }
+        try { return json(200, { skills: listSkills(String(parsed.query.dir || '')) }); }
         catch (e) { return json(500, { error: String((e && e.message) || e) }); }
     }
 
     if (req.method === 'GET' && parsed.pathname === '/claude/skill') {
-        try { return json(200, { content: readSkill(String(parsed.query.id || '')) }); }
+        try { return json(200, readSkill(String(parsed.query.id || ''), String(parsed.query.source || 'user'), String(parsed.query.dir || ''))); }
         catch (e) { return json(404, { error: String((e && e.message) || e) }); }
+    }
+
+    if (req.method === 'GET' && parsed.pathname === '/claude/plugins') {
+        listPlugins(String(parsed.query.dir || ''))
+            .then(plugins => json(200, { plugins }))
+            .catch(e => json(500, { error: String((e && e.message) || e) }));
+        return;
+    }
+
+    // Skill e plugin: solo dalla board ammessa e solo JSON, con backup dei file toccati.
+    if (req.method === 'POST' && ['/claude/skill/write', '/claude/skill/override', '/claude/skill/copy', '/claude/plugins/toggle'].includes(parsed.pathname)) {
+        if (!isAllowedOrigin(origin)) return json(403, { error: 'origin non ammessa' });
+        if (!/^application\/json/.test(req.headers['content-type'] || '')) return json(415, { error: 'serve application/json' });
+        readBody(req, 320000).then(async raw => {
+            const b = JSON.parse(raw || '{}');
+            const dir = String(b.dir || '');
+            if (parsed.pathname === '/claude/skill/write') {
+                const r = writeSkill(String(b.id || ''), String(b.source || 'user'), dir, b.content, b.base_sha);
+                return json(r.conflict ? 409 : 200, r.conflict ? { error: 'SKILL.md è cambiato dopo che l\'hai aperto: ricaricalo', sha: r.sha } : r);
+            }
+            if (parsed.pathname === '/claude/skill/override') return json(200, setSkillOverride(String(b.scope || ''), dir, String(b.name || ''), String(b.state || '')));
+            if (parsed.pathname === '/claude/skill/copy') return json(200, copySkillToProject(String(b.id || ''), dir));
+            await togglePlugin(String(b.id || ''), !!b.enabled, String(b.scope || ''), dir);
+            json(200, { ok: true, plugins: await listPlugins(dir).catch(() => null) });
+        }).catch(e => json(400, { error: String((e && e.message) || e) }));
+        return;
     }
 
     if (req.method === 'GET' && parsed.pathname === '/claude/memory') {
@@ -945,8 +1332,24 @@ const server = http.createServer((req, res) => {
     }
 
     if (req.method === 'GET' && parsed.pathname === '/claude/memory/file') {
-        try { return json(200, { content: readMemoryFile(String(parsed.query.dir || ''), String(parsed.query.file || '')) }); }
+        try { return json(200, readMemoryFile(String(parsed.query.dir || ''), String(parsed.query.file || ''), String(parsed.query.source || 'memory'))); }
         catch (e) { return json(404, { error: String((e && e.message) || e) }); }
+    }
+
+    // Modifica/elimina un file di memoria: solo dalla board ammessa, solo JSON, con backup e
+    // controllo che il file non sia cambiato nel frattempo (409 = conflitto).
+    if (req.method === 'POST' && (parsed.pathname === '/claude/memory/write' || parsed.pathname === '/claude/memory/delete')) {
+        if (!isAllowedOrigin(origin)) return json(403, { error: 'origin non ammessa' });
+        if (!/^application\/json/.test(req.headers['content-type'] || '')) return json(415, { error: 'serve application/json' });
+        readBody(req, MEMORY_MAX_BYTES + 20000).then(raw => {
+            const b = JSON.parse(raw || '{}');
+            const dir = String(b.dir || ''), source = String(b.source || 'memory'), file = String(b.file || '');
+            const r = parsed.pathname === '/claude/memory/write'
+                ? writeMemoryFile(dir, source, file, b.content, b.base_sha)
+                : deleteMemoryFile(dir, source, file, b.base_sha);
+            json(r.conflict ? 409 : 200, r.conflict ? { error: 'il file è cambiato dopo che l\'hai aperto: ricaricalo', sha: r.sha } : r);
+        }).catch(e => json(400, { error: String((e && e.message) || e) }));
+        return;
     }
 
     if (req.method === 'GET' && parsed.pathname === '/sessions') {
@@ -1008,6 +1411,9 @@ server.listen(PORT, '127.0.0.1', () => {
     heartbeat();
     setInterval(heartbeat, HEARTBEAT_MS);
     relayLoop();
+    for (const c of rcConfig().filter(c => c.autostart)) {
+        try { rcStart(c.dir, c.name, c.spawn); } catch (e) { console.error('Remote Control non avviato in ' + c.dir + ': ' + e.message); }
+    }
 });
 
 // Collegamento da riga di comando, per un PC su cui non si apre la board:
