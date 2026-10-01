@@ -172,7 +172,10 @@ $GLOBALS['ykanUserId'] = $__uid;
 
 // Chi non è il proprietario usa solo gli strumenti della board: niente file, DB, mail, sync.
 const MCP_USER_TOOLS = ['list_projects', 'board_summary', 'list_tasks', 'get_task', 'add_task', 'move_task',
-    'complete_task', 'add_label', 'set_task_label'];
+    'complete_task', 'add_label', 'set_task_label', 'thread_report'];
+
+// Stati di un thread di un Claude Code Project (gli stessi gruppi del pannello Overview).
+const MCP_THREAD_STATES = ['working', 'waiting', 'review', 'landing', 'idle', 'resolved', 'failed'];
 
 header('Content-Type: application/json; charset=utf-8');
 
@@ -491,6 +494,25 @@ function mcp_tool_defs(): array {
                 'label'   => ['type' => 'string', 'description' => 'Label name (partial match, e.g. "Stable"). Empty string clears the label.'],
             ], 'required' => ['label']],
         ],
+        [
+            'name' => 'thread_report',
+            'description' => 'Link a Claude Code Project thread (or any cloud session) to a task and report its state. '
+                . 'Call it when the thread starts working on the task and again whenever its state changes '
+                . '(waiting on the user, pull request ready for review, merged, failed). Repeated calls with the same thread_url update the same entry. '
+                . 'Works on archived tasks too, so a thread can report after complete_task.',
+            'inputSchema' => ['type' => 'object', 'properties' => [
+                'id'         => ['type' => 'string', 'description' => 'Short task id, e.g. "25" or "#25".'],
+                'title'      => ['type' => 'string', 'description' => 'Task title (partial match) — use if you do not have the id.'],
+                'project'    => $projectArg,
+                'thread_url' => ['type' => 'string', 'description' => 'URL of this thread/session on claude.ai (https://claude.ai/code/...).'],
+                'state'      => ['type' => 'string', 'enum' => MCP_THREAD_STATES,
+                    'description' => 'working = running; waiting = needs the user; review = PR open, awaiting review; landing = PR approved/queued; idle = finished, nothing pending; resolved = done (e.g. PR merged); failed = stopped on an error.'],
+                'name'       => ['type' => 'string', 'description' => 'Short thread title (optional).'],
+                'branch'     => ['type' => 'string', 'description' => 'Git branch the thread works on (optional).'],
+                'pr_url'     => ['type' => 'string', 'description' => 'Pull request URL on github.com (optional).'],
+                'summary'    => ['type' => 'string', 'description' => 'One or two lines: what was done, or what the thread needs from the user (optional).'],
+            ], 'required' => ['thread_url', 'state']],
+        ],
         // -------- Phase 2: Files (scoped to a linked project folder) --------
         [
             'name' => 'list_files',
@@ -631,7 +653,7 @@ function mcp_run_tool(string $name, array $a): string {
                     $linked ? " [folder: {$l['path']}]" : ' [no folder linked]',
                     $n,
                     !empty($l['url']) ? " ({$l['url']})" : ''
-                );
+                ) . (!empty($l['claude_project_url']) ? " [Claude Project: {$l['claude_project_url']}]" : '');
             }
             return $out ? "Projects:\n" . implode("\n", $out) : 'No projects yet.';
         }
@@ -821,9 +843,49 @@ function mcp_run_tool(string $name, array $a): string {
             if (!empty($c['label_id'])) $out[] = 'Label: ' . ($labels[$c['label_id']] ?? '?');
             if (!empty($c['due_date'])) $out[] = 'Due: ' . $c['due_date'];
             if (!empty($c['files'])) $out[] = 'Files: ' . implode(', ', array_map(fn($f) => is_array($f) ? ($f['path'] ?? '') : $f, $c['files']));
+            foreach (($c['threads'] ?? []) as $t) {
+                $out[] = 'Thread [' . ($t['state'] ?? '?') . ']: ' . ($t['name'] ?? $t['url'])
+                    . (!empty($t['pr_url']) ? ' — PR ' . $t['pr_url'] : '') . (!empty($t['summary']) ? ' — ' . $t['summary'] : '');
+            }
             $out[] = '';
             $out[] = trim((string)($c['description'] ?? '')) !== '' ? $c['description'] : '(no description)';
             return implode("\n", $out);
+        }
+
+        case 'thread_report': {
+            $needle = trim((string)($a['id'] ?? $a['title'] ?? ''));
+            $filter = isset($a['project']) ? mcp_find_lane($data, $a['project']) : null;
+            $i = mcp_find_card_index($data, $needle, $filter);
+            if ($i === null && preg_match('/^#?(\d+)$/', $needle, $m)) {
+                // Anche le card già archiviate: il thread può riferire dopo complete_task.
+                foreach (($data['cards'] ?? []) as $k => $c) if ((int)($c['seq'] ?? 0) === (int)$m[1]) { $i = $k; break; }
+            }
+            if ($i === null) throw new McpError("Task '$needle' not found.");
+            $url = trim((string)($a['thread_url'] ?? ''));
+            if (!preg_match('~^https://claude\.ai/[\w\-./?=&%#]+$~', $url)) throw new McpError('thread_url must be a https://claude.ai/... link.');
+            $state = (string)($a['state'] ?? '');
+            if (!in_array($state, MCP_THREAD_STATES, true)) throw new McpError('state must be one of: ' . implode(', ', MCP_THREAD_STATES));
+            $pr = trim((string)($a['pr_url'] ?? ''));
+            if ($pr !== '' && !preg_match('~^https://github\.com/[\w.-]+/[\w.-]+/pull/\d+$~', $pr)) throw new McpError('pr_url must be a https://github.com/<owner>/<repo>/pull/<n> link.');
+            $clip = fn($k, $n) => mb_substr(trim((string)($a[$k] ?? '')), 0, $n);
+
+            $threads = $data['cards'][$i]['threads'] ?? [];
+            $now = date('Y-m-d H:i:s');
+            $entry = null;
+            foreach ($threads as $k => $t) if (($t['url'] ?? '') === $url) { $entry = $k; break; }
+            if ($entry === null) { $threads[] = ['url' => $url, 'created_at' => $now]; $entry = count($threads) - 1; }
+            $t = &$threads[$entry];
+            $t['state'] = $state;
+            $t['updated_at'] = $now;
+            foreach (['name' => 120, 'branch' => 120, 'summary' => 500] as $k => $n) if ($clip($k, $n) !== '') $t[$k] = $clip($k, $n);
+            if ($pr !== '') $t['pr_url'] = $pr;
+            unset($t);
+            $data['cards'][$i]['threads'] = $threads;
+            $data['cards'][$i]['updated_at'] = $now;
+            mcp_save($data);
+            $c = $data['cards'][$i];
+            mcp_audit('thread_report', ['seq' => $c['seq'] ?? null, 'state' => $state, 'url' => $url]);
+            return 'Thread linked to #' . ($c['seq'] ?? '?') . " '{$c['title']}' (state: $state).";
         }
 
         // ---------------- Phase 2 ----------------

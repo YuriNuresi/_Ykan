@@ -1314,6 +1314,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['api'])) {
                         if (array_key_exists('path', $input)) $lane['path'] = $input['path'];
                         if (array_key_exists('url', $input)) $lane['url'] = $input['url'];
                         if (array_key_exists('local_path', $input)) $lane['local_path'] = $input['local_path'];
+                        // Claude Code Project collegato (1 swimlane = 1 Project): solo link claude.ai
+                        if (array_key_exists('claude_project_url', $input) && preg_match('~^(https://claude\.ai/[\w\-./?=&%#]+)?$~', (string)$input['claude_project_url'])) $lane['claude_project_url'] = $input['claude_project_url'];
                         if (array_key_exists('github_repo', $input) && preg_match('/^([\w.-]+\/[\w.-]+)?$/', (string)$input['github_repo'])) $lane['github_repo'] = $input['github_repo'];
                         // Doc/structure files the AI should study before working
                         if (array_key_exists('doc_files', $input)) $lane['doc_files'] = array_values($input['doc_files'] ?? []);
@@ -2912,6 +2914,14 @@ PROMPT;
                         $add('overdue', 'high', $c, 'Scaduta il ' . $c['due_date'], strtotime($c['due_date']));
                     if (!$done && !empty($c['next_check']) && strtotime($c['next_check']) <= $now)
                         $add('check_due', 'medium', $c, 'Controllo previsto il ' . $c['next_check'], strtotime($c['next_check']));
+                    foreach (($c['threads'] ?? []) as $t) {
+                        $tName = $t['name'] ?? 'Thread';
+                        $tWhen = strtotime($t['updated_at'] ?? '') ?: null;
+                        $tSum = !empty($t['summary']) ? ': ' . $t['summary'] : '';
+                        if (($t['state'] ?? '') === 'waiting') $add('thread_waiting', 'high', $c, "$tName aspetta una tua risposta$tSum", $tWhen);
+                        elseif (($t['state'] ?? '') === 'failed') $add('thread_failed', 'high', $c, "$tName si è fermato$tSum", $tWhen);
+                        elseif (($t['state'] ?? '') === 'review') $add('thread_review', 'medium', $c, "$tName: pull request pronta per la review", $tWhen);
+                    }
                     $acc = $c['acceptance'] ?? [];
                     if ($acc) {
                         $accDone = count(array_filter($acc, fn($a) => !empty($a['done'])));
@@ -4051,6 +4061,7 @@ $dataJson = json_encode($data);
                     </div>
                     <div id="claudeRunsList" style="display:none;max-height:300px;overflow-y:auto"></div>
                 </div>
+                <div id="cardThreads" style="display:none;margin-top:12px;border:1px solid var(--border);border-radius:8px;padding:10px 12px"></div>
                 <div id="cardSessions" style="display:none;margin-top:12px;border:1px solid var(--border);border-radius:8px;padding:10px 12px"></div>
             </form>
         </div>
@@ -4648,6 +4659,7 @@ $dataJson = json_encode($data);
                     ${hasFiles ? `<span title="${card.files.length} file associati" style="font-size:12px">📁</span>` : ''}
                     ${isRecurring ? '<span title="Task autorigenerante" style="font-size:12px">🔄</span>' : ''}
                     ${runBadge}
+                    ${threadBadge(card)}
                 </div>
                 ${label ? `<span class="card-label" style="background:${label.color}">${escHtml(label.name)}</span>` : ''}
                 ${pmBadges}
@@ -4866,9 +4878,15 @@ $dataJson = json_encode($data);
                     <label style="font-size:11px">Local folder (on this machine, e.g. for the local Bridge)</label>
                     <input type="text" id="proj-local-${lane.id}" value="${escHtml(lane.local_path || '')}" placeholder="e.g. C:\\Script locali\\clienteA">
                 </div>
-                <div style="display:flex;gap:8px">
+                <div class="form-group" style="margin-bottom:6px">
+                    <label style="font-size:11px">Claude Code Project (link claude.ai, opzionale)</label>
+                    <input type="text" id="proj-claude-${lane.id}" value="${escHtml(lane.claude_project_url || '')}" placeholder="https://claude.ai/code/projects/...">
+                </div>
+                <div style="display:flex;gap:8px;flex-wrap:wrap">
                     <button class="btn btn-primary" onclick="saveProjectLink('${lane.id}')">Save link</button>
                     <button class="btn" onclick="openDocsModal('${lane.id}')" title="Documentazione del progetto (file per l'AI)">📄 Documentazione</button>
+                    <button class="btn" onclick="copyProjectInstructions('${lane.id}')" title="Copia le istruzioni da incollare in Project settings › Memory › Project instructions">📋 Istruzioni Project</button>
+                    ${lane.claude_project_url ? `<a class="btn" href="${escHtml(lane.claude_project_url)}" target="_blank" rel="noopener">🧵 Apri Project</a>` : ''}
                 </div>
             </div>
         `).join('');
@@ -4878,11 +4896,86 @@ $dataJson = json_encode($data);
         const path = document.getElementById('proj-path-' + id).value.trim();
         const url = document.getElementById('proj-url-' + id).value.trim();
         const local_path = document.getElementById('proj-local-' + id).value.trim();
+        const claude_project_url = document.getElementById('proj-claude-' + id).value.trim();
+        if (claude_project_url && !/^https:\/\/claude\.ai\//.test(claude_project_url)) { toast('Il link del Project deve iniziare con https://claude.ai/', 'error'); return; }
         const lane = boardData.swimlanes.find(l => l.id === id);
-        if (lane) { lane.path = path; lane.url = url; lane.local_path = local_path; }
-        await api('update_swimlane', { id, path, url, local_path });
+        if (lane) { lane.path = path; lane.url = url; lane.local_path = local_path; lane.claude_project_url = claude_project_url; }
+        await api('update_swimlane', { id, path, url, local_path, claude_project_url });
         renderProjectsManager();
         render();
+    }
+
+    // === CLAUDE CODE PROJECTS: thread collegati alle card ===
+    // I thread di un Project riferiscono a _Ykan con il tool MCP thread_report; qui li mostriamo.
+    const THREAD_STATES = {
+        waiting:  ['🙋', 'Aspetta te', '#dc2626'],
+        failed:   ['💥', 'Fermo su errore', '#dc2626'],
+        review:   ['👀', 'PR da rivedere', '#7c3aed'],
+        landing:  ['🛬', 'In merge', '#0891b2'],
+        working:  ['⚙️', 'Al lavoro', '#d97706'],
+        idle:     ['💤', 'Finito, fermo', '#64748b'],
+        resolved: ['✅', 'Concluso', '#16a34a']
+    };
+    const THREAD_ORDER = Object.keys(THREAD_STATES);
+
+    // Il badge sulla card mostra lo stato che richiede più attenzione tra i thread collegati.
+    function threadBadge(card) {
+        const ts = card.threads || [];
+        if (!ts.length) return '';
+        const top = ts.map(t => t.state).sort((a, b) => THREAD_ORDER.indexOf(a) - THREAD_ORDER.indexOf(b))[0];
+        const [icon, label, color] = THREAD_STATES[top] || ['🧵', top, '#64748b'];
+        return `<span title="Thread Claude: ${escHtml(label)} (${ts.length})" style="font-size:11px;padding:1px 5px;border-radius:8px;background:${color};color:white;cursor:help">${icon}${ts.length > 1 ? '×' + ts.length : ''}</span>`;
+    }
+
+    function renderCardThreads(card) {
+        const box = document.getElementById('cardThreads');
+        const ts = [...(card.threads || [])].sort((a, b) => (b.updated_at || '').localeCompare(a.updated_at || ''));
+        if (!ts.length) { box.style.display = 'none'; return; }
+        box.style.display = 'block';
+        const safeUrl = u => /^https:\/\//.test(u || '') ? escHtml(u) : '#';
+        box.innerHTML = '<div style="font-size:13px;font-weight:500;margin-bottom:4px">🧵 Thread Claude Code (' + ts.length + ')</div>'
+            + ts.map(t => {
+                const [icon, label] = THREAD_STATES[t.state] || ['🧵', t.state || '?'];
+                return `<div style="padding:4px 0;border-top:1px solid var(--border)">
+                    <div style="display:flex;gap:8px;align-items:center">
+                        <span class="sess-badge">${icon} ${escHtml(label)}</span>
+                        <span style="font-size:13px;flex:1">${escHtml(t.name || 'Thread')}${t.branch ? ` <code style="font-size:11px">${escHtml(t.branch)}</code>` : ''}</span>
+                        <span style="font-size:11px;color:var(--text2);white-space:nowrap">${escHtml(t.updated_at || '')}</span>
+                        ${t.pr_url ? `<a class="btn" style="padding:2px 8px;font-size:11px" href="${safeUrl(t.pr_url)}" target="_blank" rel="noopener">PR</a>` : ''}
+                        <a class="btn" style="padding:2px 8px;font-size:11px" href="${safeUrl(t.url)}" target="_blank" rel="noopener">Apri</a>
+                    </div>
+                    ${t.summary ? `<div style="font-size:12px;color:var(--text2);margin-top:2px">${escHtml(t.summary)}</div>` : ''}
+                </div>`;
+            }).join('');
+    }
+
+    // Testo per Project settings › Memory › Project instructions (max 16.000 caratteri):
+    // insegna ai thread a collegarsi alle card con il connettore MCP di _Ykan.
+    function projectInstructions(lane) {
+        const doing = (boardData.columns.find(c => /progress|doing|corso|lavor/i.test(c.name)) || {}).name || 'In corso';
+        const n = lane.name;
+        return [
+            `Questo Project lavora sul progetto «${n}» della board _Ykan${lane.github_repo ? ` (repository ${lane.github_repo})` : ''}.`,
+            `I task arrivano dalla board e hanno un id breve (#N). In ogni thread è disponibile il connettore MCP di _Ykan, con gli strumenti get_task, move_task, complete_task, add_task e thread_report.`,
+            ``,
+            `Quando un thread lavora su un task #N:`,
+            `- All'avvio: leggi il task con get_task(id: "N", project: "${n}"), spostalo in "${doing}" con move_task e chiama thread_report(id: "N", project: "${n}", thread_url: <URL di questa sessione su claude.ai>, state: "working", name: <titolo breve>, branch: <branch>).`,
+            `- Se ti serve una mia risposta o approvazione: thread_report con state "waiting" e in summary cosa ti serve.`,
+            `- Quando apri la pull request: thread_report con state "review", pr_url e in summary cosa hai fatto.`,
+            `- Se ti fermi su un errore che non sai risolvere: thread_report con state "failed" e il motivo in summary.`,
+            `- Quando la pull request è mergiata: thread_report con state "resolved", poi complete_task(id: "N", project: "${n}").`,
+            `- Lavoro nuovo scoperto fuori dallo scopo del task: aggiungilo con add_task(project: "${n}") invece di farlo.`,
+            `Se un task non ha un #N, cercalo con list_tasks(project: "${n}") o crealo con add_task prima di iniziare.`,
+            `Se il connettore _Ykan non risponde, dillo nel primo messaggio e prosegui comunque con il lavoro sul codice.`
+        ].join('\n');
+    }
+
+    function copyProjectInstructions(id) {
+        const lane = boardData.swimlanes.find(l => l.id === id);
+        if (!lane) return;
+        navigator.clipboard.writeText(projectInstructions(lane)).then(
+            () => toast('Istruzioni copiate: incollale in Project settings › Memory › Project instructions'),
+            () => toast('Copia non riuscita', 'error'));
     }
 
     // === DASHBOARD (schede: Da riprendere / Ultimi 7 giorni / Revisione sessioni) ===
@@ -4893,7 +4986,9 @@ $dataJson = json_encode($data);
         check_due: ['🔔', 'Controllo da fare'],
         session_question: ['💬', 'Sessione in attesa di tua risposta'],
         session_unanswered: ['✋', 'Sessione interrotta'],
-        session_open_task: ['🧵', 'Sessione su task ancora aperto']
+        session_open_task: ['🧵', 'Sessione su task ancora aperto'],
+        thread_waiting: ['🙋', 'Thread in attesa di te'], thread_failed: ['💥', 'Thread fermo su un errore'],
+        thread_review: ['👀', 'PR del thread da rivedere']
     };
     const DASH_DONE_RE = /done|fatto|chius|completat/i;
     const DASH_DOING_RE = /progress|doing|corso|lavor/i;
@@ -6946,6 +7041,7 @@ $dataJson = json_encode($data);
             const cardLane = boardData.swimlanes.find(l => l.id === card.swimlane_id);
             document.getElementById('playLocalBtn').style.display = (cardLane && cardLane.local_path) ? 'block' : 'none';
             renderClaudeRuns(card);
+            renderCardThreads(card);
             renderCardSessions(card);
             document.getElementById('templateGroup').style.display = 'none';
         } else {
@@ -6972,6 +7068,7 @@ $dataJson = json_encode($data);
             document.getElementById('openClaudeAppBtn').style.display = 'none';
             document.getElementById('playLocalBtn').style.display = 'none';
             document.getElementById('cardSessions').style.display = 'none';
+            document.getElementById('cardThreads').style.display = 'none';
             document.getElementById('claudeRunsPanel').style.display = 'none';
             document.getElementById('templateGroup').style.display = 'block';
             document.getElementById('cardTemplate').value = '';
