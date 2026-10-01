@@ -4042,12 +4042,16 @@ $dataJson = json_encode($data);
                         <span style="font-size:11px;color:var(--text2);margin-left:8px">0 = immediate</span>
                     </div>
                 </div>
-                <div class="modal-actions">
-                    <button type="button" class="btn btn-warning" id="deleteCardBtn" onclick="deleteCard()" style="display:none">📦 Archive</button>
+                <!-- Riga Claude: i modi di far lavorare Claude sul task (solo su una card esistente) -->
+                <div class="modal-actions" id="cardClaudeActions" style="display:none;justify-content:flex-start;flex-wrap:wrap;padding-bottom:12px;border-bottom:1px solid var(--border)">
+                    <button type="button" class="btn" id="executeClaudeBtn" onclick="executeWithClaude()" style="display:none;background:linear-gradient(135deg,#d97706,#ea580c);color:white;border:none" title="Esegue il task con l'Agent API di Claude direttamente sul server">🏖️ Claude Agent API</button>
+                    <button type="button" class="btn" id="openClaudeAppBtn" onclick="openInClaudeApp()" style="display:none;background:linear-gradient(135deg,#7c3aed,#6d28d9);color:white;border:none" title="Copia il prompt del task e apre claude.ai">🌐 Claude Web</button>
+                    <button type="button" class="btn" id="playLocalBtn" onclick="playCardInTerminal()" style="display:none;background:linear-gradient(135deg,#059669,#10b981);color:white;border:none" title="Avvia Claude Code nel terminale interno di Ykan, sul contesto di questo task">⌨️ Claude Terminale</button>
+                    <button type="button" class="btn" id="openClaudeDesktopBtn" onclick="openCardInClaudeDesktop()" style="display:none;background:linear-gradient(135deg,#c2410c,#9a3412);color:white;border:none" title="Avvia il task in Claude Desktop, nella cartella del progetto">🖥️ Claude Desktop</button>
                     <button type="button" class="btn" id="verifyCardBtn" onclick="verifyTaskWithAI()" style="display:none;background:linear-gradient(135deg,#667eea,#764ba2);color:white;border:none">🤖 AI Verify</button>
-                    <button type="button" class="btn" id="executeClaudeBtn" onclick="executeWithClaude()" style="display:none;background:linear-gradient(135deg,#d97706,#ea580c);color:white;border:none">🏖️ Claude Go</button>
-                    <button type="button" class="btn" id="openClaudeAppBtn" onclick="openInClaudeApp()" style="display:none;background:linear-gradient(135deg,#7c3aed,#6d28d9);color:white;border:none">📱 Claude App</button>
-                    <button type="button" class="btn" id="playLocalBtn" onclick="playCardInTerminal()" style="display:none;background:linear-gradient(135deg,#059669,#10b981);color:white;border:none" title="Apre un terminale locale con Claude Code già avviato sul contesto di questo task">▶️ PLAY locale</button>
+                </div>
+                <div class="modal-actions" style="margin-top:12px">
+                    <button type="button" class="btn btn-warning" id="deleteCardBtn" onclick="deleteCard()" style="display:none">📦 Archive</button>
                     <span style="flex:1"></span>
                     <button type="button" class="btn" onclick="closeCardModal()">Cancel</button>
                     <button type="submit" class="btn btn-primary">Save</button>
@@ -7040,6 +7044,8 @@ $dataJson = json_encode($data);
             document.getElementById('openClaudeAppBtn').style.display = 'block';
             const cardLane = boardData.swimlanes.find(l => l.id === card.swimlane_id);
             document.getElementById('playLocalBtn').style.display = (cardLane && cardLane.local_path) ? 'block' : 'none';
+            document.getElementById('openClaudeDesktopBtn').style.display = cardLane ? 'block' : 'none';
+            document.getElementById('cardClaudeActions').style.display = 'flex';
             renderClaudeRuns(card);
             renderCardThreads(card);
             renderCardSessions(card);
@@ -7067,6 +7073,8 @@ $dataJson = json_encode($data);
             claudeBtn.style.display = 'none';
             document.getElementById('openClaudeAppBtn').style.display = 'none';
             document.getElementById('playLocalBtn').style.display = 'none';
+            document.getElementById('openClaudeDesktopBtn').style.display = 'none';
+            document.getElementById('cardClaudeActions').style.display = 'none';
             document.getElementById('cardSessions').style.display = 'none';
             document.getElementById('cardThreads').style.display = 'none';
             document.getElementById('claudeRunsPanel').style.display = 'none';
@@ -7255,13 +7263,7 @@ $dataJson = json_encode($data);
         if (!card) return;
         const lane = boardData.swimlanes.find(l => l.id === card.swimlane_id);
         if (!lane || !lane.local_path) return;
-
-        const label = card.label_id ? boardData.labels.find(l => l.id === card.label_id) : null;
-        let prompt = `Task Ykan #${card.seq || ''} — ${card.title}\n`;
-        if (label) prompt += `[${label.name}] `;
-        prompt += `Priorità: ${card.priority}\n`;
-        if (card.description) prompt += `\n${card.description}\n`;
-        if (card.files && card.files.length > 0) prompt += `\nFile: ${card.files.join(', ')}\n`;
+        const prompt = cardTaskPrompt(card);
 
         // Fixed session id: lets the Dashboard know this session belongs to this task
         const sessionId = crypto.randomUUID();
@@ -7270,6 +7272,38 @@ $dataJson = json_encode($data);
 
         closeCardModal();
         openTerminalModal(lane.id, { launch: 'claude', prompt, sessionId });
+    }
+
+    // Prompt con il contesto del task, lo stesso per terminale interno e Claude Desktop
+    function cardTaskPrompt(card) {
+        const label = card.label_id ? boardData.labels.find(l => l.id === card.label_id) : null;
+        let prompt = `Task Ykan #${card.seq || ''} — ${card.title}\n`;
+        if (label) prompt += `[${label.name}] `;
+        prompt += `Priorità: ${card.priority}\n`;
+        if (card.description) prompt += `\n${card.description}\n`;
+        if (card.files && card.files.length > 0) prompt += `\nFile: ${card.files.join(', ')}\n`;
+        return prompt;
+    }
+
+    // Claude Desktop sempre, qualunque sia session_open_mode: su questo PC deep link
+    // claude://code/new con la cartella del progetto (Desktop chiede conferma), su un PC
+    // collegato il Bridge lancia Claude Code e a fine lavoro apre la sessione in Desktop.
+    function openCardInClaudeDesktop() {
+        const cardId = document.getElementById('cardId').value;
+        if (!cardId) return;
+        const card = boardData.cards.find(c => c.id === cardId);
+        if (!card) return;
+        const lane = boardData.swimlanes.find(l => l.id === card.swimlane_id);
+        if (!lane) return;
+        const prompt = cardTaskPrompt(card);
+        closeCardModal();
+        if (bridgeIsRemote()) {
+            remoteDesktop('/desktop/new', { prompt, dir: lane.local_path || '', name: lane.name || '' });
+            return;
+        }
+        let url = 'claude://code/new?q=' + encodeURIComponent(prompt);
+        if (lane.local_path) url += '&folder=' + encodeURIComponent(lane.local_path);
+        window.location.href = url;
     }
 
     function executeWithClaudeManual(card) {
