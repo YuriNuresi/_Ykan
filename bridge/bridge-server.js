@@ -109,6 +109,7 @@ async function heartbeat() {
 // (solo quelli ammessi da memoryPath, con backup), niente shell.
 const RELAY_PATHS = new Set(['/sessions', '/session', '/reviews', '/git', '/claude/skills', '/claude/skill',
     '/claude/memory', '/claude/memory/file', '/claude/memory/write', '/claude/memory/delete',
+    '/claude/skill/write', '/claude/skill/override', '/claude/skill/copy', '/claude/plugins', '/claude/plugins/toggle',
     '/desktop-archive', '/desktop/new', '/desktop/resume']);
 
 function selfRequest(method, p, body, origin) {
@@ -202,7 +203,7 @@ function claudeProjectDirName(localPath) {
     return localPath.replace(/[^a-zA-Z0-9]/g, '-');
 }
 
-// === CLAUDE SKILLS & MEMORIA (pannello Claude: skill in lettura, memoria anche in scrittura) ===
+// === CLAUDE SKILLS, PLUGIN & MEMORIA (pannello Claude della board) ===
 // Skills sono globali (~/.claude/skills/<nome>/SKILL.md, alcune sono symlink verso
 // ~/.agents/skills — le seguiamo). La memoria e' per-progetto: stessa cartella
 // (~/.claude/projects/<claudeProjectDirName(local_path)>/memory/) gia' usata per le
@@ -225,23 +226,169 @@ function parseFrontmatter(raw) {
     };
 }
 
-function listSkills() {
-    const dir = path.join(claudeHome(), 'skills');
-    if (!fs.existsSync(dir)) return [];
-    const out = [];
-    for (const name of fs.readdirSync(dir)) {
-        const file = path.join(dir, name, 'SKILL.md');
-        let raw, stat;
-        try { raw = fs.readFileSync(file, 'utf8'); stat = fs.statSync(file); } catch (_) { continue; }
-        const meta = parseFrontmatter(raw);
-        out.push({ id: name, name: meta.name || name, description: meta.description || '', modified: stat.mtime.toISOString() });
+// === SKILL: utente (~/.claude/skills, anche quelle sincronizzate da claude.ai in synced/) e
+// progetto (<cartella>/.claude/skills). Lo stato di ognuna viene da skillOverrides nei settings:
+// utente ~/.claude/settings.json, progetto .claude/settings.json (condiviso, qui solo letto),
+// locale .claude/settings.local.json (solo per te). Precedenza: locale > progetto > utente.
+const SKILL_STATES = ['on', 'name-only', 'user-invocable-only', 'off'];
+const SKILL_BACKUP_DIR = path.join(os.homedir(), '.ykan-bridge-backups', 'skills');
+
+function skillsRoot(source, localPath) {
+    if (source === 'user') return path.join(claudeHome(), 'skills');
+    if (source === 'synced') return path.join(claudeHome(), 'skills', 'synced');
+    if (source === 'project') {
+        if (!localPath || !fs.existsSync(localPath)) throw new Error('cartella del progetto inesistente su questo PC');
+        return path.join(localPath, '.claude', 'skills');
     }
+    throw new Error('fonte non valida');
+}
+
+function skillFile(source, localPath, id) {
+    // niente '.', '..' o nomi nascosti: il nome resta una sola cartella dentro skills/
+    if (!/^[\w-][\w.-]*$/.test(id) || id.includes('..') || id === 'synced') throw new Error('nome non valido');
+    return path.join(skillsRoot(source, localPath), id, 'SKILL.md');
+}
+
+function settingsFile(scope, localPath) {
+    if (scope === 'user') return path.join(claudeHome(), 'settings.json');
+    if (!localPath || !fs.existsSync(localPath)) throw new Error('cartella del progetto inesistente su questo PC');
+    if (scope === 'project') return path.join(localPath, '.claude', 'settings.json');
+    if (scope === 'local') return path.join(localPath, '.claude', 'settings.local.json');
+    throw new Error('ambito non valido');
+}
+
+function readSettings(file) {
+    if (!fs.existsSync(file)) return {};
+    const raw = fs.readFileSync(file, 'utf8');
+    if (!raw.trim()) return {};
+    try { return JSON.parse(raw); }
+    catch (_) { throw new Error(path.basename(file) + ' non è JSON valido: correggilo a mano prima di cambiare le skill da qui'); }
+}
+
+function skillOverridesFor(localPath) {
+    const read = scope => { try { return (readSettings(settingsFile(scope, localPath)).skillOverrides) || {}; } catch (_) { return {}; } };
+    return { user: read('user'), project: localPath ? read('project') : {}, local: localPath ? read('local') : {} };
+}
+
+function listSkills(localPath) {
+    const ov = skillOverridesFor(localPath);
+    const out = [];
+    const scan = source => {
+        let root;
+        try { root = skillsRoot(source, localPath); } catch (_) { return; }
+        if (!fs.existsSync(root)) return;
+        for (const id of fs.readdirSync(root)) {
+            if (source === 'user' && (id === 'synced' || id === '.trash')) continue;
+            const file = path.join(root, id, 'SKILL.md');
+            let raw, stat;
+            try { raw = fs.readFileSync(file, 'utf8'); stat = fs.statSync(file); } catch (_) { continue; }
+            const meta = parseFrontmatter(raw);
+            const name = meta.name || id;
+            const st = { user: ov.user[name] || null, project: ov.project[name] || null, local: ov.local[name] || null };
+            out.push({ id, source, name, description: meta.description || '', modified: stat.mtime.toISOString(),
+                overrides: st, effective: st.local || st.project || st.user || 'on' });
+        }
+    };
+    scan('user'); scan('synced');
+    if (localPath) scan('project');
     return out.sort((a, b) => a.name.localeCompare(b.name));
 }
 
-function readSkill(id) {
-    if (!/^[\w.-]+$/.test(id)) throw new Error('nome non valido');
-    return fs.readFileSync(path.join(claudeHome(), 'skills', id, 'SKILL.md'), 'utf8');
+function readSkill(id, source, localPath) {
+    const content = fs.readFileSync(skillFile(source || 'user', localPath, id), 'utf8');
+    return { content, sha: sha256(content) };
+}
+
+function backupInto(dir, abs, rel) {
+    if (!fs.existsSync(abs)) return null;
+    const stamp = new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').replace('.', '-').replace('Z', '');
+    let dest = path.join(dir, stamp, rel);
+    for (let n = 2; fs.existsSync(dest); n++) dest = path.join(dir, stamp + '-' + n, rel);
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    fs.copyFileSync(abs, dest);
+    return dest;
+}
+
+function writeSkill(id, source, localPath, content, baseSha) {
+    if (source === 'synced') throw new Error('le skill sincronizzate da claude.ai si modificano su claude.ai');
+    if (typeof content !== 'string' || !content.trim()) throw new Error('contenuto mancante');
+    if (Buffer.byteLength(content, 'utf8') > 300000) throw new Error('SKILL.md troppo grande');
+    const abs = skillFile(source, localPath, id);
+    if (!fs.existsSync(abs)) throw new Error('skill non trovata');
+    const cur = sha256(fs.readFileSync(abs, 'utf8'));
+    if (baseSha && baseSha !== cur) return { conflict: true, sha: cur };
+    const backup = backupInto(SKILL_BACKUP_DIR, abs, path.join(source, id, 'SKILL.md'));
+    fs.writeFileSync(abs + '.ykan-tmp', content, 'utf8');
+    fs.renameSync(abs + '.ykan-tmp', abs);
+    return { ok: true, sha: sha256(content), backup };
+}
+
+// Cambia lo stato di una skill in skillOverrides ("on" = togli la voce). Solo ambito utente o locale:
+// il settings.json condiviso del progetto si cambia nel repository, non da qui.
+function setSkillOverride(scope, localPath, name, state) {
+    if (!['user', 'local'].includes(scope)) throw new Error('ambito non modificabile da qui');
+    if (!/^[\w.:-]{1,100}$/.test(name)) throw new Error('nome skill non valido');
+    if (!SKILL_STATES.includes(state)) throw new Error('stato non valido');
+    const file = settingsFile(scope, localPath);
+    const settings = readSettings(file);
+    const ov = (settings.skillOverrides && typeof settings.skillOverrides === 'object') ? settings.skillOverrides : {};
+    if (state === 'on') delete ov[name]; else ov[name] = state;
+    if (Object.keys(ov).length) settings.skillOverrides = ov; else delete settings.skillOverrides;
+    const backup = backupInto(SKILL_BACKUP_DIR, file, path.join('settings', scope, path.basename(file)));
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file + '.ykan-tmp', JSON.stringify(settings, null, 2) + '\n', 'utf8');
+    fs.renameSync(file + '.ykan-tmp', file);
+    return { ok: true, file, backup };
+}
+
+// Copia una skill dell'utente nel progetto (.claude/skills/<id>): i thread cloud dei Claude Projects
+// caricano solo le skill del repository. Non sovrascrive: se esiste già, errore.
+function copySkillToProject(id, localPath) {
+    const src = path.dirname(skillFile('user', localPath, id));
+    if (!fs.existsSync(path.join(src, 'SKILL.md'))) throw new Error('skill non trovata tra quelle utente');
+    const dest = path.join(skillsRoot('project', localPath), id);
+    if (fs.existsSync(dest)) throw new Error('nel progetto esiste già una skill «' + id + '»');
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    fs.cpSync(src, dest, { recursive: true, dereference: true });
+    return { ok: true, path: dest };
+}
+
+// === PLUGIN: tramite la CLI di Claude Code (claude plugin list/enable/disable --json) ===
+function runClaude(args, cwd) {
+    const { execFile } = require('child_process');
+    return new Promise(resolve => {
+        execFile(resolveClaudeBin(), args, { cwd: cwd && fs.existsSync(cwd) ? cwd : os.homedir(), timeout: 60000,
+            windowsHide: true, maxBuffer: 8 * 1024 * 1024 }, (err, stdout, stderr) => {
+            resolve({ ok: !err, code: err ? err.code : 0, out: String(stdout || ''), err: String(stderr || (err && err.message) || '') });
+        });
+    });
+}
+
+function lastJsonLine(text) {
+    const lines = text.trim().split(/\r?\n/).reverse();
+    for (const l of lines) { try { return JSON.parse(l); } catch (_) { /* riga di testo */ } }
+    return null;
+}
+
+async function listPlugins(localPath) {
+    const r = await runClaude(['plugin', 'list', '--json'], localPath);
+    if (r.code === 'ENOENT') throw new Error('Claude Code non trovato su questo PC');
+    let list = null;
+    try { list = JSON.parse(r.out); } catch (_) { const i = r.out.indexOf('['); if (i >= 0) try { list = JSON.parse(r.out.slice(i)); } catch (_) { } }
+    if (!Array.isArray(list)) throw new Error((r.err || r.out || 'risposta non valida da claude plugin list').trim().slice(0, 300));
+    return list.map(p => ({ id: String(p.id || ''), version: String(p.version || ''), scope: String(p.scope || ''),
+        enabled: !!p.enabled, errors: Array.isArray(p.errors) ? p.errors.slice(0, 5).map(String) : [],
+        projectPath: p.projectPath || '', hasUserConfig: !!p.hasUserConfig, projectEnabled: !!p.projectEnabled }));
+}
+
+async function togglePlugin(id, enabled, scope, localPath) {
+    if (!/^[\w.@:-]{1,200}$/.test(id) || /@(inline|skills-dir|synced)$/.test(id)) throw new Error('plugin non gestibile da qui');
+    const args = ['plugin', enabled ? 'enable' : 'disable', id, '--json'];
+    if (['user', 'project', 'local'].includes(scope)) args.push('--scope', scope);
+    const r = await runClaude(args, localPath);
+    const j = lastJsonLine(r.out);
+    if (j && (j.success || j.alreadyInGoalState)) return { ok: true };
+    throw new Error(((j && (j.error || j.message)) || r.err || r.out || 'comando non riuscito').toString().trim().slice(0, 300));
 }
 
 // === MEMORIA: tutte le fonti che Claude Code legge per un progetto ===
@@ -1021,13 +1168,39 @@ const server = http.createServer((req, res) => {
     }
 
     if (req.method === 'GET' && parsed.pathname === '/claude/skills') {
-        try { return json(200, { skills: listSkills() }); }
+        try { return json(200, { skills: listSkills(String(parsed.query.dir || '')) }); }
         catch (e) { return json(500, { error: String((e && e.message) || e) }); }
     }
 
     if (req.method === 'GET' && parsed.pathname === '/claude/skill') {
-        try { return json(200, { content: readSkill(String(parsed.query.id || '')) }); }
+        try { return json(200, readSkill(String(parsed.query.id || ''), String(parsed.query.source || 'user'), String(parsed.query.dir || ''))); }
         catch (e) { return json(404, { error: String((e && e.message) || e) }); }
+    }
+
+    if (req.method === 'GET' && parsed.pathname === '/claude/plugins') {
+        listPlugins(String(parsed.query.dir || ''))
+            .then(plugins => json(200, { plugins }))
+            .catch(e => json(500, { error: String((e && e.message) || e) }));
+        return;
+    }
+
+    // Skill e plugin: solo dalla board ammessa e solo JSON, con backup dei file toccati.
+    if (req.method === 'POST' && ['/claude/skill/write', '/claude/skill/override', '/claude/skill/copy', '/claude/plugins/toggle'].includes(parsed.pathname)) {
+        if (!isAllowedOrigin(origin)) return json(403, { error: 'origin non ammessa' });
+        if (!/^application\/json/.test(req.headers['content-type'] || '')) return json(415, { error: 'serve application/json' });
+        readBody(req, 320000).then(async raw => {
+            const b = JSON.parse(raw || '{}');
+            const dir = String(b.dir || '');
+            if (parsed.pathname === '/claude/skill/write') {
+                const r = writeSkill(String(b.id || ''), String(b.source || 'user'), dir, b.content, b.base_sha);
+                return json(r.conflict ? 409 : 200, r.conflict ? { error: 'SKILL.md è cambiato dopo che l\'hai aperto: ricaricalo', sha: r.sha } : r);
+            }
+            if (parsed.pathname === '/claude/skill/override') return json(200, setSkillOverride(String(b.scope || ''), dir, String(b.name || ''), String(b.state || '')));
+            if (parsed.pathname === '/claude/skill/copy') return json(200, copySkillToProject(String(b.id || ''), dir));
+            await togglePlugin(String(b.id || ''), !!b.enabled, String(b.scope || ''), dir);
+            json(200, { ok: true, plugins: await listPlugins(dir).catch(() => null) });
+        }).catch(e => json(400, { error: String((e && e.message) || e) }));
+        return;
     }
 
     if (req.method === 'GET' && parsed.pathname === '/claude/memory') {

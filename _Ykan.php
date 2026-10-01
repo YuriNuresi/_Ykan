@@ -311,10 +311,11 @@ const YKAN_BRIDGE_ONLINE_SECS = 60;
 // Relay: la board mette in coda un comando per un PC (ykan_bridge_cmds), il Bridge di quel PC
 // lo prende con ?bridge=poll (richiesta che resta aperta qualche secondo), lo esegue su se stesso
 // e rimanda la risposta con ?bridge=result. Solo i percorsi di questo elenco (lo stesso che il
-// Bridge controlla a sua volta): letture, apertura di Claude Desktop e scrittura dei file di memoria
+// Bridge controlla a sua volta): letture, apertura di Claude Desktop, file di memoria, skill e plugin
 // (con backup e conferma nella board), niente shell libera.
 const YKAN_RELAY_PATHS = ['/sessions', '/session', '/reviews', '/git', '/claude/skills', '/claude/skill',
     '/claude/memory', '/claude/memory/file', '/claude/memory/write', '/claude/memory/delete',
+    '/claude/skill/write', '/claude/skill/override', '/claude/skill/copy', '/claude/plugins', '/claude/plugins/toggle',
     '/desktop-archive', '/desktop/new', '/desktop/resume'];
 const YKAN_RELAY_WAIT_SECS = 25; // quanto la board aspetta la risposta del PC
 const YKAN_POLL_HOLD_SECS = 8;   // quanto una ?bridge=poll resta aperta se non ci sono comandi
@@ -3797,6 +3798,7 @@ $dataJson = json_encode(ykanPublicData($data));
         .mem-diff-add { background: rgba(22, 163, 74, .16); }
         .mem-diff-del { background: rgba(220, 38, 38, .16); text-decoration: line-through; text-decoration-color: rgba(220, 38, 38, .5); }
         .mem-diff-skip { color: var(--text2); font-style: italic; }
+        .dash-projcard.skill-off b { opacity: .55; text-decoration: line-through; }
         /* Terminale: pannello SEMPRE presente in fondo alla pagina, con tab multiple. Minimizzare
            nasconde solo il corpo (.term-body) e lascia la barra per riaprirlo: le WebSocket/PTY
            restano vive in background. Chiudere una scheda invece termina davvero il processo.
@@ -4368,12 +4370,13 @@ $dataJson = json_encode(ykanPublicData($data));
             <h2>🤖 Claude</h2>
             <span id="claudeBridge" class="dash-bridge"></span>
             <span style="flex:1"></span>
-            <label style="font-size:12px;color:var(--text2)">Progetto (memoria)
-                <select id="claudeMemProject" onchange="claudeFetchMemory()" style="width:auto;padding:2px 4px;max-width:200px"></select></label>
+            <label style="font-size:12px;color:var(--text2)">Progetto
+                <select id="claudeMemProject" onchange="claudeProjectChanged()" style="width:auto;padding:2px 4px;max-width:200px"></select></label>
             <button class="btn" onclick="loadClaudeView()">↻ Aggiorna</button>
         </div>
         <div class="dash-tabs">
             <button data-tab="skills" class="active" onclick="claudeTab('skills')">Skills <span class="dash-count"></span></button>
+            <button data-tab="plugins" onclick="claudeTab('plugins')">Plugin <span class="dash-count"></span></button>
             <button data-tab="memory" onclick="claudeTab('memory')">Memoria <span class="dash-count"></span></button>
         </div>
         <div id="claudeBody"></div>
@@ -7731,7 +7734,7 @@ $dataJson = json_encode(ykanPublicData($data));
         toast('✅ Chiave Gemini valida', 'success');
     }
 
-    // === PANNELLO CLAUDE (skills in lettura, memoria modificabile via Bridge) ===
+    // === PANNELLO CLAUDE (skill, plugin e memoria del PC, via Bridge) ===
     let claudeSkills = null; // null = non ancora caricato/non raggiungibile, [] = caricato ma vuoto
     let claudeMemory = {}; // laneId -> { exists, files } | null (bridge irraggiungibile)
     let claudeTabName = 'skills';
@@ -7754,14 +7757,19 @@ $dataJson = json_encode(ykanPublicData($data));
 
         document.querySelectorAll('#claudeView .dash-tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === claudeTabName));
         claudeRenderBody();
-        await Promise.all([claudeFetchSkills(), claudeFetchMemory()]);
+        await Promise.all([claudeFetchSkills(), claudeFetchMemory(), claudeFetchPlugins()]);
+    }
+
+    function claudeProjectChanged() {
+        claudeFetchMemory(); claudeFetchSkills(); claudeFetchPlugins();
     }
 
     async function claudeFetchSkills() {
         try {
-            const r = await bridgeFetch('/claude/skills');
+            const lane = claudeSelectedLane();
+            const r = await bridgeFetch('/claude/skills' + (lane ? '?dir=' + encodeURIComponent(lane.local_path) : ''));
             if (!r.ok) throw new Error('HTTP ' + r.status);
-            claudeSkills = (await r.json()).skills || [];
+            claudeSkills = ((await r.json()).skills || []).map(sk => ({ source: 'user', overrides: null, effective: 'on', ...sk }));
         } catch (_) { claudeSkills = null; }
         claudeUpdateBridgeBadge();
         claudeRenderBody();
@@ -7805,11 +7813,18 @@ $dataJson = json_encode(ykanPublicData($data));
 
     function claudeRenderBody() {
         const body = document.getElementById('claudeBody');
-        const counts = { skills: claudeSkills ? claudeSkills.length : '', memory: 0 };
+        const memNow = claudeMemory[document.getElementById('claudeMemProject').value];
+        const counts = { skills: claudeSkills ? claudeSkills.length : '', plugins: Array.isArray(claudePlugins) ? claudePlugins.length : '',
+            memory: memNow && memNow.files ? memNow.files.length : '' };
         if (claudeTabName === 'skills') {
             if (claudeSkills === null) body.innerHTML = '<div class="dash-empty">Bridge locale non raggiungibile: avvialo per vedere le skill installate.</div>';
             else if (!claudeSkills.length) body.innerHTML = '<div class="dash-empty">Nessuna skill trovata in ~/.claude/skills.</div>';
-            else body.innerHTML = claudeSkills.map(s => claudeCard('skill|' + s.id, '', s.name, s.description, s.modified)).join('');
+            else {
+                body.innerHTML = skillsHeaderHtml() + claudeSkills.map(skillCardHtml).join('');
+                claudeExpanded.forEach(k => { if (k.startsWith('skill|')) skillRenderFile(k); });
+            }
+        } else if (claudeTabName === 'plugins') {
+            body.innerHTML = pluginsHtml();
         } else {
             const laneId = document.getElementById('claudeMemProject').value;
             const mem = claudeMemory[laneId];
@@ -7830,24 +7845,21 @@ $dataJson = json_encode(ykanPublicData($data));
             }
         }
         document.querySelectorAll('#claudeView .dash-tabs button').forEach(b => {
-            const c = b.dataset.tab === 'skills' ? counts.skills : counts.memory;
+            const c = counts[b.dataset.tab] ?? '';
             b.querySelector('.dash-count').textContent = c === '' ? '' : c;
         });
     }
 
     async function claudeToggle(key) {
-        if (claudeExpanded.has(key)) { claudeExpanded.delete(key); memEditing.delete(key); claudeRenderBody(); return; }
+        if (claudeExpanded.has(key)) { claudeExpanded.delete(key); memEditing.delete(key); skillEditing.delete(key); claudeRenderBody(); return; }
         claudeExpanded.add(key);
         claudeRenderBody();
         const safeId = 'claudeContent_' + key.replace(/[^\w]/g, '_');
         const parts = key.split('|');
         try {
             if (parts[0] === 'skill') {
-                const r = await bridgeFetch('/claude/skill?id=' + encodeURIComponent(parts[1]));
-                if (!r.ok) throw new Error('HTTP ' + r.status);
-                const { content } = await r.json();
-                const el = document.getElementById(safeId);
-                if (el) el.innerHTML = `<div class="mem-pre">${escHtml(content.replace(/^---[\s\S]*?---\r?\n/, ''))}</div>`;
+                await skillLoadFile(key);
+                skillRenderFile(key);
                 return;
             }
             await memLoadFile(key);
@@ -7856,6 +7868,210 @@ $dataJson = json_encode(ykanPublicData($data));
             const el = document.getElementById(safeId);
             if (el) el.innerHTML = '<div class="dash-empty">Errore nel caricamento: ' + escHtml(e.message) + '</div>';
         }
+    }
+
+    // === SKILL E PLUGIN (Bridge 0.6.0) ===
+    // Stato delle skill: skillOverrides nei settings di Claude Code. Ambito "user" = ~/.claude/settings.json
+    // (tutti i progetti), "local" = .claude/settings.local.json del progetto scelto (solo per te).
+    // Plugin: claude plugin enable/disable sul PC. Valgono dalle prossime sessioni di Claude Code.
+    let claudeSkillScope = 'user';
+    let claudePlugins = undefined;   // undefined = non caricati, null = Bridge irraggiungibile, 'old' = Bridge vecchio, [] = lista
+    let claudePluginsError = '';
+    const skillFiles = {};           // "skill|source|id" -> { content, sha }
+    const skillEditing = new Set();
+    const SKILL_STATES = { on: 'Attiva', 'name-only': 'Solo nome', 'user-invocable-only': 'Solo con /comando', off: 'Disattivata' };
+    const SKILL_SOURCES = { user: ['utente', '~/.claude/skills: vale in tutti i progetti'],
+        synced: ['claude.ai', 'Sincronizzata dal tuo account claude.ai'], project: ['progetto', '.claude/skills del progetto: la caricano anche i thread cloud'] };
+
+    function claudeSelectedLane() {
+        const lane = boardData.swimlanes.find(l => l.id === document.getElementById('claudeMemProject').value);
+        return lane && lane.local_path ? lane : null;
+    }
+
+    function claudeBridgeOldError(r, what) {
+        if (r.status === 404) return new Error('il Bridge di ' + memWhere() + ' è di una versione precedente: aggiornalo alla 0.6.0 per ' + what);
+        return null;
+    }
+
+    async function claudeBridgePost(path, payload, what) {
+        const r = await bridgeFetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+        let j = {};
+        try { j = await r.json(); } catch (_) { }
+        const old = claudeBridgeOldError(r, what);
+        if (old) throw old;
+        if (r.status === 409) throw new Error('il file è cambiato nel frattempo: ricaricalo e riprova');
+        if (!r.ok) throw new Error(j.error || 'HTTP ' + r.status);
+        return j;
+    }
+
+    function skillsHeaderHtml() {
+        const lane = claudeSelectedLane();
+        const old = claudeSkills.some(sk => !sk.overrides);
+        return `<div class="dash-sub" style="display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
+            <span>Cambia lo stato per:</span>
+            <label><input type="radio" name="skillScope" value="user" ${claudeSkillScope === 'user' ? 'checked' : ''} onchange="claudeSkillScope='user';claudeRenderBody()"> tutti i progetti <span style="color:var(--text2)">(~/.claude/settings.json)</span></label>
+            <label title="${lane ? '' : 'Scegli in alto un progetto collegato a una cartella'}"><input type="radio" name="skillScope" value="local" ${claudeSkillScope === 'local' ? 'checked' : ''} ${lane ? '' : 'disabled'} onchange="claudeSkillScope='local';claudeRenderBody()"> solo ${lane ? '«' + escHtml(lane.name) + '»' : 'questo progetto'}, per me <span style="color:var(--text2)">(.claude/settings.local.json)</span></label>
+            <span style="color:var(--text2)">Vale dalle prossime sessioni di Claude Code.</span>
+            ${old ? '<span style="color:#dc2626">Aggiorna il Bridge alla 0.6.0 per cambiare lo stato delle skill.</span>' : ''}
+        </div>`;
+    }
+
+    function skillCardHtml(sk) {
+        const key = 'skill|' + sk.source + '|' + sk.id;
+        const scope = claudeSkillScope === 'local' && claudeSelectedLane() ? 'local' : 'user';
+        const cur = sk.overrides ? (sk.overrides[scope] || 'on') : 'on';
+        const [srcLabel, srcTitle] = SKILL_SOURCES[sk.source] || [sk.source, ''];
+        const from = sk.overrides ? (sk.overrides.local ? 'per te in questo progetto' : sk.overrides.project ? 'dal settings.json del progetto' : sk.overrides.user ? 'per tutti i progetti' : '') : '';
+        const differs = sk.effective !== cur;
+        const k = escHtml(key);
+        return `<div class="dash-projcard${sk.effective === 'off' ? ' skill-off' : ''}">
+            <div class="dash-projhead">
+                <span class="git-tag" title="${escHtml(srcTitle)}">${escHtml(srcLabel)}</span>
+                <b style="cursor:pointer" onclick="claudeToggle('${k}')">${escHtml(sk.name)}</b>
+                ${sk.effective !== 'on' ? `<span class="sess-badge" title="Stato in uso ${escHtml(from)}">${escHtml(SKILL_STATES[sk.effective] || sk.effective)}${differs ? ' · ' + escHtml(from) : ''}</span>` : ''}
+                <span style="flex:1"></span>
+                <select onchange="skillSetState('${k}', this.value)" ${sk.overrides ? '' : 'disabled'} title="Stato della skill ${scope === 'local' ? 'per te in questo progetto' : 'in tutti i progetti'}" style="width:auto;padding:2px 4px;font-size:12px">
+                    ${Object.entries(SKILL_STATES).map(([v, l]) => `<option value="${v}" ${v === cur ? 'selected' : ''}>${l}</option>`).join('')}
+                </select>
+                <span class="dash-when">${escHtml(new Date(sk.modified).toLocaleDateString('it-IT'))}</span>
+            </div>
+            ${sk.description ? `<div class="dash-sub" style="cursor:pointer" onclick="claudeToggle('${k}')">${escHtml(sk.description)}</div>` : ''}
+            ${claudeExpanded.has(key) ? `<div class="focus-blockers" id="claudeContent_${key.replace(/[^\w]/g, '_')}"><div class="dash-empty">Carico…</div></div>` : ''}
+        </div>`;
+    }
+
+    function skillParseKey(key) {
+        const [, source, id] = key.split('|');
+        return { source, id, sk: (claudeSkills || []).find(x => x.source === source && x.id === id) };
+    }
+
+    function skillUrl(source, id) {
+        const lane = claudeSelectedLane();
+        return '/claude/skill?id=' + encodeURIComponent(id) + '&source=' + encodeURIComponent(source) + (lane ? '&dir=' + encodeURIComponent(lane.local_path) : '');
+    }
+
+    async function skillLoadFile(key) {
+        const { source, id } = skillParseKey(key);
+        const r = await bridgeFetch(skillUrl(source, id));
+        const j = await r.json();
+        if (!r.ok) throw new Error(j.error || 'HTTP ' + r.status);
+        skillFiles[key] = { content: j.content, sha: j.sha || null };
+    }
+
+    function skillRenderFile(key) {
+        const el = document.getElementById('claudeContent_' + key.replace(/[^\w]/g, '_'));
+        const f = skillFiles[key];
+        if (!el || !f) return;
+        const { source } = skillParseKey(key);
+        const k = escHtml(key);
+        if (skillEditing.has(key)) {
+            el.innerHTML = `<textarea id="skillEdit_${key.replace(/[^\w]/g, '_')}" class="mem-edit" spellcheck="false">${escHtml(f.content)}</textarea>
+                <div style="display:flex;gap:8px;margin-top:6px">
+                    <button class="btn btn-primary" onclick="skillSave('${k}')">💾 Salva</button>
+                    <button class="btn" onclick="skillEditing.delete('${k}');skillRenderFile('${k}')">Annulla</button>
+                    <span style="font-size:11px;color:var(--text2);align-self:center">Prima di salvare il Bridge fa una copia in ~/.ykan-bridge-backups/skills</span>
+                </div>`;
+            return;
+        }
+        const lane = claudeSelectedLane();
+        el.innerHTML = `<div class="mem-pre">${escHtml(f.content)}</div>
+            <div style="display:flex;gap:8px;margin-top:6px;flex-wrap:wrap">
+                ${source !== 'synced' && f.sha ? `<button class="btn" onclick="skillEditing.add('${k}');skillRenderFile('${k}')">✏️ Modifica</button>` : ''}
+                ${source === 'user' && lane ? `<button class="btn" onclick="skillCopyToProject('${k}')" title="Copia la skill in .claude/skills di «${escHtml(lane.name)}»: dopo il commit la usano anche i thread cloud dei Claude Projects">📦 Copia nel progetto</button>` : ''}
+                ${source === 'synced' ? '<span style="font-size:12px;color:var(--text2)">Sincronizzata da claude.ai: si modifica su claude.ai.</span>' : ''}
+            </div>`;
+    }
+
+    async function skillSetState(key, state) {
+        const { sk } = skillParseKey(key);
+        const lane = claudeSelectedLane();
+        const scope = claudeSkillScope === 'local' && lane ? 'local' : 'user';
+        if (!sk) return;
+        if (bridgeIsRemote() && !confirm('Cambiare lo stato di «' + sk.name + '» su ' + memWhere() + '?')) { claudeRenderBody(); return; }
+        try {
+            await claudeBridgePost('/claude/skill/override', { scope, dir: lane ? lane.local_path : '', name: sk.name, state }, 'cambiare lo stato delle skill');
+            toast('«' + sk.name + '»: ' + SKILL_STATES[state] + (scope === 'local' ? ' in ' + lane.name : ' in tutti i progetti'), 'success');
+        } catch (e) { toast('Non cambiato: ' + e.message, 'error'); }
+        claudeFetchSkills();
+    }
+
+    async function skillSave(key) {
+        const { source, id } = skillParseKey(key);
+        const ta = document.getElementById('skillEdit_' + key.replace(/[^\w]/g, '_'));
+        const lane = claudeSelectedLane();
+        if (!ta || !skillFiles[key]) return;
+        if (bridgeIsRemote() && !confirm('Salvare SKILL.md di «' + id + '» su ' + memWhere() + '?')) return;
+        try {
+            const j = await claudeBridgePost('/claude/skill/write', { id, source, dir: lane ? lane.local_path : '', content: ta.value, base_sha: skillFiles[key].sha }, 'modificare le skill');
+            skillFiles[key] = { content: ta.value, sha: j.sha };
+            skillEditing.delete(key);
+            toast('Salvata la skill ' + id, 'success');
+            claudeFetchSkills();
+        } catch (e) { toast('Non salvata: ' + e.message, 'error'); }
+    }
+
+    async function skillCopyToProject(key) {
+        const { id } = skillParseKey(key);
+        const lane = claudeSelectedLane();
+        if (!lane || !confirm('Copiare la skill «' + id + '» in ' + lane.local_path + '/.claude/skills su ' + memWhere() + '?\nPoi fai commit e push: i thread cloud la caricano dal repository.')) return;
+        try {
+            await claudeBridgePost('/claude/skill/copy', { id, dir: lane.local_path }, 'copiare le skill nel progetto');
+            toast('Copiata in .claude/skills/' + id + ': ricordati commit e push', 'success');
+            claudeFetchSkills();
+        } catch (e) { toast('Non copiata: ' + e.message, 'error'); }
+    }
+
+    async function claudeFetchPlugins() {
+        const lane = claudeSelectedLane();
+        claudePluginsError = '';
+        try {
+            const r = await bridgeFetch('/claude/plugins' + (lane ? '?dir=' + encodeURIComponent(lane.local_path) : ''));
+            if (r.status === 404) { claudePlugins = 'old'; }
+            else {
+                const j = await r.json();
+                if (!r.ok) { claudePlugins = []; claudePluginsError = j.error || 'HTTP ' + r.status; }
+                else claudePlugins = j.plugins || [];
+            }
+        } catch (_) { claudePlugins = null; }
+        claudeRenderBody();
+    }
+
+    function pluginsHtml() {
+        if (claudePlugins === undefined) return '<div class="dash-empty">Carico…</div>';
+        if (claudePlugins === null) return '<div class="dash-empty">Bridge locale non raggiungibile.</div>';
+        if (claudePlugins === 'old') return '<div class="dash-empty">Aggiorna il Bridge alla 0.6.0 per vedere e gestire i plugin.</div>';
+        if (claudePluginsError) return '<div class="dash-empty">Non riesco a leggere i plugin: ' + escHtml(claudePluginsError) + '</div>';
+        if (!claudePlugins.length) return '<div class="dash-empty">Nessun plugin installato. Si installano con /plugin in Claude Code.</div>';
+        const lane = claudeSelectedLane();
+        return `<div class="dash-sub" style="margin-bottom:10px">Plugin installati su ${escHtml(memWhere())}${lane ? ' (visti dalla cartella di «' + escHtml(lane.name) + '»)' : ''}. Attivare o disattivare vale dalle prossime sessioni, o dopo /reload-plugins. I plugin dei thread cloud si scelgono in Project settings › Plugins.</div>`
+            + claudePlugins.map(p => {
+                const fixed = ['synced', 'session', 'managed'].includes(p.scope) || /@(inline|skills-dir|synced)$/.test(p.id);
+                const [name, mk] = p.id.split('@');
+                return `<div class="dash-projcard${p.enabled ? '' : ' skill-off'}">
+                    <div class="dash-projhead">
+                        <label class="switch-row" title="${fixed ? 'Non gestibile da qui' : (p.enabled ? 'Disattiva' : 'Attiva')}">
+                            <input type="checkbox" ${p.enabled ? 'checked' : ''} ${fixed ? 'disabled' : ''} onchange="pluginToggle('${escHtml(p.id)}','${escHtml(p.scope)}',this.checked)">
+                        </label>
+                        <b>${escHtml(name)}</b><span style="font-size:12px;color:var(--text2)">@${escHtml(mk || '')}</span>
+                        <span class="git-tag" title="Dove è installato">${escHtml(p.scope)}</span>
+                        ${p.version && p.version !== 'unknown' ? `<span style="font-size:11px;color:var(--text2)">v${escHtml(p.version)}</span>` : ''}
+                        <span style="flex:1"></span>
+                        ${p.errors.length ? `<span class="sess-badge" style="color:#dc2626;border-color:#dc2626" title="${escHtml(p.errors.join('\n'))}">⚠ errori</span>` : ''}
+                    </div>
+                    ${p.errors.length ? `<div class="dash-sub" style="color:#dc2626">${escHtml(p.errors[0])}</div>` : ''}
+                </div>`;
+            }).join('');
+    }
+
+    async function pluginToggle(id, scope, enabled) {
+        const lane = claudeSelectedLane();
+        if (!confirm((enabled ? 'Attivare' : 'Disattivare') + ' il plugin ' + id + ' su ' + memWhere() + '?')) { claudeRenderBody(); return; }
+        try {
+            const j = await claudeBridgePost('/claude/plugins/toggle', { id, enabled, scope, dir: lane ? lane.local_path : '' }, 'gestire i plugin');
+            if (Array.isArray(j.plugins)) claudePlugins = j.plugins;
+            toast(id + (enabled ? ' attivato' : ' disattivato'), 'success');
+        } catch (e) { toast('Non riuscito: ' + e.message, 'error'); }
+        if (!Array.isArray(claudePlugins)) await claudeFetchPlugins(); else claudeRenderBody();
     }
 
     // === MEMORIA: modifica dei file e ottimizzazione con Claude ===
