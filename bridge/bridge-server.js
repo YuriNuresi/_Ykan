@@ -105,9 +105,11 @@ async function heartbeat() {
 // Il Bridge chiede alla board "ci sono comandi per me?" (?bridge=poll, la richiesta resta aperta
 // qualche secondo), esegue ogni comando su se stesso come se arrivasse dalla board (stessi
 // controlli di sempre) e rimanda la risposta (?bridge=result). Solo i percorsi di questo elenco,
-// lo stesso che controlla il server: letture e apertura di Claude Desktop, niente shell.
+// lo stesso che controlla il server: letture, apertura di Claude Desktop e file di memoria
+// (solo quelli ammessi da memoryPath, con backup), niente shell.
 const RELAY_PATHS = new Set(['/sessions', '/session', '/reviews', '/git', '/claude/skills', '/claude/skill',
-    '/claude/memory', '/claude/memory/file', '/desktop-archive', '/desktop/new', '/desktop/resume']);
+    '/claude/memory', '/claude/memory/file', '/claude/memory/write', '/claude/memory/delete',
+    '/desktop-archive', '/desktop/new', '/desktop/resume']);
 
 function selfRequest(method, p, body, origin) {
     return new Promise(resolve => {
@@ -200,7 +202,7 @@ function claudeProjectDirName(localPath) {
     return localPath.replace(/[^a-zA-Z0-9]/g, '-');
 }
 
-// === CLAUDE SKILLS & MEMORIA (pannello Claude, sola lettura da ~/.claude) ===
+// === CLAUDE SKILLS & MEMORIA (pannello Claude: skill in lettura, memoria anche in scrittura) ===
 // Skills sono globali (~/.claude/skills/<nome>/SKILL.md, alcune sono symlink verso
 // ~/.agents/skills — le seguiamo). La memoria e' per-progetto: stessa cartella
 // (~/.claude/projects/<claudeProjectDirName(local_path)>/memory/) gia' usata per le
@@ -242,24 +244,113 @@ function readSkill(id) {
     return fs.readFileSync(path.join(claudeHome(), 'skills', id, 'SKILL.md'), 'utf8');
 }
 
-function listProjectMemory(localPath) {
-    const dir = path.join(claudeHome(), 'projects', claudeProjectDirName(localPath), 'memory');
-    if (!fs.existsSync(dir)) return { exists: false, files: [] };
-    const files = fs.readdirSync(dir).filter(f => f.endsWith('.md') && f !== 'MEMORY.md');
-    const out = files.map(f => {
-        try {
-            const raw = fs.readFileSync(path.join(dir, f), 'utf8');
-            const stat = fs.statSync(path.join(dir, f));
-            const meta = parseFrontmatter(raw);
-            return { file: f, name: meta.name || f.replace(/\.md$/, ''), description: meta.description || '', type: meta.type || '', modified: stat.mtime.toISOString() };
-        } catch (_) { return null; }
-    }).filter(Boolean);
-    return { exists: true, files: out.sort((a, b) => b.modified.localeCompare(a.modified)) };
+// === MEMORIA: tutte le fonti che Claude Code legge per un progetto ===
+// source "memory"  -> ~/.claude/projects/<dir>/memory/*.md (auto memory, indice MEMORY.md)
+// source "project" -> CLAUDE.md / CLAUDE.local.md / .claude/CLAUDE.md nella cartella del progetto
+// source "user"    -> ~/.claude/CLAUDE.md (vale per tutti i progetti)
+// Le scritture passano solo da memoryPath(): niente percorsi liberi, solo questi file.
+const PROJECT_MEMORY_FILES = ['CLAUDE.md', 'CLAUDE.local.md', '.claude/CLAUDE.md'];
+const MEMORY_BACKUP_DIR = path.join(os.homedir(), '.ykan-bridge-backups', 'memory');
+const MEMORY_MAX_BYTES = 200000;
+
+function memoryDir(localPath) {
+    return path.join(claudeHome(), 'projects', claudeProjectDirName(localPath), 'memory');
 }
 
-function readMemoryFile(localPath, file) {
-    if (!/^[\w.-]+\.md$/.test(file)) throw new Error('nome file non valido');
-    return fs.readFileSync(path.join(claudeHome(), 'projects', claudeProjectDirName(localPath), 'memory', file), 'utf8');
+function memoryPath(localPath, source, file) {
+    source = source || 'memory';
+    if (source === 'memory') {
+        if (!/^[\w.-]+\.md$/.test(file)) throw new Error('nome file non valido');
+        return path.join(memoryDir(localPath), file);
+    }
+    if (source === 'project') {
+        if (!PROJECT_MEMORY_FILES.includes(file)) throw new Error('file di progetto non ammesso');
+        if (!localPath || !fs.existsSync(localPath)) throw new Error('cartella del progetto inesistente su questo PC');
+        return path.join(localPath, file);
+    }
+    if (source === 'user') {
+        if (file !== 'CLAUDE.md') throw new Error('file utente non ammesso');
+        return path.join(claudeHome(), 'CLAUDE.md');
+    }
+    throw new Error('fonte non valida');
+}
+
+const sha256 = text => require('crypto').createHash('sha256').update(text, 'utf8').digest('hex');
+
+function memoryEntry(source, file, abs) {
+    try {
+        const raw = fs.readFileSync(abs, 'utf8');
+        const stat = fs.statSync(abs);
+        const meta = parseFrontmatter(raw);
+        return { source, file, name: meta.name || file.replace(/\.md$/, ''), description: meta.description || '',
+            type: meta.type || '', index: source === 'memory' && file === 'MEMORY.md',
+            modified: stat.mtime.toISOString(), size: stat.size };
+    } catch (_) { return null; }
+}
+
+function listProjectMemory(localPath) {
+    const dir = memoryDir(localPath);
+    const out = [];
+    if (fs.existsSync(dir)) {
+        for (const f of fs.readdirSync(dir).filter(f => f.endsWith('.md'))) out.push(memoryEntry('memory', f, path.join(dir, f)));
+    }
+    for (const f of PROJECT_MEMORY_FILES) {
+        if (localPath && fs.existsSync(path.join(localPath, f))) out.push(memoryEntry('project', f, path.join(localPath, f)));
+    }
+    const userFile = path.join(claudeHome(), 'CLAUDE.md');
+    if (fs.existsSync(userFile)) out.push(memoryEntry('user', 'CLAUDE.md', userFile));
+    const files = out.filter(Boolean).sort((a, b) => b.modified.localeCompare(a.modified));
+    return { exists: files.length > 0, files };
+}
+
+function readMemoryFile(localPath, file, source) {
+    const content = fs.readFileSync(memoryPath(localPath, source, file), 'utf8');
+    return { content, sha: sha256(content) };
+}
+
+// Copia del file prima di cambiarlo: ~/.ykan-bridge-backups/memory/<data-ora>/<fonte>/<file>
+function backupMemoryFile(abs, source, file) {
+    if (!fs.existsSync(abs)) return null;
+    const stamp = new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').replace('.', '-').replace('Z', '');
+    let dest = path.join(MEMORY_BACKUP_DIR, stamp, source, file);
+    for (let n = 2; fs.existsSync(dest); n++) dest = path.join(MEMORY_BACKUP_DIR, stamp + '-' + n, source, file);
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    fs.copyFileSync(abs, dest);
+    return dest;
+}
+
+// base_sha = hash del contenuto da cui è partita la modifica: se nel frattempo il file è
+// cambiato (Claude ci ha scritto, o l'hai modificato altrove) la scrittura viene rifiutata.
+function checkBase(abs, baseSha) {
+    if (!fs.existsSync(abs)) return baseSha ? { conflict: true, sha: null } : { conflict: false };
+    const cur = sha256(fs.readFileSync(abs, 'utf8'));
+    return { conflict: baseSha !== undefined && baseSha !== null && baseSha !== cur, sha: cur };
+}
+
+function writeMemoryFile(localPath, source, file, content, baseSha) {
+    if (typeof content !== 'string') throw new Error('contenuto mancante');
+    if (Buffer.byteLength(content, 'utf8') > MEMORY_MAX_BYTES) throw new Error('file troppo grande');
+    const abs = memoryPath(localPath, source, file);
+    if (!fs.existsSync(abs) && source !== 'memory') throw new Error('si possono creare solo nuovi file di memoria');
+    const base = checkBase(abs, baseSha);
+    if (base.conflict) return { conflict: true, sha: base.sha };
+    const backup = backupMemoryFile(abs, source, file);
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    const tmp = abs + '.ykan-tmp';
+    fs.writeFileSync(tmp, content, 'utf8');
+    fs.renameSync(tmp, abs);
+    return { ok: true, sha: sha256(content), backup };
+}
+
+function deleteMemoryFile(localPath, source, file, baseSha) {
+    if (source !== 'memory' || file === 'MEMORY.md') throw new Error('si possono eliminare solo i file di memoria (non l\'indice MEMORY.md)');
+    const abs = memoryPath(localPath, source, file);
+    if (!fs.existsSync(abs)) return { ok: true, missing: true };
+    const base = checkBase(abs, baseSha);
+    if (base.conflict) return { conflict: true, sha: base.sha };
+    const backup = backupMemoryFile(abs, source, file);
+    fs.unlinkSync(abs);
+    return { ok: true, backup };
 }
 
 function buildTitleIndex() {
@@ -945,8 +1036,24 @@ const server = http.createServer((req, res) => {
     }
 
     if (req.method === 'GET' && parsed.pathname === '/claude/memory/file') {
-        try { return json(200, { content: readMemoryFile(String(parsed.query.dir || ''), String(parsed.query.file || '')) }); }
+        try { return json(200, readMemoryFile(String(parsed.query.dir || ''), String(parsed.query.file || ''), String(parsed.query.source || 'memory'))); }
         catch (e) { return json(404, { error: String((e && e.message) || e) }); }
+    }
+
+    // Modifica/elimina un file di memoria: solo dalla board ammessa, solo JSON, con backup e
+    // controllo che il file non sia cambiato nel frattempo (409 = conflitto).
+    if (req.method === 'POST' && (parsed.pathname === '/claude/memory/write' || parsed.pathname === '/claude/memory/delete')) {
+        if (!isAllowedOrigin(origin)) return json(403, { error: 'origin non ammessa' });
+        if (!/^application\/json/.test(req.headers['content-type'] || '')) return json(415, { error: 'serve application/json' });
+        readBody(req, MEMORY_MAX_BYTES + 20000).then(raw => {
+            const b = JSON.parse(raw || '{}');
+            const dir = String(b.dir || ''), source = String(b.source || 'memory'), file = String(b.file || '');
+            const r = parsed.pathname === '/claude/memory/write'
+                ? writeMemoryFile(dir, source, file, b.content, b.base_sha)
+                : deleteMemoryFile(dir, source, file, b.base_sha);
+            json(r.conflict ? 409 : 200, r.conflict ? { error: 'il file è cambiato dopo che l\'hai aperto: ricaricalo', sha: r.sha } : r);
+        }).catch(e => json(400, { error: String((e && e.message) || e) }));
+        return;
     }
 
     if (req.method === 'GET' && parsed.pathname === '/sessions') {

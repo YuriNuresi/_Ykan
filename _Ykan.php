@@ -311,9 +311,11 @@ const YKAN_BRIDGE_ONLINE_SECS = 60;
 // Relay: la board mette in coda un comando per un PC (ykan_bridge_cmds), il Bridge di quel PC
 // lo prende con ?bridge=poll (richiesta che resta aperta qualche secondo), lo esegue su se stesso
 // e rimanda la risposta con ?bridge=result. Solo i percorsi di questo elenco (lo stesso che il
-// Bridge controlla a sua volta): letture e l'apertura di Claude Desktop, niente shell libera.
+// Bridge controlla a sua volta): letture, apertura di Claude Desktop e scrittura dei file di memoria
+// (con backup e conferma nella board), niente shell libera.
 const YKAN_RELAY_PATHS = ['/sessions', '/session', '/reviews', '/git', '/claude/skills', '/claude/skill',
-    '/claude/memory', '/claude/memory/file', '/desktop-archive', '/desktop/new', '/desktop/resume'];
+    '/claude/memory', '/claude/memory/file', '/claude/memory/write', '/claude/memory/delete',
+    '/desktop-archive', '/desktop/new', '/desktop/resume'];
 const YKAN_RELAY_WAIT_SECS = 25; // quanto la board aspetta la risposta del PC
 const YKAN_POLL_HOLD_SECS = 8;   // quanto una ?bridge=poll resta aperta se non ci sono comandi
 
@@ -626,6 +628,40 @@ function saveData(array $data): bool {
         return $st->execute([ykanCurrentUserId(), json_encode($data, JSON_UNESCAPED_UNICODE)]);
     }
     return file_put_contents(DATA_FILE, json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE)) !== false;
+}
+
+// === MEMORIA CLAUDE: snapshot e proposte di ottimizzazione ===
+// La board raccoglie dal Bridge i file di memoria di un progetto (snapshot) e li salva qui;
+// un thread Claude Code li legge con il tool MCP memory_snapshot e lascia le sue proposte con
+// memory_propose. Le proposte si approvano dalla board, che le applica sul PC tramite Bridge.
+// Sta in $data['memory_reviews'][laneId] ma non viaggia con la board (vedi ykanPublicData).
+const YKAN_MEMORY_SOURCES = ['memory', 'project', 'user'];
+const YKAN_MEMORY_MAX_FILE = 200000;
+const YKAN_MEMORY_MAX_TOTAL = 1500000;
+const YKAN_MEMORY_KINDS = ['duplicate', 'stale', 'contradiction', 'broken_link', 'cleanup', 'other'];
+
+function ykanPublicData(array $data): array {
+    unset($data['memory_reviews']);
+    return $data;
+}
+
+function ykanMemoryFileKey(string $source, string $file): string {
+    return $source . ':' . $file;
+}
+
+function ykanMemoryValidFile(string $source, string $file): bool {
+    if (!in_array($source, YKAN_MEMORY_SOURCES, true)) return false;
+    if ($source === 'memory') return (bool)preg_match('/^[\w.-]+\.md$/', $file);
+    if ($source === 'project') return in_array($file, ['CLAUDE.md', 'CLAUDE.local.md', '.claude/CLAUDE.md'], true);
+    return $file === 'CLAUDE.md';
+}
+
+/** Riepilogo senza i contenuti dei file, per la board. */
+function ykanMemoryReviewSummary(?array $r): ?array {
+    if (!$r) return null;
+    $files = array_map(fn($f) => array_diff_key($f, ['content' => 1]), $r['files'] ?? []);
+    return ['snapshot_at' => $r['snapshot_at'] ?? null, 'pc' => $r['pc'] ?? '', 'files' => $files,
+        'summary' => $r['summary'] ?? '', 'proposed_at' => $r['proposed_at'] ?? null, 'proposals' => $r['proposals'] ?? []];
 }
 
 /** Stato per Settings → Generale: modalità, cartella .env, candidate, esito della connessione. Mai i valori. */
@@ -1595,9 +1631,51 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['api'])) {
                 return ['success' => true];
             })(),
 
+            // Memoria Claude: snapshot dei file (dal Bridge) e stato delle proposte
+            'memory_review_get' => (function() use ($data, $input) {
+                $laneId = (string)($input['lane_id'] ?? '');
+                return ['success' => true, 'review' => ykanMemoryReviewSummary($data['memory_reviews'][$laneId] ?? null)];
+            })(),
+
+            'memory_snapshot_save' => (function() use (&$data, $input) {
+                $laneId = (string)($input['lane_id'] ?? '');
+                if (!in_array($laneId, array_column($data['swimlanes'], 'id'), true)) return ['success' => false, 'error' => 'Progetto non trovato'];
+                $files = []; $total = 0;
+                foreach (array_slice((array)($input['files'] ?? []), 0, 80) as $f) {
+                    $source = (string)($f['source'] ?? ''); $file = (string)($f['file'] ?? '');
+                    $content = (string)($f['content'] ?? '');
+                    if (!ykanMemoryValidFile($source, $file)) continue;
+                    if (strlen($content) > YKAN_MEMORY_MAX_FILE) return ['success' => false, 'error' => "$file è troppo grande"];
+                    $total += strlen($content);
+                    if ($total > YKAN_MEMORY_MAX_TOTAL) return ['success' => false, 'error' => 'Memoria troppo grande per lo snapshot'];
+                    $files[] = ['source' => $source, 'file' => $file, 'content' => $content,
+                        'sha' => hash('sha256', $content), 'modified' => (string)($f['modified'] ?? '')];
+                }
+                if (!$files) return ['success' => false, 'error' => 'Nessun file di memoria da analizzare'];
+                $data['memory_reviews'][$laneId] = ['snapshot_at' => date('Y-m-d H:i:s'),
+                    'pc' => mb_substr((string)($input['pc'] ?? ''), 0, 60), 'files' => $files,
+                    'summary' => '', 'proposed_at' => null, 'proposals' => []];
+                saveData($data);
+                return ['success' => true, 'review' => ykanMemoryReviewSummary($data['memory_reviews'][$laneId])];
+            })(),
+
+            'memory_proposal_state' => (function() use (&$data, $input) {
+                $laneId = (string)($input['lane_id'] ?? '');
+                $status = (string)($input['status'] ?? '');
+                if (!in_array($status, ['pending', 'applied', 'rejected'], true)) return ['success' => false, 'error' => 'Stato non valido'];
+                foreach (($data['memory_reviews'][$laneId]['proposals'] ?? []) as $k => $pr) {
+                    if (($pr['id'] ?? '') !== (string)($input['id'] ?? '')) continue;
+                    $data['memory_reviews'][$laneId]['proposals'][$k]['status'] = $status;
+                    $data['memory_reviews'][$laneId]['proposals'][$k]['decided_at'] = date('Y-m-d H:i:s');
+                    saveData($data);
+                    return ['success' => true];
+                }
+                return ['success' => false, 'error' => 'Proposta non trovata'];
+            })(),
+
             // Get all data
             'get_data' => (function() use ($data) {
-                return ['success' => true, 'data' => $data];
+                return ['success' => true, 'data' => ykanPublicData($data)];
             })(),
 
             // === AI-FRIENDLY ENDPOINTS ===
@@ -3227,7 +3305,7 @@ try {
        . "<p>Il .env letto è: <code>{$envs}</code>. Correggi i DB_* oppure togli <code>YKAN_STORAGE=mysql</code> per tornare al file JSON.</p></body>";
     exit;
 }
-$dataJson = json_encode($data);
+$dataJson = json_encode(ykanPublicData($data));
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -3713,6 +3791,12 @@ $dataJson = json_encode($data);
         .sess-tool { font-size: 11px; color: var(--text2); padding: 1px 10px; }
         .sess-badge { font-size: 11px; padding: 1px 8px; border-radius: 10px; background: var(--bg2); border: 1px solid var(--border); }
         .sess-badge.done { color: #16a34a; border-color: #16a34a; }
+        .mem-pre { white-space: pre-wrap; font-family: ui-monospace, Consolas, monospace; font-size: 12px; max-height: 420px; overflow-y: auto; }
+        .mem-edit { width: 100%; min-height: 320px; font-family: ui-monospace, Consolas, monospace; font-size: 12px; padding: 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--text); box-sizing: border-box; }
+        .mem-diff { font-family: ui-monospace, Consolas, monospace; font-size: 12px; white-space: pre-wrap; max-height: 360px; overflow-y: auto; border: 1px solid var(--border); border-radius: 6px; padding: 6px; margin-top: 4px; }
+        .mem-diff-add { background: rgba(22, 163, 74, .16); }
+        .mem-diff-del { background: rgba(220, 38, 38, .16); text-decoration: line-through; text-decoration-color: rgba(220, 38, 38, .5); }
+        .mem-diff-skip { color: var(--text2); font-style: italic; }
         /* Terminale: pannello SEMPRE presente in fondo alla pagina, con tab multiple. Minimizzare
            nasconde solo il corpo (.term-body) e lascia la barra per riaprirlo: le WebSocket/PTY
            restano vive in background. Chiudere una scheda invece termina davvero il processo.
@@ -4526,7 +4610,7 @@ $dataJson = json_encode($data);
             });
             if (res.status === 401 && YKAN_USER) { location.reload(); return { success: false }; } // sessione scaduta: torna alla pagina di accesso
             const result = await res.json();
-            const silentActions = ['get_data', 'gemini_analyze', 'claude_execute', 'claude_status', 'list_themes', 'burndown_data', 'loose_ends', 'link_session', 'session_state', 'github_repo_status', 'bridge_list', 'bridge_pair_code'];
+            const silentActions = ['get_data', 'gemini_analyze', 'claude_execute', 'claude_status', 'list_themes', 'burndown_data', 'loose_ends', 'link_session', 'session_state', 'github_repo_status', 'bridge_list', 'bridge_pair_code', 'memory_review_get', 'memory_snapshot_save', 'memory_proposal_state'];
             if (result.success) {
                 if (!silentActions.includes(action)) {
                     toast('Salvato', 'success');
@@ -7647,7 +7731,7 @@ $dataJson = json_encode($data);
         toast('✅ Chiave Gemini valida', 'success');
     }
 
-    // === PANNELLO CLAUDE (skills + memoria, sola lettura via Bridge) ===
+    // === PANNELLO CLAUDE (skills in lettura, memoria modificabile via Bridge) ===
     let claudeSkills = null; // null = non ancora caricato/non raggiungibile, [] = caricato ma vuoto
     let claudeMemory = {}; // laneId -> { exists, files } | null (bridge irraggiungibile)
     let claudeTabName = 'skills';
@@ -7687,11 +7771,13 @@ $dataJson = json_encode($data);
         const laneId = document.getElementById('claudeMemProject').value;
         const lane = boardData.swimlanes.find(l => l.id === laneId);
         if (!lane || !lane.local_path) { claudeRenderBody(); return; }
+        const review = api('memory_review_get', { lane_id: laneId }).then(r => { claudeReview[laneId] = r.success ? r.review : null; });
         try {
             const r = await bridgeFetch('/claude/memory?dir=' + encodeURIComponent(lane.local_path));
             if (!r.ok) throw new Error('HTTP ' + r.status);
             claudeMemory[laneId] = await r.json();
         } catch (_) { claudeMemory[laneId] = null; }
+        await review;
         claudeUpdateBridgeBadge();
         claudeRenderBody();
     }
@@ -7729,15 +7815,18 @@ $dataJson = json_encode($data);
             const mem = claudeMemory[laneId];
             if (!laneId) body.innerHTML = '<div class="dash-empty">Collega un progetto a una cartella locale per vedere la sua memoria (Kanban → 🔗 Projects).</div>';
             else if (mem === undefined) body.innerHTML = '<div class="dash-empty">Carico…</div>';
-            else if (mem === null) body.innerHTML = '<div class="dash-empty">Bridge locale non raggiungibile.</div>';
+            else if (mem === null) body.innerHTML = memReviewHtml(laneId) + '<div class="dash-empty">Bridge locale non raggiungibile.</div>';
             else if (!mem.exists || !mem.files.length) body.innerHTML = '<div class="dash-empty">Nessuna memoria per questo progetto — Claude non ha ancora salvato nulla qui.</div>';
             else {
                 counts.memory = mem.files.length;
-                body.innerHTML = mem.files.map(f => claudeCard(
-                    'mem|' + laneId + '|' + f.file,
-                    f.type ? `<span class="git-tag">${escHtml(f.type)}</span>` : '',
-                    f.name, f.description, f.modified
+                const order = { project: 0, user: 1, memory: 2 };
+                const files = [...mem.files].sort((a, b) => (order[a.source || 'memory'] - order[b.source || 'memory']) || (b.index - a.index) || b.modified.localeCompare(a.modified));
+                body.innerHTML = memReviewHtml(laneId) + files.map(f => claudeCard(
+                    'mem|' + laneId + '|' + (f.source || 'memory') + '|' + f.file,
+                    memSourceBadge(f) + (f.type ? ` <span class="git-tag">${escHtml(f.type)}</span>` : ''),
+                    f.source === 'memory' || !f.source ? f.name : f.file, f.description, f.modified
                 )).join('');
+                claudeExpanded.forEach(k => { if (k.startsWith('mem|' + laneId + '|')) memRenderFile(k); });
             }
         }
         document.querySelectorAll('#claudeView .dash-tabs button').forEach(b => {
@@ -7747,29 +7836,284 @@ $dataJson = json_encode($data);
     }
 
     async function claudeToggle(key) {
-        if (claudeExpanded.has(key)) { claudeExpanded.delete(key); claudeRenderBody(); return; }
+        if (claudeExpanded.has(key)) { claudeExpanded.delete(key); memEditing.delete(key); claudeRenderBody(); return; }
         claudeExpanded.add(key);
         claudeRenderBody();
         const safeId = 'claudeContent_' + key.replace(/[^\w]/g, '_');
         const parts = key.split('|');
         try {
-            let url;
             if (parts[0] === 'skill') {
-                url = '/claude/skill?id=' + encodeURIComponent(parts[1]);
-            } else {
-                const lane = boardData.swimlanes.find(l => l.id === parts[1]);
-                if (!lane) throw new Error('progetto non trovato');
-                url = '/claude/memory/file?dir=' + encodeURIComponent(lane.local_path) + '&file=' + encodeURIComponent(parts[2]);
+                const r = await bridgeFetch('/claude/skill?id=' + encodeURIComponent(parts[1]));
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                const { content } = await r.json();
+                const el = document.getElementById(safeId);
+                if (el) el.innerHTML = `<div class="mem-pre">${escHtml(content.replace(/^---[\s\S]*?---\r?\n/, ''))}</div>`;
+                return;
             }
-            const r = await bridgeFetch(url);
-            if (!r.ok) throw new Error('HTTP ' + r.status);
-            const { content } = await r.json();
-            const el = document.getElementById(safeId);
-            if (el) el.innerHTML = `<div style="white-space:pre-wrap;font-family:ui-monospace,Consolas,monospace;font-size:12px;max-height:420px;overflow-y:auto">${escHtml(content.replace(/^---[\s\S]*?---\r?\n/, ''))}</div>`;
+            await memLoadFile(key);
+            memRenderFile(key);
         } catch (e) {
             const el = document.getElementById(safeId);
             if (el) el.innerHTML = '<div class="dash-empty">Errore nel caricamento: ' + escHtml(e.message) + '</div>';
         }
+    }
+
+    // === MEMORIA: modifica dei file e ottimizzazione con Claude ===
+    // Fonti (dal Bridge): memory = auto memory del progetto (MEMORY.md è l'indice),
+    // project = CLAUDE.md nella cartella, user = ~/.claude/CLAUDE.md (vale per tutti i progetti).
+    // Le scritture passano dal Bridge, che fa un backup e rifiuta se il file è cambiato nel frattempo.
+    let claudeReview = {};          // laneId -> riepilogo snapshot/proposte (memory_review_get)
+    const memFiles = {};            // chiave "mem|lane|source|file" -> { content, sha }
+    const memEditing = new Set();   // chiavi in modifica
+
+    function memSourceBadge(f) {
+        const src = f.source || 'memory';
+        if (src === 'project') return '<span class="git-tag" title="CLAUDE.md nella cartella del progetto">progetto</span>';
+        if (src === 'user') return '<span class="git-tag" title="~/.claude/CLAUDE.md: vale per tutti i progetti">utente · globale</span>';
+        return f.index ? '<span class="git-tag" title="Indice della memoria: Claude lo legge a ogni sessione">indice</span>' : '';
+    }
+
+    function memParseKey(key) {
+        const [, laneId, source, ...rest] = key.split('|');
+        return { laneId, source, file: rest.join('|'), lane: boardData.swimlanes.find(l => l.id === laneId) };
+    }
+
+    function memFileUrl(lane, source, file) {
+        return '/claude/memory/file?dir=' + encodeURIComponent(lane.local_path) + '&source=' + encodeURIComponent(source) + '&file=' + encodeURIComponent(file);
+    }
+
+    async function memLoadFile(key) {
+        const { lane, source, file } = memParseKey(key);
+        if (!lane) throw new Error('progetto non trovato');
+        const r = await bridgeFetch(memFileUrl(lane, source, file));
+        const j = await r.json();
+        if (!r.ok) throw new Error(j.error || 'HTTP ' + r.status);
+        memFiles[key] = { content: j.content, sha: j.sha };
+        return memFiles[key];
+    }
+
+    function memWhere() { return bridgeIsRemote() ? '«' + bridgeTargetName() + '»' : 'questo PC'; }
+
+    function memRenderFile(key) {
+        const el = document.getElementById('claudeContent_' + key.replace(/[^\w]/g, '_'));
+        const f = memFiles[key];
+        if (!el || !f) return;
+        const { source, file } = memParseKey(key);
+        const k = escHtml(key).replace(/'/g, '&#39;');
+        if (memEditing.has(key)) {
+            el.innerHTML = `<textarea id="memEdit_${key.replace(/[^\w]/g, '_')}" class="mem-edit" spellcheck="false">${escHtml(f.content)}</textarea>
+                <div style="display:flex;gap:8px;margin-top:6px">
+                    <button class="btn btn-primary" onclick="memSave('${k}')">💾 Salva</button>
+                    <button class="btn" onclick="memEditing.delete('${k}');memRenderFile('${k}')">Annulla</button>
+                    <span style="font-size:11px;color:var(--text2);align-self:center">Prima di salvare il Bridge fa una copia in ~/.ykan-bridge-backups/memory</span>
+                </div>`;
+            return;
+        }
+        const canDelete = source === 'memory' && file !== 'MEMORY.md';
+        el.innerHTML = `<div class="mem-pre">${escHtml(f.content)}</div>
+            <div style="display:flex;gap:8px;margin-top:6px">
+                <button class="btn" onclick="memEditing.add('${k}');memRenderFile('${k}')">✏️ Modifica</button>
+                ${canDelete ? `<button class="btn btn-danger" onclick="memDelete('${k}')">🗑️ Elimina</button>` : ''}
+            </div>`;
+    }
+
+    // Scrive (o elimina) tramite Bridge. base_sha: hash del contenuto di partenza ('' = il file non deve esistere).
+    async function memBridgeWrite(lane, source, file, op, content, baseSha) {
+        const path = op === 'delete' ? '/claude/memory/delete' : '/claude/memory/write';
+        const r = await bridgeFetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ dir: lane.local_path, source, file, content, base_sha: baseSha }) });
+        let j = {};
+        try { j = await r.json(); } catch (_) { }
+        if (r.status === 404) throw new Error('il Bridge di ' + memWhere() + ' è di una versione precedente: aggiornalo alla 0.5.0 (Settings → Strumenti)');
+        if (r.status === 409) throw new Error('il file è cambiato nel frattempo: ricaricalo e riprova');
+        if (!r.ok) throw new Error(j.error || 'HTTP ' + r.status);
+        return j;
+    }
+
+    async function memSave(key) {
+        const { lane, source, file } = memParseKey(key);
+        const ta = document.getElementById('memEdit_' + key.replace(/[^\w]/g, '_'));
+        if (!lane || !ta || !memFiles[key]) return;
+        if (source === 'user' && !confirm('~/.claude/CLAUDE.md vale per TUTTI i progetti. Salvare la modifica su ' + memWhere() + '?')) return;
+        if (source !== 'user' && bridgeIsRemote() && !confirm('Salvare ' + file + ' su ' + memWhere() + '?')) return;
+        try {
+            const j = await memBridgeWrite(lane, source, file, 'write', ta.value, memFiles[key].sha);
+            memFiles[key] = { content: ta.value, sha: j.sha };
+            memEditing.delete(key);
+            toast('Salvato ' + file, 'success');
+            claudeFetchMemory();
+        } catch (e) { toast('Non salvato: ' + e.message, 'error'); }
+    }
+
+    async function memDelete(key) {
+        const { lane, source, file } = memParseKey(key);
+        if (!lane || !memFiles[key]) return;
+        if (!confirm('Eliminare ' + file + ' su ' + memWhere() + '? Il Bridge ne tiene una copia in ~/.ykan-bridge-backups/memory.\nRicordati di togliere la sua voce da MEMORY.md.')) return;
+        try {
+            await memBridgeWrite(lane, source, file, 'delete', '', memFiles[key].sha);
+            claudeExpanded.delete(key); delete memFiles[key];
+            toast('Eliminato ' + file, 'success');
+            claudeFetchMemory();
+        } catch (e) { toast('Non eliminato: ' + e.message, 'error'); }
+    }
+
+    // Prompt per il thread che analizza la memoria: legge lo snapshot via MCP e lascia proposte.
+    function memOptimizePrompt(lane) {
+        const n = lane.name;
+        return [
+            `Ottimizza la memoria di Claude Code del progetto «${n}» della board _Ykan. Non modificare nessun file direttamente: lavori solo con il connettore MCP di _Ykan.`,
+            ``,
+            `1. Chiama memory_snapshot(project: "${n}"). Contiene i CLAUDE.md del progetto, il CLAUDE.md utente (vale per tutti i progetti), l'indice MEMORY.md con i suoi file di memoria, i task aperti e quelli chiusi negli ultimi 90 giorni.`,
+            `2. Cerca:`,
+            `   - informazioni duplicate in più file;`,
+            `   - informazioni superate: cose descritte come da fare o in corso che risultano chiuse fra i task, decisioni poi cambiate${lane.github_repo ? `, dettagli che non corrispondono più al codice del repository ${lane.github_repo} (se serve controllalo)` : ''};`,
+            `   - contraddizioni tra file;`,
+            `   - voci di MEMORY.md che puntano a file inesistenti, o file di memoria senza voce nell'indice;`,
+            `   - testo prolisso che si può dire in meno righe senza perdere informazioni.`,
+            `3. Chiama memory_propose(project: "${n}", summary, proposals) con al massimo una proposta per file:`,
+            `   - action "edit" con il contenuto completo nuovo del file in new_content (mantieni il frontmatter YAML dei file di memoria);`,
+            `   - action "delete" per un file di memoria da eliminare dopo averne spostato altrove il contenuto ancora utile (mai MEMORY.md);`,
+            `   - action "create" per un nuovo file di memoria;`,
+            `   - per ognuna kind (duplicate, stale, contradiction, broken_link, cleanup) e reason: una riga in italiano.`,
+            `Regole: non togliere informazioni ancora valide; unendo duplicati tieni il testo nel posto più adatto (regole valide ovunque nel CLAUDE.md utente, regole del repository nel CLAUDE.md del progetto, il resto nei file di memoria) e aggiorna MEMORY.md di conseguenza; tocca il CLAUDE.md utente solo se serve davvero, perché vale per tutti i progetti.`,
+            `Alla fine scrivimi un riepilogo breve. Applicherò io le proposte dalla board.`
+        ].join('\n');
+    }
+
+    async function memOptimize() {
+        const laneId = document.getElementById('claudeMemProject').value;
+        const lane = boardData.swimlanes.find(l => l.id === laneId);
+        const mem = claudeMemory[laneId];
+        if (!lane || !mem || !mem.files || !mem.files.length) { toast('Nessuna memoria da analizzare per questo progetto', 'error'); return; }
+        const win = window.open('about:blank', '_blank'); // subito, prima degli await: altrimenti il browser blocca il popup
+        try {
+            toast('Raccolgo i file di memoria…', 'info');
+            const files = await Promise.all(mem.files.map(async f => {
+                const r = await bridgeFetch(memFileUrl(lane, f.source || 'memory', f.file));
+                const j = await r.json();
+                if (!r.ok) throw new Error(f.file + ': ' + (j.error || 'HTTP ' + r.status));
+                return { source: f.source || 'memory', file: f.file, content: j.content, modified: f.modified };
+            }));
+            const res = await api('memory_snapshot_save', { lane_id: laneId, files, pc: bridgeIsRemote() ? bridgeTargetName() : '' });
+            if (!res.success) throw new Error(res.error || 'snapshot non salvato');
+            claudeReview[laneId] = res.review;
+            claudeRenderBody();
+            await navigator.clipboard.writeText(memOptimizePrompt(lane)).catch(() => {});
+            if (win) win.location.href = lane.claude_project_url || 'https://claude.ai/code';
+            toast('Snapshot salvato e prompt copiato: incollalo nella sessione Claude appena aperta', 'success');
+        } catch (e) {
+            if (win) win.close();
+            toast('Ottimizzazione non avviata: ' + e.message, 'error');
+        }
+    }
+
+    function memCopyPrompt() {
+        const lane = boardData.swimlanes.find(l => l.id === document.getElementById('claudeMemProject').value);
+        if (!lane) return;
+        navigator.clipboard.writeText(memOptimizePrompt(lane)).then(() => toast('Prompt copiato'), () => toast('Copia non riuscita', 'error'));
+    }
+
+    async function memRefreshReview() {
+        const laneId = document.getElementById('claudeMemProject').value;
+        const r = await api('memory_review_get', { lane_id: laneId });
+        claudeReview[laneId] = r.success ? r.review : null;
+        claudeRenderBody();
+    }
+
+    const MEM_KINDS = { duplicate: '🔁 Duplicato', stale: '🕰️ Superato', contradiction: '⚔️ Contraddizione',
+        broken_link: '🔗 Indice', cleanup: '🧹 Pulizia', other: '📝 Altro' };
+    const MEM_ACTIONS = { edit: 'modifica', delete: 'elimina', create: 'nuovo file' };
+
+    // Differenze riga per riga (LCS): i file di memoria sono piccoli, basta e avanza.
+    function memLineDiff(a, b) {
+        const x = a.split('\n'), y = b.split('\n');
+        if (x.length * y.length > 4e6) return [...x.map(s => ['-', s]), ...y.map(s => ['+', s])];
+        const m = x.length, n = y.length;
+        const L = Array.from({ length: m + 1 }, () => new Uint32Array(n + 1));
+        for (let i = m - 1; i >= 0; i--) for (let j = n - 1; j >= 0; j--)
+            L[i][j] = x[i] === y[j] ? L[i + 1][j + 1] + 1 : Math.max(L[i + 1][j], L[i][j + 1]);
+        const out = []; let i = 0, j = 0;
+        while (i < m && j < n) {
+            if (x[i] === y[j]) { out.push([' ', x[i]]); i++; j++; }
+            else if (L[i + 1][j] >= L[i][j + 1]) out.push(['-', x[i++]]);
+            else out.push(['+', y[j++]]);
+        }
+        while (i < m) out.push(['-', x[i++]]);
+        while (j < n) out.push(['+', y[j++]]);
+        return out;
+    }
+
+    function memDiffHtml(p) {
+        const rows = memLineDiff(p.old_content || '', p.action === 'delete' ? '' : (p.new_content || ''));
+        // Le righe uguali lontane dai cambiamenti si comprimono
+        const near = rows.map((r, i) => r[0] !== ' ' || rows.slice(Math.max(0, i - 2), i + 3).some(q => q[0] !== ' '));
+        let html = '', skipped = 0;
+        rows.forEach((r, i) => {
+            if (!near[i]) { skipped++; return; }
+            if (skipped) { html += `<div class="mem-diff-skip">… ${skipped} righe uguali …</div>`; skipped = 0; }
+            html += `<div class="${r[0] === '+' ? 'mem-diff-add' : r[0] === '-' ? 'mem-diff-del' : ''}">${r[0]} ${escHtml(r[1])}</div>`;
+        });
+        if (skipped) html += `<div class="mem-diff-skip">… ${skipped} righe uguali …</div>`;
+        return `<div class="mem-diff">${html}</div>`;
+    }
+
+    function memReviewHtml(laneId) {
+        const rv = claudeReview[laneId];
+        const head = `<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
+            <button class="btn btn-primary" onclick="memOptimize()" title="Salva uno snapshot dei file di memoria e apre Claude con il prompt per analizzarli">🧹 Ottimizza con Claude</button>
+            ${rv ? `<button class="btn" onclick="memCopyPrompt()">📋 Copia prompt</button>
+                    <button class="btn" onclick="memRefreshReview()">↻ Proposte</button>
+                    <span style="font-size:12px;color:var(--text2)">Snapshot del ${escHtml(rv.snapshot_at || '')}${rv.pc ? ' da ' + escHtml(rv.pc) : ''}${rv.proposed_at ? ' · proposte del ' + escHtml(rv.proposed_at) : ' · in attesa delle proposte di Claude'}</span>` : ''}
+        </div>`;
+        if (!rv || !(rv.proposals || []).length) return head;
+        const pending = rv.proposals.filter(p => p.status === 'pending');
+        const done = rv.proposals.length - pending.length;
+        return head + `<div class="dash-projcard" style="margin-bottom:12px">
+            <div class="dash-projhead"><b>Proposte di Claude</b><span style="flex:1"></span>
+                <span class="dash-when">${pending.length} da decidere${done ? ' · ' + done + ' già decise' : ''}</span></div>
+            ${rv.summary ? `<div class="dash-sub" style="white-space:pre-wrap">${escHtml(rv.summary)}</div>` : ''}
+            ${rv.proposals.map(p => `<div style="border-top:1px solid var(--border);padding:8px 0">
+                <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+                    <span class="sess-badge">${MEM_KINDS[p.kind] || p.kind}</span>
+                    <b style="font-size:13px">${escHtml(p.file)}</b>
+                    ${memSourceBadge({ source: p.source, index: p.source === 'memory' && p.file === 'MEMORY.md' })}
+                    <span style="font-size:11px;color:var(--text2)">${MEM_ACTIONS[p.action] || p.action}</span>
+                    <span style="flex:1"></span>
+                    ${p.status === 'pending'
+                        ? `<button class="btn btn-primary" style="padding:2px 10px;font-size:12px" onclick="memApplyProposal('${escHtml(laneId)}','${escHtml(p.id)}')">Applica</button>
+                           <button class="btn" style="padding:2px 10px;font-size:12px" onclick="memDecide('${escHtml(laneId)}','${escHtml(p.id)}','rejected')">Scarta</button>`
+                        : `<span class="sess-badge${p.status === 'applied' ? ' done' : ''}">${p.status === 'applied' ? '✔ applicata' : '✕ scartata'}</span>`}
+                </div>
+                ${p.reason ? `<div style="font-size:12px;color:var(--text2);margin-top:2px">${escHtml(p.reason)}</div>` : ''}
+                ${p.status === 'pending' ? `<details style="margin-top:4px"><summary style="font-size:12px;cursor:pointer">Mostra le modifiche</summary>${memDiffHtml(p)}</details>` : ''}
+            </div>`).join('')}
+        </div>`;
+    }
+
+    async function memDecide(laneId, id, status) {
+        const r = await api('memory_proposal_state', { lane_id: laneId, id, status });
+        if (!r.success) return;
+        const p = (claudeReview[laneId]?.proposals || []).find(x => x.id === id);
+        if (p) p.status = status;
+        claudeRenderBody();
+    }
+
+    async function memApplyProposal(laneId, id) {
+        const lane = boardData.swimlanes.find(l => l.id === laneId);
+        const p = (claudeReview[laneId]?.proposals || []).find(x => x.id === id);
+        if (!lane || !p) return;
+        const what = p.action === 'delete' ? 'Eliminare ' + p.file : p.action === 'create' ? 'Creare ' + p.file : 'Modificare ' + p.file;
+        if (!confirm(what + ' su ' + memWhere() + '?' + (p.source === 'user' ? '\n~/.claude/CLAUDE.md vale per TUTTI i progetti.' : '') + '\nIl Bridge fa prima una copia del file.')) return;
+        try {
+            await memBridgeWrite(lane, p.source, p.file, p.action === 'delete' ? 'delete' : 'write', p.new_content, p.action === 'create' ? '' : p.base_sha);
+        } catch (e) {
+            toast('Non applicata: ' + e.message.replace('ricaricalo e riprova', 'rilancia «Ottimizza con Claude»'), 'error');
+            return;
+        }
+        Object.keys(memFiles).forEach(k => { if (k.startsWith('mem|' + laneId + '|')) delete memFiles[k]; });
+        await memDecide(laneId, id, 'applied');
+        toast('Applicata: ' + p.file, 'success');
+        claudeFetchMemory();
     }
 
     // === BADGE CONSUMO CLAUDE (via estensione Chrome "Ykan Usage Badge", vedi extension/) ===

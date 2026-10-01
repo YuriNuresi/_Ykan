@@ -39,12 +39,13 @@ A second tab next to Kanban, sharing one project + period filter across four vie
 ### MCP Server & Automation
 Beyond remote board/file control from the Claude mobile app, `mcp.php` turns _Ykan into a
 coordination hub for every project linked to it:
-- **Board & file tools** - `list_projects`, `board_summary`, `list_tasks`, `add_task`, `move_task`, `complete_task`, `thread_report`, and folder-scoped `list_files`/`read_file`/`edit_file`/`write_file`/`search_files`
+- **Board & file tools** - `list_projects`, `board_summary`, `list_tasks`, `add_task`, `move_task`, `complete_task`, `thread_report`, `memory_snapshot`, `memory_propose`, and folder-scoped `list_files`/`read_file`/`edit_file`/`write_file`/`search_files`
 - **Database tools** (MySQL) - `db_list_tables`, `db_schema`, `db_query`, `db_exec`, `db_dump_table` (backup before writes)
 - **Mail tool** - `send_digest_mail` sends an HTML summary email
 - **Google Tasks sync** - optional bidirectional sync (`sync_google_tasks`) when the host provides Google credentials
 - **Automated routines** - "Claude Do" (hourly, processes cards queued in a "Claude Do" column from any project) and "Sistema Vacanze" (nightly, scouts one project per day for improvements and creates or implements tasks), both driven straight from the board
 - **Claude Code Projects** - each project can be linked to a Claude Code Project; its threads report their state (working, waiting on you, PR ready, merged) with `thread_report`, shown as a badge on the card, in the card details and in the Dashboard. "📋 Istruzioni Project" copies ready-made project instructions
+- **Claude memory** - the Claude tab lists every memory source of a project (project `CLAUDE.md`, user `~/.claude/CLAUDE.md`, auto-memory `MEMORY.md` and its files) and edits them through the Bridge (backup + conflict check). "🧹 Ottimizza con Claude" saves a snapshot and opens Claude: a thread reads it with `memory_snapshot`, sends duplicates/stale/contradictions as `memory_propose` proposals, and you apply or discard each one from the board with a line diff
 - **`.env` config** - Secrets (`MCP_SECRET`, `MCP_ROOT`, optional `ANTHROPIC_KEY`) loaded from `.env`, never hardcoded
 - See [MCP_SETUP.md](MCP_SETUP.md) for the full setup guide
 
