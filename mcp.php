@@ -652,8 +652,8 @@ function mcp_run_tool(string $name, array $a): string {
                     $l['name'],
                     $linked ? " [folder: {$l['path']}]" : ' [no folder linked]',
                     $n,
-                    !empty($l['url']) ? " ({$l['url']})" : ''
-                ) . (!empty($l['claude_project_url']) ? " [Claude Project: {$l['claude_project_url']}]" : '');
+                    (!empty($l['url']) ? " ({$l['url']})" : '') . (!empty($l['claude_project_url']) ? " [Claude Project: {$l['claude_project_url']}]" : '')
+                );
             }
             return $out ? "Projects:\n" . implode("\n", $out) : 'No projects yet.';
         }
