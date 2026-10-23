@@ -172,7 +172,10 @@ $GLOBALS['ykanUserId'] = $__uid;
 
 // Chi non è il proprietario usa solo gli strumenti della board: niente file, DB, mail, sync.
 const MCP_USER_TOOLS = ['list_projects', 'board_summary', 'list_tasks', 'get_task', 'add_task', 'move_task',
-    'complete_task', 'add_label', 'set_task_label'];
+    'complete_task', 'add_label', 'set_task_label', 'thread_report', 'memory_snapshot', 'memory_propose'];
+
+// Stati di un thread di un Claude Code Project (gli stessi gruppi del pannello Overview).
+const MCP_THREAD_STATES = ['working', 'waiting', 'review', 'landing', 'idle', 'resolved', 'failed'];
 
 header('Content-Type: application/json; charset=utf-8');
 
@@ -491,6 +494,53 @@ function mcp_tool_defs(): array {
                 'label'   => ['type' => 'string', 'description' => 'Label name (partial match, e.g. "Stable"). Empty string clears the label.'],
             ], 'required' => ['label']],
         ],
+        [
+            'name' => 'thread_report',
+            'description' => 'Link a Claude Code Project thread (or any cloud session) to a task and report its state. '
+                . 'Call it when the thread starts working on the task and again whenever its state changes '
+                . '(waiting on the user, pull request ready for review, merged, failed). Repeated calls with the same thread_url update the same entry. '
+                . 'Works on archived tasks too, so a thread can report after complete_task.',
+            'inputSchema' => ['type' => 'object', 'properties' => [
+                'id'         => ['type' => 'string', 'description' => 'Short task id, e.g. "25" or "#25".'],
+                'title'      => ['type' => 'string', 'description' => 'Task title (partial match) — use if you do not have the id.'],
+                'project'    => $projectArg,
+                'thread_url' => ['type' => 'string', 'description' => 'URL of this thread/session on claude.ai (https://claude.ai/code/...).'],
+                'state'      => ['type' => 'string', 'enum' => MCP_THREAD_STATES,
+                    'description' => 'working = running; waiting = needs the user; review = PR open, awaiting review; landing = PR approved/queued; idle = finished, nothing pending; resolved = done (e.g. PR merged); failed = stopped on an error.'],
+                'name'       => ['type' => 'string', 'description' => 'Short thread title (optional).'],
+                'branch'     => ['type' => 'string', 'description' => 'Git branch the thread works on (optional).'],
+                'pr_url'     => ['type' => 'string', 'description' => 'Pull request URL on github.com (optional).'],
+                'summary'    => ['type' => 'string', 'description' => 'One or two lines: what was done, or what the thread needs from the user (optional).'],
+            ], 'required' => ['thread_url', 'state']],
+        ],
+        [
+            'name' => 'memory_snapshot',
+            'description' => 'Read the Claude Code memory of a project, as last collected by the _Ykan board from the user\'s PC: '
+                . 'the project CLAUDE.md files, the user ~/.claude/CLAUDE.md, the auto-memory index MEMORY.md and its topic files, '
+                . 'plus the open tasks and the tasks completed in the last 90 days. Use it to find duplicated, outdated or contradictory memory, '
+                . 'then send your suggestions with memory_propose. It never changes anything.',
+            'inputSchema' => ['type' => 'object', 'properties' => ['project' => $projectArg], 'required' => ['project']],
+        ],
+        [
+            'name' => 'memory_propose',
+            'description' => 'Send proposed changes to the memory files read with memory_snapshot. Nothing is applied: the user reviews '
+                . 'each proposal on the board and applies it. Replaces the previous pending proposals of that project. '
+                . 'One proposal per file: action "edit" (new_content = the COMPLETE new file content, keep the YAML frontmatter of memory files), '
+                . '"delete" (only topic files of source "memory", never MEMORY.md) or "create" (new topic file of source "memory").',
+            'inputSchema' => ['type' => 'object', 'properties' => [
+                'project'   => $projectArg,
+                'summary'   => ['type' => 'string', 'description' => 'Two or three lines on what you found, in Italian.'],
+                'proposals' => ['type' => 'array', 'items' => ['type' => 'object', 'properties' => [
+                    'source'      => ['type' => 'string', 'enum' => YKAN_MEMORY_SOURCES, 'description' => 'As listed by memory_snapshot.'],
+                    'file'        => ['type' => 'string', 'description' => 'File name as listed by memory_snapshot, e.g. "MEMORY.md", "deploy.md", "CLAUDE.md".'],
+                    'action'      => ['type' => 'string', 'enum' => ['edit', 'delete', 'create']],
+                    'kind'        => ['type' => 'string', 'enum' => YKAN_MEMORY_KINDS,
+                        'description' => 'duplicate = same information in several files; stale = no longer true (e.g. task already done); contradiction; broken_link = MEMORY.md entry without file or file without entry; cleanup = shorter/clearer wording.'],
+                    'reason'      => ['type' => 'string', 'description' => 'One line, in Italian: why this change.'],
+                    'new_content' => ['type' => 'string', 'description' => 'Complete new content of the file (edit/create).'],
+                ], 'required' => ['source', 'file', 'action', 'kind', 'reason']]],
+            ], 'required' => ['project', 'proposals']],
+        ],
         // -------- Phase 2: Files (scoped to a linked project folder) --------
         [
             'name' => 'list_files',
@@ -630,7 +680,7 @@ function mcp_run_tool(string $name, array $a): string {
                     $l['name'],
                     $linked ? " [folder: {$l['path']}]" : ' [no folder linked]',
                     $n,
-                    !empty($l['url']) ? " ({$l['url']})" : ''
+                    (!empty($l['url']) ? " ({$l['url']})" : '') . (!empty($l['claude_project_url']) ? " [Claude Project: {$l['claude_project_url']}]" : '')
                 );
             }
             return $out ? "Projects:\n" . implode("\n", $out) : 'No projects yet.';
@@ -821,9 +871,125 @@ function mcp_run_tool(string $name, array $a): string {
             if (!empty($c['label_id'])) $out[] = 'Label: ' . ($labels[$c['label_id']] ?? '?');
             if (!empty($c['due_date'])) $out[] = 'Due: ' . $c['due_date'];
             if (!empty($c['files'])) $out[] = 'Files: ' . implode(', ', array_map(fn($f) => is_array($f) ? ($f['path'] ?? '') : $f, $c['files']));
+            foreach (($c['threads'] ?? []) as $t) {
+                $out[] = 'Thread [' . ($t['state'] ?? '?') . ']: ' . ($t['name'] ?? $t['url'])
+                    . (!empty($t['pr_url']) ? ' — PR ' . $t['pr_url'] : '') . (!empty($t['summary']) ? ' — ' . $t['summary'] : '');
+            }
             $out[] = '';
             $out[] = trim((string)($c['description'] ?? '')) !== '' ? $c['description'] : '(no description)';
             return implode("\n", $out);
+        }
+
+        case 'thread_report': {
+            $needle = trim((string)($a['id'] ?? $a['title'] ?? ''));
+            $filter = isset($a['project']) ? mcp_find_lane($data, $a['project']) : null;
+            $i = mcp_find_card_index($data, $needle, $filter);
+            if ($i === null && preg_match('/^#?(\d+)$/', $needle, $m)) {
+                // Anche le card già archiviate: il thread può riferire dopo complete_task.
+                foreach (($data['cards'] ?? []) as $k => $c) if ((int)($c['seq'] ?? 0) === (int)$m[1]) { $i = $k; break; }
+            }
+            if ($i === null) throw new McpError("Task '$needle' not found.");
+            $url = trim((string)($a['thread_url'] ?? ''));
+            if (!preg_match('~^https://claude\.ai/[\w\-./?=&%#]+$~', $url)) throw new McpError('thread_url must be a https://claude.ai/... link.');
+            $state = (string)($a['state'] ?? '');
+            if (!in_array($state, MCP_THREAD_STATES, true)) throw new McpError('state must be one of: ' . implode(', ', MCP_THREAD_STATES));
+            $pr = trim((string)($a['pr_url'] ?? ''));
+            if ($pr !== '' && !preg_match('~^https://github\.com/[\w.-]+/[\w.-]+/pull/\d+$~', $pr)) throw new McpError('pr_url must be a https://github.com/<owner>/<repo>/pull/<n> link.');
+            $clip = fn($k, $n) => mb_substr(trim((string)($a[$k] ?? '')), 0, $n);
+
+            $threads = $data['cards'][$i]['threads'] ?? [];
+            $now = date('Y-m-d H:i:s');
+            $entry = null;
+            foreach ($threads as $k => $t) if (($t['url'] ?? '') === $url) { $entry = $k; break; }
+            if ($entry === null) { $threads[] = ['url' => $url, 'created_at' => $now]; $entry = count($threads) - 1; }
+            $t = &$threads[$entry];
+            $t['state'] = $state;
+            $t['updated_at'] = $now;
+            foreach (['name' => 120, 'branch' => 120, 'summary' => 500] as $k => $n) if ($clip($k, $n) !== '') $t[$k] = $clip($k, $n);
+            if ($pr !== '') $t['pr_url'] = $pr;
+            unset($t);
+            $data['cards'][$i]['threads'] = $threads;
+            $data['cards'][$i]['updated_at'] = $now;
+            mcp_save($data);
+            $c = $data['cards'][$i];
+            mcp_audit('thread_report', ['seq' => $c['seq'] ?? null, 'state' => $state, 'url' => $url]);
+            return 'Thread linked to #' . ($c['seq'] ?? '?') . " '{$c['title']}' (state: $state).";
+        }
+
+        case 'memory_snapshot': {
+            $lane = mcp_find_lane($data, (string)($a['project'] ?? ''));
+            if (!$lane) throw new McpError("Project '" . ($a['project'] ?? '') . "' not found. Available: " . mcp_project_names($data));
+            $r = $data['memory_reviews'][$lane['id']] ?? null;
+            if (!$r || empty($r['files'])) {
+                throw new McpError("No memory snapshot for '{$lane['name']}'. Ask the user to press \"Ottimizza con Claude\" in _Ykan (Claude → Memoria) first.");
+            }
+            $out = ["# Memoria di Claude Code — progetto {$lane['name']}",
+                "Snapshot del {$r['snapshot_at']}" . (!empty($r['pc']) ? " dal PC {$r['pc']}" : '') . '.',
+                'Fonti: memory = auto memory del progetto (MEMORY.md è l\'indice), project = CLAUDE.md nella cartella del progetto, user = ~/.claude/CLAUDE.md (vale per TUTTI i progetti).', ''];
+            foreach ($r['files'] as $f) {
+                $out[] = "===== [{$f['source']}] {$f['file']}" . (!empty($f['modified']) ? " (modificato {$f['modified']})" : '') . ' =====';
+                $out[] = rtrim($f['content']);
+                $out[] = '';
+            }
+            $cols = array_column($data['columns'] ?? [], 'name', 'id');
+            $open = []; $done = [];
+            $cut = strtotime('-90 days');
+            foreach (($data['cards'] ?? []) as $c) {
+                if (($c['swimlane_id'] ?? '') !== $lane['id']) continue;
+                $line = '#' . ($c['seq'] ?? '?') . ' ' . $c['title'];
+                if (empty($c['archived'])) $open[] = '- ' . $line . ' [' . ($cols[$c['column_id'] ?? ''] ?? '?') . ']';
+                elseif (strtotime($c['archived_at'] ?? '') >= $cut) $done[] = '- ' . $line . ' (chiuso il ' . substr((string)$c['archived_at'], 0, 10) . ')';
+            }
+            $out[] = '===== Task aperti (' . count($open) . ') =====';
+            $out[] = $open ? implode("\n", $open) : '(nessuno)';
+            $out[] = '';
+            $out[] = '===== Task chiusi negli ultimi 90 giorni (' . count($done) . ') =====';
+            $out[] = $done ? implode("\n", $done) : '(nessuno)';
+            if (!empty($lane['github_repo'])) $out[] = "\nRepository GitHub del progetto: {$lane['github_repo']}";
+            return implode("\n", $out);
+        }
+
+        case 'memory_propose': {
+            $lane = mcp_find_lane($data, (string)($a['project'] ?? ''));
+            if (!$lane) throw new McpError("Project '" . ($a['project'] ?? '') . "' not found. Available: " . mcp_project_names($data));
+            $r = $data['memory_reviews'][$lane['id']] ?? null;
+            if (!$r || empty($r['files'])) throw new McpError('No memory snapshot for this project: call memory_snapshot first.');
+            $known = [];
+            foreach ($r['files'] as $f) $known[ykanMemoryFileKey($f['source'], $f['file'])] = $f;
+            $list = is_array($a['proposals'] ?? null) ? $a['proposals'] : [];
+            if (!$list) throw new McpError('proposals is empty.');
+            if (count($list) > 40) throw new McpError('Too many proposals (max 40).');
+            $props = []; $seen = [];
+            foreach ($list as $n => $pr) {
+                $source = (string)($pr['source'] ?? ''); $file = (string)($pr['file'] ?? '');
+                $action = (string)($pr['action'] ?? ''); $kind = (string)($pr['kind'] ?? 'other');
+                $key = ykanMemoryFileKey($source, $file);
+                $where = 'Proposal ' . ($n + 1) . " ($source/$file)";
+                if (!ykanMemoryValidFile($source, $file)) throw new McpError("$where: unknown source/file.");
+                if (isset($seen[$key])) throw new McpError("$where: only one proposal per file.");
+                $seen[$key] = true;
+                if (!in_array($action, ['edit', 'delete', 'create'], true)) throw new McpError("$where: action must be edit, delete or create.");
+                if (!in_array($kind, YKAN_MEMORY_KINDS, true)) $kind = 'other';
+                $exists = isset($known[$key]);
+                if ($action === 'create' && ($exists || $source !== 'memory')) throw new McpError("$where: create is only for new files of source memory.");
+                if ($action !== 'create' && !$exists) throw new McpError("$where: file not in the snapshot.");
+                if ($action === 'delete' && ($source !== 'memory' || $file === 'MEMORY.md')) throw new McpError("$where: only memory topic files can be deleted.");
+                $new = (string)($pr['new_content'] ?? '');
+                if ($action !== 'delete' && trim($new) === '') throw new McpError("$where: new_content is required.");
+                if (strlen($new) > YKAN_MEMORY_MAX_FILE) throw new McpError("$where: new_content too large.");
+                if ($action === 'edit' && $new === $known[$key]['content']) continue; // nessuna modifica reale
+                $props[] = ['id' => 'p' . ($n + 1) . '_' . bin2hex(random_bytes(3)), 'source' => $source, 'file' => $file,
+                    'action' => $action, 'kind' => $kind, 'reason' => mb_substr(trim((string)($pr['reason'] ?? '')), 0, 400),
+                    'old_content' => $exists ? $known[$key]['content'] : '', 'base_sha' => $exists ? $known[$key]['sha'] : null,
+                    'new_content' => $action === 'delete' ? '' : $new, 'status' => 'pending'];
+            }
+            $keep = array_values(array_filter($r['proposals'] ?? [], fn($p) => ($p['status'] ?? '') !== 'pending'));
+            $data['memory_reviews'][$lane['id']]['proposals'] = array_merge($keep, $props);
+            $data['memory_reviews'][$lane['id']]['summary'] = mb_substr(trim((string)($a['summary'] ?? '')), 0, 1500);
+            $data['memory_reviews'][$lane['id']]['proposed_at'] = date('Y-m-d H:i:s');
+            mcp_save($data);
+            mcp_audit('memory_propose', ['project' => $lane['name'], 'proposals' => count($props)]);
+            return count($props) . " proposal(s) saved for '{$lane['name']}'. The user will review and apply them from _Ykan (Claude → Memoria).";
         }
 
         // ---------------- Phase 2 ----------------
