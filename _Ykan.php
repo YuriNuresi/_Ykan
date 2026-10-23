@@ -8038,7 +8038,7 @@ $dataJson = json_encode(ykanPublicData($data));
     ctxState.opt = {}; // dir -> { busy: ms, result, error, sel: Set di chiavi spuntate }
     async function ctxOptimize(dir) {
         const o = ctxState.opt[dir] = { busy: Date.now() };
-        const tick = setInterval(() => { if (claudeTabName === 'context') claudeRenderBody(); }, 1000);
+        const tick = setInterval(() => { if (['context', 'skills', 'plugins'].includes(claudeTabName)) claudeRenderBody(); }, 1000);
         claudeRenderBody();
         try {
             o.result = await ctxCall('/claude/context/optimize', { dir });
@@ -8065,7 +8065,7 @@ $dataJson = json_encode(ykanPublicData($data));
             o.applied = true;
             toast('✅ Contesto del progetto ottimizzato: vale dalla prossima sessione', 'success');
         } catch (e) { toast('❌ ' + e.message, 'error'); }
-        await ctxLoadProject(dir);
+        await Promise.all([ctxLoadProject(dir), claudeFetchSkills(), claudeFetchPlugins()]);
     }
 
     function ctxOptimizeHtml(dir) {
@@ -8159,30 +8159,37 @@ $dataJson = json_encode(ykanPublicData($data));
         const h = t => `<h3 style="margin:18px 0 8px;font-size:15px">${t}</h3>`;
         const userSkTok = inv.userSkills.reduce((s, x) => s + x.tokens, 0);
         const mdTok = inv.claudeMd.reduce((s, x) => s + x.tokens, 0);
+        const lane = claudeSelectedLane();
+        if (lane) {
+            if (ctxState.dir !== lane.local_path) { ctxLoadProject(lane.local_path); return '<div class="dash-empty">Leggo le sessioni del progetto…</div>'; }
+            return ctxProjectHtml();
+        }
         let html = `<div class="dash-sub" style="margin-bottom:8px">Stima del contesto fisso di ogni sessione (globale): <b>~${ctxK(inv.totalTokens)} token</b>
             (plugin attivi ${ctxK(inv.totalTokens - userSkTok - mdTok)}, skill tue ${ctxK(userSkTok)}, CLAUDE.md ${ctxK(mdTok)}). Le modifiche valgono dalla sessione successiva.</div>`;
         html += h('1 · Plugin (globale)') + inv.plugins.slice().sort((a, b) => b.tokens - a.tokens).map(p => ctxPluginCard(p, '')).join('');
         html += h('Skill tue (~/.claude/skills)') + inv.userSkills.map(s => ctxSkillRow(s, '', null)).join('');
         html += h('Server MCP') + inv.mcp.map(m => `<div class="dash-sub">🔌 ${escHtml(m.name)} <span class="git-tag">${escHtml(m.scope)}</span>${m.needsAuth ? ' <span class="git-tag" style="background:#fee2e2;color:#991b1b">autenticazione mai fatta / non si connette</span>' : ''}</div>`).join('');
 
-        html += h('2 · Vista per progetto') + `<select onchange="ctxLoadProject(this.value)" style="max-width:420px"><option value="">— scegli un progetto —</option>${inv.projects.map(p => `<option value="${escHtml(p.dir)}" ${p.dir === ctxState.dir ? 'selected' : ''}>${escHtml(p.name)} — ${escHtml(p.dir)}</option>`).join('')}</select>`;
-        if (ctxState.dir) {
-            const pr = ctxState.proj;
-            if (ctxState.projErr) html += `<div class="dash-empty">Errore: ${escHtml(ctxState.projErr)}</div>`;
-            else if (!pr) html += '<div class="dash-empty">Leggo le sessioni del progetto…</div>';
-            else {
-                const used = Object.entries(pr.usage.skills).sort((a, b) => b[1].count - a[1].count);
-                html += `<div class="dash-sub" style="margin:8px 0">${pr.usage.sessions} sessioni lette · contesto effettivo ~${ctxK(pr.totalTokens)} token · gli interruttori qui scrivono in <code>.claude/settings.local.json</code> del progetto.</div>`;
-                html += `<div style="margin:6px 0 12px">${ctxOptimizeHtml(pr.dir)}</div>`;
-                html += pr.plugins.slice().sort((a, b) => b.tokens - a.tokens).map(p => ctxPluginCard(p, pr.dir)).join('');
-                html += `<div class="dash-sub" style="margin-top:8px"><b>Skill usate davvero qui:</b> ${used.length ? used.map(([n, u]) => `${escHtml(n)} ×${u.count} (${ctxWhen(u.last)})`).join(' · ') : 'nessuna'}</div>`;
-                if (pr.projectSkills.length) html += pr.projectSkills.map(s => ctxSkillRow(s, pr.dir, pr.usage)).join('');
-                html += `<div class="dash-sub" style="margin-top:6px">CLAUDE.md: ${pr.claudeMd.length ? pr.claudeMd.map(c => escHtml(c.file) + ' (~' + c.tokens + ')').join(', ') : 'nessuno'}</div>`;
-                if (pr.claudeMd.length) html += h('4 · Analisi CLAUDE.md del progetto') + ctxAnalysisHtml(pr.dir);
-            }
-        }
+        html += h('2 · Un progetto') + '<div class="dash-sub">Scegli un progetto nel menu in alto per vedere il suo contesto effettivo, le skill usate davvero e ottimizzarlo.</div>';
 
         html += h('3 · Analisi CLAUDE.md globale') + `<div class="dash-sub" style="margin-bottom:6px">${inv.claudeMd.map(c => escHtml(c.file) + ' (' + c.lines + ' righe, ~' + c.tokens + ' token)').join(' · ')} + indici memoria dei progetti. Claude propone, tu approvi ogni correzione (con backup).</div>` + ctxAnalysisHtml('');
+        return html;
+    }
+
+    // Contesto di un solo progetto (quello scelto in alto)
+    function ctxProjectHtml() {
+        const h = t => `<h3 style="margin:18px 0 8px;font-size:15px">${t}</h3>`;
+        const pr = ctxState.proj;
+        if (ctxState.projErr) return `<div class="dash-empty">Errore: ${escHtml(ctxState.projErr)}</div>`;
+        if (!pr) return '<div class="dash-empty">Leggo le sessioni del progetto…</div>';
+        const used = Object.entries(pr.usage.skills).sort((a, b) => b[1].count - a[1].count);
+        let html = `<div class="dash-sub" style="margin:0 0 8px">${pr.usage.sessions} sessioni lette · contesto effettivo ~${ctxK(pr.totalTokens)} token · gli interruttori qui scrivono in <code>.claude/settings.local.json</code> del progetto.</div>`;
+        html += `<div style="margin:6px 0 12px">${ctxOptimizeHtml(pr.dir)}</div>`;
+        html += pr.plugins.slice().sort((a, b) => b.tokens - a.tokens).map(p => ctxPluginCard(p, pr.dir)).join('');
+        html += `<div class="dash-sub" style="margin-top:8px"><b>Skill usate davvero qui:</b> ${used.length ? used.map(([n, u]) => `${escHtml(n)} ×${u.count} (${ctxWhen(u.last)})`).join(' · ') : 'nessuna'}</div>`;
+        if (pr.projectSkills.length) html += pr.projectSkills.map(s => ctxSkillRow(s, pr.dir, pr.usage)).join('');
+        html += `<div class="dash-sub" style="margin-top:6px">CLAUDE.md: ${pr.claudeMd.length ? pr.claudeMd.map(c => escHtml(c.file) + ' (~' + c.tokens + ')').join(', ') : 'nessuno'}</div>`;
+        if (pr.claudeMd.length) html += h('Analisi CLAUDE.md del progetto') + ctxAnalysisHtml(pr.dir);
         return html;
     }
 
@@ -8190,10 +8197,9 @@ $dataJson = json_encode(ykanPublicData($data));
         const sel = document.getElementById('claudeMemProject');
         const projects = boardData.swimlanes.filter(l => l.local_path);
         const prevVal = sel.value;
-        sel.innerHTML = projects.length
-            ? projects.map(l => `<option value="${escHtml(l.id)}">${escHtml(l.name)}</option>`).join('')
-            : '<option value="">Nessun progetto collegato a una cartella</option>';
-        if (prevVal && projects.some(l => l.id === prevVal)) sel.value = prevVal;
+        sel.innerHTML = '<option value="">Tutti i progetti</option>'
+            + projects.map(l => `<option value="${escHtml(l.id)}">${escHtml(l.name)}</option>`).join('');
+        sel.value = prevVal && projects.some(l => l.id === prevVal) ? prevVal : '';
 
         document.querySelectorAll('#claudeView .dash-tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === claudeTabName));
         claudeRenderBody();
@@ -8202,6 +8208,8 @@ $dataJson = json_encode(ykanPublicData($data));
 
     function claudeProjectChanged() {
         claudeFetchMemory(); claudeFetchSkills(); claudeFetchPlugins();
+        if (!claudeSelectedLane()) { ctxState.dir = ''; ctxState.proj = null; }
+        claudeRenderBody();
     }
 
     async function claudeFetchSkills() {
@@ -8276,7 +8284,7 @@ $dataJson = json_encode(ykanPublicData($data));
         } else {
             const laneId = document.getElementById('claudeMemProject').value;
             const mem = claudeMemory[laneId];
-            if (!laneId) body.innerHTML = '<div class="dash-empty">Collega un progetto a una cartella locale per vedere la sua memoria (Kanban → 🔗 Projects).</div>';
+            if (!laneId) body.innerHTML = '<div class="dash-empty">Scegli un progetto nel menu in alto per vedere e ottimizzare la sua memoria. (I progetti compaiono lì quando sono collegati a una cartella: Kanban → 🔗 Projects.)</div>';
             else if (mem === undefined) body.innerHTML = '<div class="dash-empty">Carico…</div>';
             else if (mem === null) body.innerHTML = memReviewHtml(laneId) + '<div class="dash-empty">Bridge locale non raggiungibile.</div>';
             else if (!mem.exists || !mem.files.length) body.innerHTML = '<div class="dash-empty">Nessuna memoria per questo progetto — Claude non ha ancora salvato nulla qui.</div>';
@@ -8323,7 +8331,6 @@ $dataJson = json_encode(ykanPublicData($data));
     // Stato delle skill: skillOverrides nei settings di Claude Code. Ambito "user" = ~/.claude/settings.json
     // (tutti i progetti), "local" = .claude/settings.local.json del progetto scelto (solo per te).
     // Plugin: claude plugin enable/disable sul PC. Valgono dalle prossime sessioni di Claude Code.
-    let claudeSkillScope = 'user';
     let claudePlugins = undefined;   // undefined = non caricati, null = Bridge irraggiungibile, 'old' = Bridge vecchio, [] = lista
     let claudePluginsError = '';
     const skillFiles = {};           // "skill|source|id" -> { content, sha }
@@ -8353,21 +8360,23 @@ $dataJson = json_encode(ykanPublicData($data));
         return j;
     }
 
-    function skillsHeaderHtml() {
+    // Dove valgono le modifiche: il progetto scelto in alto (solo per te) o tutti i progetti.
+    function claudeScopeLine() {
         const lane = claudeSelectedLane();
+        return `<div class="dash-sub" style="margin-bottom:10px">Le modifiche valgono per ${lane
+            ? '<b>solo «' + escHtml(lane.name) + '»</b>, per te <span style="color:var(--text2)">(.claude/settings.local.json del progetto)</span>'
+            : '<b>tutti i progetti</b> <span style="color:var(--text2)">(~/.claude/settings.json) — scegli un progetto in alto per cambiarle solo lì e per ottimizzarlo</span>'}, dalle prossime sessioni.</div>`
+            + (lane ? `<div style="margin-bottom:12px">${ctxOptimizeHtml(lane.local_path)}</div>` : '');
+    }
+
+    function skillsHeaderHtml() {
         const old = claudeSkills.some(sk => !sk.overrides);
-        return `<div class="dash-sub" style="display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
-            <span>Cambia lo stato per:</span>
-            <label><input type="radio" name="skillScope" value="user" ${claudeSkillScope === 'user' ? 'checked' : ''} onchange="claudeSkillScope='user';claudeRenderBody()"> tutti i progetti <span style="color:var(--text2)">(~/.claude/settings.json)</span></label>
-            <label title="${lane ? '' : 'Scegli in alto un progetto collegato a una cartella'}"><input type="radio" name="skillScope" value="local" ${claudeSkillScope === 'local' ? 'checked' : ''} ${lane ? '' : 'disabled'} onchange="claudeSkillScope='local';claudeRenderBody()"> solo ${lane ? '«' + escHtml(lane.name) + '»' : 'questo progetto'}, per me <span style="color:var(--text2)">(.claude/settings.local.json)</span></label>
-            <span style="color:var(--text2)">Vale dalle prossime sessioni di Claude Code.</span>
-            ${old ? '<span style="color:#dc2626">Aggiorna il Bridge alla 0.6.0 per cambiare lo stato delle skill.</span>' : ''}
-        </div>`;
+        return claudeScopeLine() + (old ? '<div class="dash-sub" style="color:#dc2626">Aggiorna il Bridge alla 0.6.0 per cambiare lo stato delle skill.</div>' : '');
     }
 
     function skillCardHtml(sk) {
         const key = 'skill|' + sk.source + '|' + sk.id;
-        const scope = claudeSkillScope === 'local' && claudeSelectedLane() ? 'local' : 'user';
+        const scope = claudeSelectedLane() ? 'local' : 'user';
         const cur = sk.overrides ? (sk.overrides[scope] || 'on') : 'on';
         const [srcLabel, srcTitle] = SKILL_SOURCES[sk.source] || [sk.source, ''];
         const from = sk.overrides ? (sk.overrides.local ? 'per te in questo progetto' : sk.overrides.project ? 'dal settings.json del progetto' : sk.overrides.user ? 'per tutti i progetti' : '') : '';
@@ -8434,7 +8443,7 @@ $dataJson = json_encode(ykanPublicData($data));
     async function skillSetState(key, state) {
         const { sk } = skillParseKey(key);
         const lane = claudeSelectedLane();
-        const scope = claudeSkillScope === 'local' && lane ? 'local' : 'user';
+        const scope = lane ? 'local' : 'user';
         if (!sk) return;
         if (bridgeIsRemote() && !confirm('Cambiare lo stato di «' + sk.name + '» su ' + memWhere() + '?')) { claudeRenderBody(); return; }
         try {
@@ -8492,7 +8501,7 @@ $dataJson = json_encode(ykanPublicData($data));
         if (claudePluginsError) return '<div class="dash-empty">Non riesco a leggere i plugin: ' + escHtml(claudePluginsError) + '</div>';
         if (!claudePlugins.length) return '<div class="dash-empty">Nessun plugin installato. Si installano con /plugin in Claude Code.</div>';
         const lane = claudeSelectedLane();
-        return `<div class="dash-sub" style="margin-bottom:10px">Plugin installati su ${escHtml(memWhere())}${lane ? ' (visti dalla cartella di «' + escHtml(lane.name) + '»)' : ''}. Attivare o disattivare vale dalle prossime sessioni, o dopo /reload-plugins. I plugin dei thread cloud si scelgono in Project settings › Plugins.</div>`
+        return claudeScopeLine() + `<div class="dash-sub" style="margin-bottom:10px">Plugin installati su ${escHtml(memWhere())}${lane ? ' (stato in «' + escHtml(lane.name) + '»)' : ''}. I plugin dei thread cloud si scelgono in Project settings › Plugins.</div>`
             + claudePlugins.map(p => {
                 const fixed = ['synced', 'session', 'managed'].includes(p.scope) || /@(inline|skills-dir|synced)$/.test(p.id);
                 const [name, mk] = p.id.split('@');
@@ -8514,7 +8523,12 @@ $dataJson = json_encode(ykanPublicData($data));
 
     async function pluginToggle(id, scope, enabled) {
         const lane = claudeSelectedLane();
-        if (!confirm((enabled ? 'Attivare' : 'Disattivare') + ' il plugin ' + id + ' su ' + memWhere() + '?')) { claudeRenderBody(); return; }
+        if (!confirm((enabled ? 'Attivare' : 'Disattivare') + ' il plugin ' + id + (lane ? ' solo per «' + lane.name + '»' : ' per tutti i progetti') + ' su ' + memWhere() + '?')) { claudeRenderBody(); return; }
+        if (lane) {
+            try { await ctxCall('/claude/context/plugin', { plugin: id, enabled, dir: lane.local_path }); toast(id + (enabled ? ' attivato' : ' disattivato') + ' per ' + lane.name, 'success'); }
+            catch (e) { toast('Non riuscito: ' + e.message, 'error'); }
+            return claudeFetchPlugins();
+        }
         try {
             const j = await claudeBridgePost('/claude/plugins/toggle', { id, enabled, scope, dir: lane ? lane.local_path : '' }, 'gestire i plugin');
             if (Array.isArray(j.plugins)) claudePlugins = j.plugins;
@@ -8551,7 +8565,8 @@ $dataJson = json_encode(ykanPublicData($data));
         if (rcServers === undefined) return '<div class="dash-empty">Carico…</div>';
         if (rcServers === null) return '<div class="dash-empty">Bridge locale non raggiungibile.</div>';
         if (rcServers === 'old') return '<div class="dash-empty">Aggiorna il Bridge alla 0.7.0 per gestire Remote Control da qui.</div>';
-        const lanes = boardData.swimlanes.filter(l => l.local_path);
+        const only = claudeSelectedLane();
+        const lanes = only ? [only] : boardData.swimlanes.filter(l => l.local_path);
         if (!lanes.length) return '<div class="dash-empty">Collega un progetto a una cartella locale (Kanban → 🔗 Projects).</div>';
         return `<div class="dash-sub" style="margin-bottom:10px">Con Remote Control attivo su una cartella, i thread dei Claude Projects possono lavorare su ${escHtml(memWhere())} («Work locally») e le sessioni si seguono dal telefono. Gira finché il Bridge è acceso; «worktree» dà a ogni sessione la sua copia del repository.</div>`
             + lanes.map(l => {
@@ -8824,7 +8839,9 @@ $dataJson = json_encode(ykanPublicData($data));
             `{"summary": "cosa hai trovato, in 3-6 righe in italiano, e cosa NON hai toccato perché ti sembrava importante",`,
             ` "proposals": [{"source": "project|user|memory", "file": "nome file come sotto", "action": "edit|delete|create",`,
             `   "kind": "duplicate|stale|contradiction|broken_link|cleanup", "reason": "una riga in italiano",`,
-            `   "new_content": "contenuto COMPLETO nuovo del file (mantieni il frontmatter YAML); vuoto per delete"}]}`,
+            `   "edits": [{"find": "testo copiato ESATTAMENTE dal file, che compare una sola volta", "replace": "testo nuovo (vuoto per togliere)"}],`,
+            `   "new_content": "SOLO per create: contenuto del nuovo file (con frontmatter YAML)"}]}`,
+            `Per edit NON riscrivere il file: elenca solo i pezzi da cambiare in "edits" (find abbastanza lungo da essere unico). Per delete niente edits.`,
             `Al massimo una proposta per file. delete solo per file di memoria (mai MEMORY.md), create solo per nuovi file di memoria. Se non c'è nulla da migliorare, proposals è [].`,
             ``,
             ...files.map(f => `===== FILE source="${f.source}" file="${f.file}" =====\n${f.content}`),
@@ -8835,6 +8852,7 @@ $dataJson = json_encode(ykanPublicData($data));
     }
 
     const memBusy = {}; // laneId -> ms di avvio dell'analisi in corso
+    const memErr = {};  // laneId -> ultimo errore/avviso dell'analisi, resta visibile nel pannello
 
     async function memOptimize() {
         const laneId = document.getElementById('claudeMemProject').value;
@@ -8861,14 +8879,30 @@ $dataJson = json_encode(ykanPublicData($data));
             const ans = await r.json().catch(() => ({}));
             if (r.status === 404) throw new Error('il Bridge è di una versione precedente: aggiornalo (Settings → Strumenti)');
             if (!r.ok) throw new Error(ans.error || 'HTTP ' + r.status);
-            const res = await api('memory_proposals_save', { lane_id: laneId, summary: ans.summary, proposals: ans.proposals });
+            // edit a pezzi (find → replace) applicati qui sul contenuto dello snapshot: il server riceve il file completo
+            const byKey = Object.fromEntries(files.map(f => [f.source + '|' + f.file, f.content]));
+            const skippedHere = [];
+            const proposals = (ans.proposals || []).map(p => {
+                if (p.action !== 'edit' || !Array.isArray(p.edits)) return p;
+                let txt = byKey[p.source + '|' + p.file];
+                if (txt === undefined) { skippedHere.push(p.file + ': file non nello snapshot'); return null; }
+                for (const ed of p.edits) {
+                    const find = String(ed.find || '');
+                    if (!find || txt.split(find).length !== 2) { skippedHere.push(p.file + ': un pezzo da cambiare non si trova esattamente una volta'); return null; }
+                    txt = txt.replace(find, () => String(ed.replace || ''));
+                }
+                return Object.assign({}, p, { new_content: txt });
+            }).filter(Boolean);
+            const res = await api('memory_proposals_save', { lane_id: laneId, summary: ans.summary, proposals });
             if (!res.success) throw new Error(res.error || 'proposte non salvate');
             claudeReview[laneId] = res.review;
+            const skipped = skippedHere.concat(res.skipped || []);
             const n = (res.review.proposals || []).filter(p => p.status === 'pending').length;
-            toast(`Claude ha finito in ${ans.seconds}s: ${n} proposte da decidere` + (res.skipped.length ? ` (${res.skipped.length} scartate perché non valide)` : ''), 'success');
-            if (res.skipped.length) console.warn('Proposte scartate:', res.skipped);
+            memErr[laneId] = skipped.length ? 'Proposte scartate perché non applicabili: ' + skipped.join(' · ') : '';
+            toast(`Claude ha finito in ${ans.seconds}s: ${n} proposte da decidere` + (skipped.length ? ` (${skipped.length} scartate)` : ''), 'success');
         } catch (e) {
-            toast('Ottimizzazione non riuscita: ' + e.message, 'error');
+            memErr[laneId] = 'Ottimizzazione non riuscita: ' + e.message;
+            toast(memErr[laneId], 'error');
         } finally {
             clearInterval(tick);
             delete memBusy[laneId];
@@ -8937,10 +8971,11 @@ $dataJson = json_encode(ykanPublicData($data));
                     <button class="btn" onclick="memRefreshReview()">↻ Proposte</button>
                     <span style="font-size:12px;color:var(--text2)">Snapshot del ${escHtml(rv.snapshot_at || '')}${rv.pc ? ' da ' + escHtml(rv.pc) : ''}${rv.proposed_at ? ' · proposte del ' + escHtml(rv.proposed_at) : ' · in attesa delle proposte di Claude'}</span>` : ''}
         </div>`;
-        if (!rv || !(rv.proposals || []).length) return head;
+        const errBox = memErr[laneId] ? `<div class="dash-projcard" style="margin-bottom:10px;border-color:#dc2626"><div class="dash-sub" style="color:#dc2626">⚠️ ${escHtml(memErr[laneId])}</div></div>` : '';
+        if (!rv || !(rv.proposals || []).length) return head + errBox;
         const pending = rv.proposals.filter(p => p.status === 'pending');
         const done = rv.proposals.length - pending.length;
-        return head + `<div class="dash-projcard" style="margin-bottom:12px">
+        return head + errBox + `<div class="dash-projcard" style="margin-bottom:12px">
             <div class="dash-projhead"><b>Proposte di Claude</b><span style="flex:1"></span>
                 <span class="dash-when">${pending.length} da decidere${done ? ' · ' + done + ' già decise' : ''}</span></div>
             ${rv.summary ? `<div class="dash-sub" style="white-space:pre-wrap">${escHtml(rv.summary)}</div>` : ''}

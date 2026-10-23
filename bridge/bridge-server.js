@@ -1254,7 +1254,9 @@ function runClaudePrint(prompt, timeoutMs) {
         const { spawn } = require('child_process');
         const args = ['-p', '--output-format', 'json', '--model', 'sonnet', '--tools', '', '--strict-mcp-config',
             '--no-session-persistence', '--disable-slash-commands'];
-        const child = spawn(resolveClaudeBin(), args, { cwd: os.tmpdir(), windowsHide: true });
+        // Le analisi rispondono con JSON lunghi: limite di output alzato, se no la risposta arriva troncata
+        const env = Object.assign({}, process.env, { CLAUDE_CODE_MAX_OUTPUT_TOKENS: process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS || '64000' });
+        const child = spawn(resolveClaudeBin(), args, { cwd: os.tmpdir(), windowsHide: true, env });
         let out = '', err = '';
         const timer = setTimeout(() => { child.kill(); reject(new Error('Timeout: l\'analisi AI ha impiegato troppo')); }, timeoutMs);
         child.stdout.on('data', d => out += d);
@@ -1272,12 +1274,15 @@ function runClaudePrint(prompt, timeoutMs) {
     });
 }
 
+// Se la risposta non e' JSON valido la si salva in ~/.ykan-last-ai-answer.txt per capire cosa e' successo.
 function extractJson(text) {
     const m = text.match(/```(?:json)?\s*([\s\S]*?)```/);
     const raw = m ? m[1] : text;
     const a = raw.indexOf('{'), b = raw.lastIndexOf('}');
-    if (a < 0 || b < a) throw new Error('L\'AI non ha risposto con JSON');
-    return JSON.parse(raw.slice(a, b + 1));
+    const dump = () => { try { fs.writeFileSync(path.join(os.homedir(), '.ykan-last-ai-answer.txt'), text); } catch (_) { /* non critico */ } };
+    if (a < 0 || b < a) { dump(); throw new Error('L\'AI non ha risposto con JSON (risposta salvata in ~/.ykan-last-ai-answer.txt, ' + text.length + ' caratteri)'); }
+    try { return JSON.parse(raw.slice(a, b + 1)); }
+    catch (e) { dump(); throw new Error('JSON dell\'AI non valido: ' + e.message + ' (risposta salvata in ~/.ykan-last-ai-answer.txt)'); }
 }
 
 async function analyzeForTasks(localPath, sessionId, boardTasks, projectName) {
