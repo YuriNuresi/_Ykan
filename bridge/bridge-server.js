@@ -1741,6 +1741,23 @@ const server = http.createServer((req, res) => {
         try { return json(200, contextForProject(path.resolve(String(parsed.query.dir || '')))); }
         catch (e) { return json(500, { error: String((e && e.message) || e) }); }
     }
+    // Ottimizza memoria: la board manda i file (gia' letti dal Bridge) e il prompt, claude gira qui
+    // in locale senza strumenti (--tools ""), quindi puo' solo rispondere: non tocca nessun file.
+    // Le proposte tornano alla board, che le applica una per una solo dopo la conferma.
+    if (req.method === 'POST' && parsed.pathname === '/claude/memory/analyze') {
+        if (!isAllowedOrigin(origin)) return json(403, { error: 'origin non ammessa' });
+        if (!/^application\/json/.test(req.headers['content-type'] || '')) return json(415, { error: 'serve application/json' });
+        readBody(req, 3000000).then(async raw => {
+            const b = JSON.parse(raw || '{}');
+            const prompt = String(b.prompt || '');
+            if (!prompt.trim()) return json(400, { error: 'prompt vuoto' });
+            const started = Date.now();
+            const j = extractJson(await runClaudePrint(prompt, 600000));
+            json(200, { summary: String(j.summary || ''), proposals: Array.isArray(j.proposals) ? j.proposals : [], seconds: Math.round((Date.now() - started) / 1000) });
+        }).catch(e => json(500, { error: String((e && e.message) || e) }));
+        return;
+    }
+
     if (req.method === 'POST' && /^\/claude\/context\/(plugin|skill|analyze|apply)$/.test(parsed.pathname)) {
         if (!isAllowedOrigin(origin)) return json(403, { error: 'origin non ammessa' });
         if (!/^application\/json/.test(req.headers['content-type'] || '')) return json(415, { error: 'serve application/json' });
