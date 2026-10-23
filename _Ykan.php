@@ -5448,7 +5448,6 @@ $dataJson = json_encode(ykanPublicData($data));
         if (dashTabName === 'graphify') gfyRender();
     }
 
-    function gfySelect(id) { gfy.sel = id; gfyRender(); }
 
     function gfyRender() {
         const body = document.getElementById('dashboardBody');
@@ -5468,7 +5467,15 @@ $dataJson = json_encode(ykanPublicData($data));
             </div>`
             + (!inf ? '<div class="dash-empty">Nessun progetto ha ancora un grafo. In una sessione di Claude Code nel progetto scrivi <code>/graphify</code>: crea <code>graphify-out/</code> e qui compare.</div>'
             : `<div class="dash-sub" style="margin-bottom:6px;white-space:pre-wrap">${escHtml(inf.summary)} · aggiornato il ${new Date(inf.modified).toLocaleDateString('it-IT')} — per rigenerarlo: <code>/graphify</code> in una sessione del progetto</div>
-               <iframe src="${BRIDGE_URL}/graphify/graph?dir=${encodeURIComponent(sel.local_path)}" style="width:100%;height:calc(100vh - 260px);min-height:480px;border:1px solid var(--border);border-radius:8px;background:#fff" referrerpolicy="strict-origin-when-cross-origin"></iframe>`);
+               <iframe src="${BRIDGE_URL}/graphify/graph?t=${encodeURIComponent(inf.token || '')}" style="width:100%;height:calc(100vh - 260px);min-height:480px;border:1px solid var(--border);border-radius:8px;background:#fff"></iframe>`);
+    }
+
+    // Il codice per l'iframe vale 5 minuti: prima di mostrare un grafo se ne chiede uno nuovo.
+    async function gfySelect(id) {
+        gfy.sel = id;
+        const lane = boardData.swimlanes.find(l => l.id === id);
+        try { const r = await fetch(BRIDGE_URL + '/graphify/info?dir=' + encodeURIComponent(lane.local_path)); if (r.ok) gfy.info[id] = await r.json(); } catch (_) { }
+        gfyRender();
     }
 
     function dashRender() {

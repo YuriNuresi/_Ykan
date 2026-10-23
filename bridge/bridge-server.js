@@ -909,6 +909,7 @@ function setSkillOverridesBatch(dir, overrides) {
 }
 
 // === GRAPHIFY: grafo del progetto (graphify-out/graph.html) mostrato nella board ===
+const graphifyTokens = new Map(); // codice monouso -> { dir, until }
 function graphifyInfo(dir) {
     const out = path.join(dir, 'graphify-out');
     const html = path.join(out, 'graph.html'), report = path.join(out, 'GRAPH_REPORT.md');
@@ -1925,16 +1926,25 @@ const server = http.createServer((req, res) => {
         return;
     }
 
-    // Graphify: info come le altre letture; la pagina del grafo si mostra in un iframe della board,
-    // quindi niente Origin: si accetta solo se il Referer e' la board (un altro sito non la incorpora).
+    // Graphify: la pagina del grafo va in un iframe, che non manda Origin e (https → http) nemmeno
+    // il Referer. Quindi info rilascia anche un codice monouso (solo alla board, via Origin) da
+    // mettere nell'URL dell'iframe: vale 5 minuti e solo per quella cartella.
     if (req.method === 'GET' && parsed.pathname === '/graphify/info') {
-        try { return json(200, graphifyInfo(path.resolve(String(parsed.query.dir || '')))); }
-        catch (e) { return json(500, { error: String((e && e.message) || e) }); }
+        try {
+            const dir = path.resolve(String(parsed.query.dir || ''));
+            const info = graphifyInfo(dir);
+            if (info.exists && isAllowedOrigin(origin)) {
+                info.token = require('crypto').randomBytes(16).toString('hex');
+                graphifyTokens.set(info.token, { dir, until: Date.now() + 300000 });
+            }
+            return json(200, info);
+        } catch (e) { return json(500, { error: String((e && e.message) || e) }); }
     }
     if (req.method === 'GET' && parsed.pathname === '/graphify/graph') {
-        const ref = String(req.headers.referer || '');
-        if (!ALLOWED_ORIGINS.some(o => ref === o || ref.startsWith(o + '/'))) { res.writeHead(403); return res.end('solo dalla board Ykan'); }
-        const file = path.join(path.resolve(String(parsed.query.dir || '')), 'graphify-out', 'graph.html');
+        const t = graphifyTokens.get(String(parsed.query.t || ''));
+        for (const [k, v] of graphifyTokens) if (v.until < Date.now()) graphifyTokens.delete(k);
+        if (!t || t.until < Date.now()) { res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' }); return res.end('Codice scaduto: ricarica la scheda Graphify della board'); }
+        const file = path.join(t.dir, 'graphify-out', 'graph.html');
         if (!fs.existsSync(file)) { res.writeHead(404); return res.end('nessun grafo per questo progetto'); }
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Content-Security-Policy': "frame-ancestors " + ALLOWED_ORIGINS.join(' ') });
         return fs.createReadStream(file).pipe(res);
