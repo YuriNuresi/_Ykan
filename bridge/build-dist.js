@@ -48,11 +48,25 @@ fs.cpSync(path.join(nm, 'node-pty'), path.join(outNm, 'node-pty'), {
     }
 });
 
+// Icona nella tray + avvio automatico nascosto: stessi script della cartella sorgente
+// (tray.ps1 usa ykan-bridge.exe se lo trova accanto a se').
+for (const f of ['tray.ps1', 'autostart-hidden.vbs', 'install-autostart.bat', 'uninstall-autostart.bat']) {
+    fs.copyFileSync(path.join(root, f), path.join(out, f));
+}
+
 fs.writeFileSync(path.join(out, 'LEGGIMI.txt'),
 `Ykan Bridge
 ===========
-Doppio click su ykan-bridge.exe: si apre una finestra e il Bridge resta in ascolto
-su http://127.0.0.1:51820 (solo su questo PC). Lascia la finestra aperta mentre usi Ykan.
+Estrai tutta la cartella (non avviare l'exe da dentro lo zip), poi:
+
+- install-autostart.bat (una volta): il Bridge parte da solo a ogni accesso a Windows,
+  in background, senza finestre. Per avviarlo subito: doppio click su autostart-hidden.vbs.
+- Icona "Y" vicino all'orologio (verde = attivo, rossa = fermo): tasto destro per
+  Riavvia / Apri log / Termina.
+- uninstall-autostart.bat toglie l'avvio automatico.
+- ykan-bridge.exe da solo apre invece una finestra di terminale (utile per vedere gli errori).
+
+Il Bridge resta in ascolto su http://127.0.0.1:51820 (solo su questo PC).
 
 Non spostare l'exe fuori da questa cartella: la cartella node_modules deve stargli accanto.
 Serve Claude Code installato (comando "claude") per i pulsanti PLAY e Riprendi.

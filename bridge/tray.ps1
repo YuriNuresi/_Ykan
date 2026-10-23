@@ -65,7 +65,10 @@ function Update-State {
 
 function Start-Bridge {
     Free-Port
-    $script:node = Start-Process -FilePath 'node' -ArgumentList 'bridge-server.js' -WorkingDirectory $here `
+    # Nel pacchetto scaricato c'e' ykan-bridge.exe; nella cartella sorgente si usa node
+    $exe = Join-Path $here 'ykan-bridge.exe'
+    if (Test-Path $exe) { $file = $exe; $argList = @() } else { $file = 'node'; $argList = @('bridge-server.js') }
+    $script:node = Start-Process -FilePath $file -ArgumentList $argList -WorkingDirectory $here `
         -WindowStyle Hidden -PassThru -RedirectStandardOutput $logOut -RedirectStandardError $logErr
     $script:wasRunning = $true
     Update-State
