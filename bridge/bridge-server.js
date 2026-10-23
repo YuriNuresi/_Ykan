@@ -915,7 +915,9 @@ function graphifyInfo(dir) {
     if (!fs.existsSync(html)) return { exists: false };
     const rep = fs.existsSync(report) ? fs.readFileSync(report, 'utf8') : '';
     const sum = (rep.match(/## Summary\s*\n([\s\S]*?)\n##/) || [])[1] || '';
-    return { exists: true, modified: fs.statSync(html).mtime.toISOString(), summary: sum.trim().slice(0, 1200), report: rep.slice(0, 20000) };
+    // Report senza sezione Summary (formati vecchi): le prime righe dopo il titolo
+    const fallback = rep.replace(/^#.*\r?\n/, '').trim().split(/\r?\n/).filter(l => l.trim()).slice(0, 4).join('\n');
+    return { exists: true, modified: fs.statSync(html).mtime.toISOString(), summary: (sum.trim() || fallback).slice(0, 1200), report: rep.slice(0, 20000) };
 }
 
 // === ANALISI CLAUDE.md (via claude locale) ===
