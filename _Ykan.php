@@ -313,7 +313,8 @@ const YKAN_BRIDGE_ONLINE_SECS = 60;
 // e rimanda la risposta con ?bridge=result. Solo i percorsi di questo elenco (lo stesso che il
 // Bridge controlla a sua volta): letture e l'apertura di Claude Desktop, niente shell libera.
 const YKAN_RELAY_PATHS = ['/sessions', '/session', '/reviews', '/git', '/claude/skills', '/claude/skill',
-    '/claude/memory', '/claude/memory/file', '/desktop-archive', '/desktop/new', '/desktop/resume'];
+    '/claude/memory', '/claude/memory/file', '/claude/context', '/claude/context/project',
+    '/desktop-archive', '/desktop/new', '/desktop/resume'];
 const YKAN_RELAY_WAIT_SECS = 25; // quanto la board aspetta la risposta del PC
 const YKAN_POLL_HOLD_SECS = 8;   // quanto una ?bridge=poll resta aperta se non ci sono comandi
 
@@ -4280,6 +4281,7 @@ $dataJson = json_encode($data);
         <div class="dash-tabs">
             <button data-tab="skills" class="active" onclick="claudeTab('skills')">Skills <span class="dash-count"></span></button>
             <button data-tab="memory" onclick="claudeTab('memory')">Memoria <span class="dash-count"></span></button>
+            <button data-tab="context" onclick="claudeTab('context')">Contesto <span class="dash-count"></span></button>
         </div>
         <div id="claudeBody"></div>
     </section>
@@ -7560,6 +7562,164 @@ $dataJson = json_encode($data);
         claudeTabName = name;
         document.querySelectorAll('#claudeView .dash-tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
         claudeRenderBody();
+        if (name === 'context' && !ctxState.inv) ctxLoad();
+    }
+
+    // === CONTEXT MANAGER: cosa entra in ogni sessione (plugin, skill, MCP, CLAUDE.md) e interruttori ===
+    // Tutto via Bridge: le scritture fanno sempre backup in ~/.ykan-context-backup/ e partono solo da un clic.
+    const ctxState = { inv: null, err: '', dir: '', proj: null, projErr: '', open: new Set(), analysis: {}, busy: '' };
+    const ctxK = n => n >= 1000 ? (n / 1000).toFixed(1).replace('.0', '') + 'k' : String(n || 0);
+    const ctxWhen = iso => iso ? new Date(iso).toLocaleDateString('it-IT') : 'mai';
+
+    async function ctxCall(path, body) {
+        const opts = body ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : {};
+        const r = await bridgeFetch(path, opts);
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok || j.error) throw new Error(j.error || 'HTTP ' + r.status);
+        return j;
+    }
+
+    async function ctxLoad() {
+        try { ctxState.inv = await ctxCall('/claude/context'); ctxState.err = ''; }
+        catch (e) { ctxState.inv = null; ctxState.err = e.message; }
+        if (ctxState.dir) await ctxLoadProject(ctxState.dir, true);
+        claudeRenderBody();
+    }
+
+    async function ctxLoadProject(dir, silent) {
+        ctxState.dir = dir; ctxState.proj = null; ctxState.projErr = '';
+        if (!silent) claudeRenderBody();
+        if (!dir) return;
+        try { ctxState.proj = await ctxCall('/claude/context/project?dir=' + encodeURIComponent(dir)); }
+        catch (e) { ctxState.projErr = e.message; }
+        if (!silent) claudeRenderBody();
+    }
+
+    async function ctxTogglePlugin(key, enabled, dir) {
+        const where = dir ? 'per il progetto (' + dir + '\\.claude\\settings.local.json)' : 'globalmente (~/.claude/settings.json)';
+        const what = enabled === null ? 'Togliere l\'override di ' + key + ' (torna a ereditare)' : (enabled ? 'Accendere ' : 'Spegnere ') + key + ' ' + where;
+        if (!confirm(what + '?\nVerrà fatto un backup del file. Vale dalla prossima sessione.')) { claudeRenderBody(); return; }
+        try { await ctxCall('/claude/context/plugin', { plugin: key, enabled, dir: dir || '' }); toast('✅ Salvato — vale dalla prossima sessione', 'success'); }
+        catch (e) { toast('❌ ' + e.message, 'error'); }
+        await ctxLoad();
+    }
+
+    async function ctxToggleSkill(id, disabled, dir) {
+        if (!confirm((disabled ? 'Togliere dal contesto' : 'Rimettere nel contesto') + ' la skill "' + id + '"?\n(disable-model-invocation nel frontmatter di SKILL.md, con backup; resta richiamabile a mano con /' + id + ')')) { claudeRenderBody(); return; }
+        try { await ctxCall('/claude/context/skill', { id, disabled, dir: dir || '' }); toast('✅ Salvato', 'success'); }
+        catch (e) { toast('❌ ' + e.message, 'error'); }
+        await ctxLoad();
+    }
+
+    async function ctxAnalyze(dir) {
+        const key = dir || '';
+        ctxState.busy = key; ctxState.analysis[key] = null; claudeRenderBody();
+        try { ctxState.analysis[key] = await ctxCall('/claude/context/analyze', { dir: key }); }
+        catch (e) { ctxState.analysis[key] = { error: e.message }; }
+        ctxState.busy = ''; claudeRenderBody();
+    }
+
+    async function ctxApply(key, i) {
+        const f = ctxState.analysis[key].findings[i];
+        if (!f || !f.fix) return;
+        const fx = f.fix;
+        const msg = 'Applicare questa correzione a ' + fx.file + '?\n\n— togli —\n' + fx.find + '\n\n— metti —\n' + (fx.replace || '(niente)')
+            + (fx.appendFile ? '\n\n+ aggiungi in ' + fx.appendFile + ':\n' + fx.appendText : '') + '\n\nVerrà fatto un backup.';
+        if (!confirm(msg)) return;
+        try { await ctxCall('/claude/context/apply', { fix: fx }); f.applied = true; toast('✅ Correzione applicata', 'success'); }
+        catch (e) { toast('❌ ' + e.message, 'error'); }
+        claudeRenderBody();
+    }
+
+    function ctxToggleOpen(k) { ctxState.open.has(k) ? ctxState.open.delete(k) : ctxState.open.add(k); claudeRenderBody(); }
+
+    function ctxSwitch(checked, onchange) {
+        return `<label style="display:inline-flex;align-items:center;gap:4px;font-size:12px;cursor:pointer" onclick="event.stopPropagation()"><input type="checkbox" ${checked ? 'checked' : ''} onchange="${escHtml(onchange)}">${checked ? 'on' : 'off'}</label>`;
+    }
+
+    function ctxPluginCard(p, dir) {
+        const k = 'p|' + (dir || '') + '|' + p.key;
+        const open = ctxState.open.has(k);
+        const js = s => JSON.stringify(s).replace(/"/g, '&quot;');
+        const parts = [p.skills.length + ' skill', p.agents.length + ' agenti', p.commands + ' comandi', p.hooks.total + ' hook', p.mcp.length + ' MCP'].join(' · ');
+        const usage = dir && ctxState.proj ? ` · usato <b>${p.used}</b> volte${p.used ? ' (ultima ' + ctxWhen(p.lastUsed) + ')' : ''}` : '';
+        const override = dir && p.from === 'locale' ? ` <a href="#" onclick="event.preventDefault();ctxTogglePlugin(${js(p.key)}, null, ${js(dir)})" style="font-size:11px">togli override</a>` : '';
+        return `<div class="dash-projcard" style="${p.enabled ? '' : 'opacity:.6'}">
+            <div class="dash-projhead" style="cursor:pointer" onclick="ctxToggleOpen(${js(k)})">
+                ${ctxSwitch(p.enabled, `ctxTogglePlugin(${JSON.stringify(p.key)}, this.checked, ${JSON.stringify(dir || '')})`)}
+                <b>${escHtml(p.name)}</b> <span class="git-tag">${escHtml(p.source)}</span>
+                ${p.suggestOff ? '<span class="git-tag" style="background:#fef3c7;color:#92400e">mai usato qui: spegnere?</span>' : ''}
+                <span style="flex:1"></span>
+                <span class="dash-when" title="stima: caratteri di nomi e descrizioni ÷ 4">~${ctxK(p.tokens)} token</span>
+            </div>
+            <div class="dash-sub">${escHtml(parts)}${usage} · da: ${escHtml(p.from)}${override}</div>
+            ${open ? `<div class="focus-blockers" style="max-height:360px;overflow-y:auto;font-size:12px">
+                ${p.hooks.total ? '<div><b>Hook:</b> ' + escHtml(Object.entries(p.hooks.events).map(([e, n]) => e + ' ' + n).join(', ')) + '</div>' : ''}
+                ${p.mcp.length ? '<div><b>MCP:</b> ' + escHtml(p.mcp.join(', ')) + '</div>' : ''}
+                ${p.skills.map(s => `<div>🧩 <b>${escHtml(s.name)}</b> <span style="color:var(--text2)">~${s.tokens} — ${escHtml(s.description.slice(0, 160))}</span></div>`).join('')}
+                ${p.agents.map(s => `<div>🤖 <b>${escHtml(s.name)}</b> <span style="color:var(--text2)">~${s.tokens} — ${escHtml(s.description.slice(0, 160))}</span></div>`).join('')}
+            </div>` : ''}
+        </div>`;
+    }
+
+    function ctxSkillRow(s, dir, usage) {
+        const u = usage && usage.skills[s.id];
+        return `<div class="dash-projcard" style="${s.disabled ? 'opacity:.6' : ''}"><div class="dash-projhead">
+            ${ctxSwitch(!s.disabled, `ctxToggleSkill(${JSON.stringify(s.id)}, !this.checked, ${JSON.stringify(dir || '')})`)}
+            <b>${escHtml(s.name)}</b>${usage ? ` <span class="dash-sub" style="margin:0">usata ${u ? u.count + ' volte, ultima ' + ctxWhen(u.last) : 'mai qui'}</span>` : ''}
+            <span style="flex:1"></span><span class="dash-when">~${s.tokens} token</span></div>
+            <div class="dash-sub">${escHtml(s.description.slice(0, 220))}</div></div>`;
+    }
+
+    function ctxAnalysisHtml(dir) {
+        const key = dir || '';
+        const a = ctxState.analysis[key];
+        const btn = `<button class="btn" ${ctxState.busy !== '' ? 'disabled' : ''} onclick="ctxAnalyze(${JSON.stringify(key).replace(/"/g, '&quot;')})">${ctxState.busy === key ? '⏳ Analisi in corso (1-3 min)…' : '🔍 Analizza con Claude'}</button>`;
+        if (!a) return btn;
+        if (a.error) return btn + `<div class="dash-empty">Errore: ${escHtml(a.error)}</div>`;
+        const kinds = { duplicate: 'duplicata', conflict: 'in contrasto', stale: 'scaduta', too_specific: 'troppo specifica', memory_promote: 'memoria → globale', contradicts_global: 'contraddice il globale', repeats_global: 'ripete il globale' };
+        return btn + `<div class="dash-sub" style="margin:8px 0">${escHtml(a.summary)} — token: ${a.tokensBefore} → ${a.tokensAfter ?? '?'}</div>`
+            + (a.findings.length ? a.findings.map((f, i) => `<div class="dash-projcard">
+                <div class="dash-projhead"><span class="git-tag">${escHtml(kinds[f.kind] || f.kind)}</span>
+                    <span style="font-size:12px">${escHtml(f.file)}${f.line ? ':' + f.line : ''}</span><span style="flex:1"></span>
+                    ${f.applied ? '✅ applicata' : f.fix ? `<button class="btn" onclick="ctxApply(${JSON.stringify(key).replace(/"/g, '&quot;')}, ${i})">Applica</button>` : '<span class="dash-when">da sistemare a mano</span>'}</div>
+                ${f.quote ? `<div style="font-family:ui-monospace,Consolas,monospace;font-size:12px;white-space:pre-wrap;color:var(--text2)">${escHtml(f.quote)}</div>` : ''}
+                <div class="dash-sub">${escHtml(f.problem)}</div>
+                ${f.fix && f.fix.appendFile ? `<div class="dash-sub">→ sposta in ${escHtml(f.fix.appendFile)}</div>` : ''}
+            </div>`).join('') : '<div class="dash-empty">Nessun problema trovato.</div>');
+    }
+
+    function ctxRender() {
+        if (ctxState.err) return `<div class="dash-empty">Bridge non raggiungibile o non aggiornato: ${escHtml(ctxState.err)}</div>`;
+        const inv = ctxState.inv;
+        if (!inv) return '<div class="dash-empty">Carico…</div>';
+        const h = t => `<h3 style="margin:18px 0 8px;font-size:15px">${t}</h3>`;
+        const userSkTok = inv.userSkills.reduce((s, x) => s + x.tokens, 0);
+        const mdTok = inv.claudeMd.reduce((s, x) => s + x.tokens, 0);
+        let html = `<div class="dash-sub" style="margin-bottom:8px">Stima del contesto fisso di ogni sessione (globale): <b>~${ctxK(inv.totalTokens)} token</b>
+            (plugin attivi ${ctxK(inv.totalTokens - userSkTok - mdTok)}, skill tue ${ctxK(userSkTok)}, CLAUDE.md ${ctxK(mdTok)}). Le modifiche valgono dalla sessione successiva.</div>`;
+        html += h('1 · Plugin (globale)') + inv.plugins.slice().sort((a, b) => b.tokens - a.tokens).map(p => ctxPluginCard(p, '')).join('');
+        html += h('Skill tue (~/.claude/skills)') + inv.userSkills.map(s => ctxSkillRow(s, '', null)).join('');
+        html += h('Server MCP') + inv.mcp.map(m => `<div class="dash-sub">🔌 ${escHtml(m.name)} <span class="git-tag">${escHtml(m.scope)}</span>${m.needsAuth ? ' <span class="git-tag" style="background:#fee2e2;color:#991b1b">autenticazione mai fatta / non si connette</span>' : ''}</div>`).join('');
+
+        html += h('2 · Vista per progetto') + `<select onchange="ctxLoadProject(this.value)" style="max-width:420px"><option value="">— scegli un progetto —</option>${inv.projects.map(p => `<option value="${escHtml(p.dir)}" ${p.dir === ctxState.dir ? 'selected' : ''}>${escHtml(p.name)} — ${escHtml(p.dir)}</option>`).join('')}</select>`;
+        if (ctxState.dir) {
+            const pr = ctxState.proj;
+            if (ctxState.projErr) html += `<div class="dash-empty">Errore: ${escHtml(ctxState.projErr)}</div>`;
+            else if (!pr) html += '<div class="dash-empty">Leggo le sessioni del progetto…</div>';
+            else {
+                const used = Object.entries(pr.usage.skills).sort((a, b) => b[1].count - a[1].count);
+                html += `<div class="dash-sub" style="margin:8px 0">${pr.usage.sessions} sessioni lette · contesto effettivo ~${ctxK(pr.totalTokens)} token · gli interruttori qui scrivono in <code>.claude/settings.local.json</code> del progetto.</div>`;
+                html += pr.plugins.slice().sort((a, b) => b.tokens - a.tokens).map(p => ctxPluginCard(p, pr.dir)).join('');
+                html += `<div class="dash-sub" style="margin-top:8px"><b>Skill usate davvero qui:</b> ${used.length ? used.map(([n, u]) => `${escHtml(n)} ×${u.count} (${ctxWhen(u.last)})`).join(' · ') : 'nessuna'}</div>`;
+                if (pr.projectSkills.length) html += pr.projectSkills.map(s => ctxSkillRow(s, pr.dir, pr.usage)).join('');
+                html += `<div class="dash-sub" style="margin-top:6px">CLAUDE.md: ${pr.claudeMd.length ? pr.claudeMd.map(c => escHtml(c.file) + ' (~' + c.tokens + ')').join(', ') : 'nessuno'}</div>`;
+                if (pr.claudeMd.length) html += h('4 · Analisi CLAUDE.md del progetto') + ctxAnalysisHtml(pr.dir);
+            }
+        }
+
+        html += h('3 · Analisi CLAUDE.md globale') + `<div class="dash-sub" style="margin-bottom:6px">${inv.claudeMd.map(c => escHtml(c.file) + ' (' + c.lines + ' righe, ~' + c.tokens + ' token)').join(' · ')} + indici memoria dei progetti. Claude propone, tu approvi ogni correzione (con backup).</div>` + ctxAnalysisHtml('');
+        return html;
     }
 
     async function loadClaudeView() {
@@ -7573,7 +7733,7 @@ $dataJson = json_encode($data);
 
         document.querySelectorAll('#claudeView .dash-tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === claudeTabName));
         claudeRenderBody();
-        await Promise.all([claudeFetchSkills(), claudeFetchMemory()]);
+        await Promise.all([claudeFetchSkills(), claudeFetchMemory(), claudeTabName === 'context' ? ctxLoad() : null]);
     }
 
     async function claudeFetchSkills() {
@@ -7623,7 +7783,9 @@ $dataJson = json_encode($data);
     function claudeRenderBody() {
         const body = document.getElementById('claudeBody');
         const counts = { skills: claudeSkills ? claudeSkills.length : '', memory: 0 };
-        if (claudeTabName === 'skills') {
+        if (claudeTabName === 'context') {
+            body.innerHTML = ctxRender();
+        } else if (claudeTabName === 'skills') {
             if (claudeSkills === null) body.innerHTML = '<div class="dash-empty">Bridge locale non raggiungibile: avvialo per vedere le skill installate.</div>';
             else if (!claudeSkills.length) body.innerHTML = '<div class="dash-empty">Nessuna skill trovata in ~/.claude/skills.</div>';
             else body.innerHTML = claudeSkills.map(s => claudeCard('skill|' + s.id, '', s.name, s.description, s.modified)).join('');
@@ -7644,6 +7806,7 @@ $dataJson = json_encode($data);
             }
         }
         document.querySelectorAll('#claudeView .dash-tabs button').forEach(b => {
+            if (b.dataset.tab === 'context') { b.querySelector('.dash-count').textContent = ctxState.inv ? '~' + ctxK(ctxState.inv.totalTokens) : ''; return; }
             const c = b.dataset.tab === 'skills' ? counts.skills : counts.memory;
             b.querySelector('.dash-count').textContent = c === '' ? '' : c;
         });
