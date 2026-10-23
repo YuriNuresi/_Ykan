@@ -4071,6 +4071,7 @@ $dataJson = json_encode(ykanPublicData($data));
             <button data-tab="week" onclick="dashTab('week')">Attività <span class="dash-count"></span></button>
             <button data-tab="review" onclick="dashTab('review')">Revisione sessioni <span class="dash-count"></span></button>
             <button data-tab="git" onclick="dashTab('git')">Git <span class="dash-count"></span></button>
+            <button data-tab="graphify" onclick="dashTab('graphify')">🕸️ Graphify <span class="dash-count"></span></button>
             <span class="dash-legend"><i class="st-todo"></i>To Do <i class="st-doing"></i>Claude Do / In corso <i class="st-done"></i>Fatto / archiviato</span>
         </div>
         <div id="dashboardBody"></div>
@@ -5433,7 +5434,45 @@ $dataJson = json_encode(ykanPublicData($data));
         return act;
     }
 
+    // === GRAPHIFY: grafo di ogni progetto (graphify-out/ nella cartella, letto dal Bridge locale) ===
+    const gfy = { info: null, sel: '' }; // info: laneId -> {exists, modified, summary} | null (bridge ko)
+    async function gfyLoad() {
+        const lanes = boardData.swimlanes.filter(l => l.local_path);
+        const info = {};
+        await Promise.all(lanes.map(async l => {
+            try { const r = await fetch(BRIDGE_URL + '/graphify/info?dir=' + encodeURIComponent(l.local_path)); info[l.id] = r.ok ? await r.json() : { exists: false }; }
+            catch (_) { info[l.id] = null; }
+        }));
+        gfy.info = info;
+        if (!gfy.sel || !(info[gfy.sel] && info[gfy.sel].exists)) gfy.sel = (lanes.find(l => info[l.id] && info[l.id].exists) || {}).id || '';
+        if (dashTabName === 'graphify') gfyRender();
+    }
+
+    function gfySelect(id) { gfy.sel = id; gfyRender(); }
+
+    function gfyRender() {
+        const body = document.getElementById('dashboardBody');
+        document.querySelectorAll('#dashTabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === 'graphify'));
+        if (!gfy.info) { body.innerHTML = '<div class="dash-empty">Cerco i grafi nei progetti…</div>'; gfyLoad(); return; }
+        const lanes = boardData.swimlanes.filter(l => l.local_path);
+        if (Object.values(gfy.info).every(v => v === null)) { body.innerHTML = '<div class="dash-empty">Bridge locale non raggiungibile: il grafo si legge dal PC (vale solo per «Questo computer»).</div>'; return; }
+        const withGraph = lanes.filter(l => gfy.info[l.id] && gfy.info[l.id].exists);
+        const btn = document.querySelector('#dashTabs button[data-tab="graphify"] .dash-count');
+        if (btn) btn.textContent = withGraph.length || '';
+        const sel = boardData.swimlanes.find(l => l.id === gfy.sel);
+        const inf = sel && gfy.info[sel.id];
+        body.innerHTML = `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">
+                ${lanes.map(l => { const i = gfy.info[l.id]; const has = i && i.exists;
+                    return `<button class="btn${l.id === gfy.sel ? ' btn-primary' : ''}" ${has ? `onclick="gfySelect('${escHtml(l.id)}')"` : 'disabled'} title="${has ? 'grafo del ' + new Date(i.modified).toLocaleDateString('it-IT') : 'nessun grafo: lancia /graphify in una sessione di questo progetto'}" style="${has ? '' : 'opacity:.5'}">${escHtml(l.name)}${has ? '' : ' —'}</button>`; }).join('')}
+                <span style="flex:1"></span><button class="btn" onclick="gfy.info=null;gfyRender()">↻</button>
+            </div>`
+            + (!inf ? '<div class="dash-empty">Nessun progetto ha ancora un grafo. In una sessione di Claude Code nel progetto scrivi <code>/graphify</code>: crea <code>graphify-out/</code> e qui compare.</div>'
+            : `<div class="dash-sub" style="margin-bottom:6px;white-space:pre-wrap">${escHtml(inf.summary)} · aggiornato il ${new Date(inf.modified).toLocaleDateString('it-IT')} — per rigenerarlo: <code>/graphify</code> in una sessione del progetto</div>
+               <iframe src="${BRIDGE_URL}/graphify/graph?dir=${encodeURIComponent(sel.local_path)}" style="width:100%;height:calc(100vh - 260px);min-height:480px;border:1px solid var(--border);border-radius:8px;background:#fff" referrerpolicy="strict-origin-when-cross-origin"></iframe>`);
+    }
+
     function dashRender() {
+        if (dashTabName === 'graphify') return gfyRender();
         if (!dashData) return;
         const { res, sd } = dashData;
         const counts = {
@@ -7988,6 +8027,66 @@ $dataJson = json_encode(ykanPublicData($data));
         claudeRenderBody();
     }
 
+    // Ottimizza contesto del progetto: Claude (sul PC, senza strumenti) propone, tu spunti e applichi.
+    ctxState.opt = {}; // dir -> { busy: ms, result, error, sel: Set di chiavi spuntate }
+    async function ctxOptimize(dir) {
+        const o = ctxState.opt[dir] = { busy: Date.now() };
+        const tick = setInterval(() => { if (claudeTabName === 'context') claudeRenderBody(); }, 1000);
+        claudeRenderBody();
+        try {
+            o.result = await ctxCall('/claude/context/optimize', { dir });
+            o.sel = new Set([...o.result.plugins.map(p => 'p|' + p.key), ...o.result.skills.map(s => 's|' + s.name)]);
+        } catch (e) { o.error = e.message; }
+        clearInterval(tick); o.busy = 0; claudeRenderBody();
+    }
+
+    function ctxOptToggle(dir, key, on) { const o = ctxState.opt[dir]; if (o && o.sel) on ? o.sel.add(key) : o.sel.delete(key); }
+
+    async function ctxOptApply(dir) {
+        const o = ctxState.opt[dir];
+        if (!o || !o.result) return;
+        const plugins = o.result.plugins.filter(p => o.sel.has('p|' + p.key));
+        const skills = o.result.skills.filter(s => o.sel.has('s|' + s.name));
+        if (!plugins.length && !skills.length) { toast('Nessuna proposta selezionata', 'error'); return; }
+        if (!confirm(`Applicare ${plugins.length} modifiche ai plugin e ${skills.length} alle skill per questo progetto?\n\nScrive solo in ${dir}\\.claude\\settings.local.json (con backup). Vale dalla prossima sessione e si annulla da qui.`)) return;
+        try {
+            for (const p of plugins.filter(p => p.action !== 'keep_only')) await ctxCall('/claude/context/plugin', { plugin: p.key, enabled: p.action === 'on', dir });
+            const overrides = {};
+            plugins.filter(p => p.action === 'keep_only').forEach(p => p.hide.forEach(n => { overrides[n] = 'user-invocable-only'; }));
+            skills.forEach(s => { overrides[s.name] = s.state; });
+            if (Object.keys(overrides).length) await ctxCall('/claude/context/overrides', { dir, overrides });
+            o.applied = true;
+            toast('✅ Contesto del progetto ottimizzato: vale dalla prossima sessione', 'success');
+        } catch (e) { toast('❌ ' + e.message, 'error'); }
+        await ctxLoadProject(dir);
+    }
+
+    function ctxOptimizeHtml(dir) {
+        const o = ctxState.opt[dir] || {};
+        const q = JSON.stringify(dir).replace(/"/g, '&quot;');
+        const btn = o.busy
+            ? `<button class="btn btn-primary" disabled>⏳ Claude sta studiando il progetto… ${Math.round((Date.now() - o.busy) / 1000)}s</button>`
+            : `<button class="btn btn-primary" onclick="ctxOptimize(${q})" title="Claude gira sul PC senza strumenti: legge di che progetto si tratta e propone cosa spegnere. Applichi tu.">✨ Ottimizza contesto con Claude</button>`;
+        if (o.error) return btn + `<div class="dash-empty">Errore: ${escHtml(o.error)}</div>`;
+        if (!o.result) return btn + '<div class="dash-sub" style="margin-top:4px">Propone per questo progetto quali plugin e skill spegnere, o lasciare solo a comando (/nome). Niente viene cambiato finché non applichi.</div>';
+        const r = o.result;
+        const states = { off: '⛔ spenta', 'user-invocable-only': '⌨️ solo a comando', 'name-only': '🏷️ solo nome', on: '✅ accesa' };
+        const acts = { off: '⛔ spegni il plugin', on: '✅ accendi il plugin', keep_only: '✂️ tieni solo alcune skill' };
+        const row = (key, checked, head, reason, extra) => `<label style="display:flex;gap:8px;align-items:flex-start;padding:6px 0;border-top:1px solid var(--border);cursor:pointer">
+            <input type="checkbox" ${checked ? 'checked' : ''} ${o.applied ? 'disabled' : ''} onchange="ctxOptToggle(${q}, ${JSON.stringify(key).replace(/"/g, '&quot;')}, this.checked)" style="width:auto;margin-top:3px">
+            <span><span style="font-size:13px">${head}</span><br><span style="font-size:12px;color:var(--text2)">${escHtml(reason)}</span>${extra || ''}</span></label>`;
+        return btn + `<div class="dash-projcard" style="margin-top:8px">
+            <div class="dash-projhead"><b>Proposte di Claude</b><span style="flex:1"></span>
+                <span class="dash-when">${r.seconds}s · risparmio stimato ~${ctxK(r.tokensSaved || 0)} token su ~${ctxK(r.totalTokens)}</span></div>
+            <div class="dash-sub" style="white-space:pre-wrap">${escHtml(r.summary)}</div>
+            ${r.plugins.map(p => row('p|' + p.key, o.sel.has('p|' + p.key), `<b>${escHtml(p.name)}</b> → ${acts[p.action]} <span class="dash-when">~${ctxK(p.tokens)} token</span>`, p.reason,
+                p.action === 'keep_only' ? `<br><span style="font-size:11px">tiene: ${escHtml(p.keep.join(', ') || 'nessuna')} · le altre ${p.hide.length} diventano solo a comando</span>` : '')).join('')}
+            ${r.skills.map(s => row('s|' + s.name, o.sel.has('s|' + s.name), `<b>${escHtml(s.name)}</b>: ${states[s.current] || s.current} → ${states[s.state]}`, s.reason)).join('')}
+            ${!r.plugins.length && !r.skills.length ? '<div class="dash-empty">Niente da alleggerire: il contesto di questo progetto è già a posto.</div>' : ''}
+            <div style="margin-top:8px">${o.applied ? '✅ Applicate. Ricontrolla il contesto effettivo qui sopra.' : `<button class="btn btn-primary" onclick="ctxOptApply(${q})">Applica selezionate</button>`}</div>
+        </div>`;
+    }
+
     function ctxToggleOpen(k) { ctxState.open.has(k) ? ctxState.open.delete(k) : ctxState.open.add(k); claudeRenderBody(); }
 
     function ctxSwitch(checked, onchange) {
@@ -8067,6 +8166,7 @@ $dataJson = json_encode(ykanPublicData($data));
             else {
                 const used = Object.entries(pr.usage.skills).sort((a, b) => b[1].count - a[1].count);
                 html += `<div class="dash-sub" style="margin:8px 0">${pr.usage.sessions} sessioni lette · contesto effettivo ~${ctxK(pr.totalTokens)} token · gli interruttori qui scrivono in <code>.claude/settings.local.json</code> del progetto.</div>`;
+                html += `<div style="margin:6px 0 12px">${ctxOptimizeHtml(pr.dir)}</div>`;
                 html += pr.plugins.slice().sort((a, b) => b.tokens - a.tokens).map(p => ctxPluginCard(p, pr.dir)).join('');
                 html += `<div class="dash-sub" style="margin-top:8px"><b>Skill usate davvero qui:</b> ${used.length ? used.map(([n, u]) => `${escHtml(n)} ×${u.count} (${ctxWhen(u.last)})`).join(' · ') : 'nessuna'}</div>`;
                 if (pr.projectSkills.length) html += pr.projectSkills.map(s => ctxSkillRow(s, pr.dir, pr.usage)).join('');
