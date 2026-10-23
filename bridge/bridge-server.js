@@ -1741,6 +1741,37 @@ const server = http.createServer((req, res) => {
         try { return json(200, contextForProject(path.resolve(String(parsed.query.dir || '')))); }
         catch (e) { return json(500, { error: String((e && e.message) || e) }); }
     }
+    // Login della CLI claude (diverso da quello di Claude Desktop, che passa il token alle sue sessioni):
+    // serve per le analisi che il Bridge lancia da solo. Lo stato viene da "claude auth status" (JSON).
+    if (req.method === 'GET' && parsed.pathname === '/claude/auth') {
+        const child = spawnProcess(resolveClaudeBin(), ['auth', 'status'], { cwd: os.tmpdir(), windowsHide: true });
+        let out = '';
+        const timer = setTimeout(() => child.kill(), 20000);
+        child.stdout.on('data', d => { out += d; });
+        child.on('error', e => { clearTimeout(timer); json(500, { error: String(e.message) }); });
+        child.on('close', () => {
+            clearTimeout(timer);
+            if (res.headersSent) return;
+            try { const j = JSON.parse(out); json(200, { loggedIn: !!j.loggedIn, authMethod: j.authMethod || '', email: j.email || '', bin: resolveClaudeBin() }); }
+            catch (_) { json(500, { error: 'risposta di claude auth status non valida' }); }
+        });
+        return;
+    }
+    // Apre una finestra visibile con "claude auth login": il login si completa nel browser.
+    if (req.method === 'POST' && parsed.pathname === '/claude/auth/login') {
+        if (!isAllowedOrigin(origin)) return json(403, { error: 'origin non ammessa' });
+        if (!/^application\/json/.test(req.headers['content-type'] || '')) return json(415, { error: 'serve application/json' });
+        const bin = resolveClaudeBin();
+        if (process.platform === 'win32') {
+            // Riga di comando scritta a mano (verbatim): cmd /k ""<exe>" auth login" e' la forma che cmd capisce
+            spawnProcess('cmd.exe', ['/c', `start "Login Claude Code" cmd.exe /k ""${bin}" auth login & echo. & echo Fatto: puoi chiudere questa finestra."`],
+                { detached: true, stdio: 'ignore', windowsVerbatimArguments: true }).unref();
+        } else {
+            spawnProcess(bin, ['auth', 'login'], { detached: true, stdio: 'ignore' }).unref();
+        }
+        return json(200, { ok: true });
+    }
+
     // Ottimizza memoria: la board manda i file (gia' letti dal Bridge) e il prompt, claude gira qui
     // in locale senza strumenti (--tools ""), quindi puo' solo rispondere: non tocca nessun file.
     // Le proposte tornano alla board, che le applica una per una solo dopo la conferma.

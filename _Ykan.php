@@ -4376,6 +4376,13 @@ $dataJson = json_encode(ykanPublicData($data));
                     </label>
                     <small style="color:var(--text2);font-size:11px;display:block;margin-top:4px">Aggiungi <code>ANTHROPIC_KEY=sk-ant-...</code> nel file <code>.env</code> per abilitare l'esecuzione automatica dei task.</small>
                 </div>
+                <div class="form-group" style="background:var(--bg2);padding:10px 12px;border-radius:8px">
+                    <label style="display:flex;align-items:center;gap:8px;margin-bottom:0">
+                        <span>💻 Login di Claude Code su questo PC</span>
+                        <button type="button" id="claudeAuthBtn" class="btn" onclick="claudeAuthClick()" style="padding:3px 12px">Controllo…</button>
+                    </label>
+                    <small style="color:var(--text2);font-size:11px;display:block;margin-top:4px">Serve alle analisi che il Bridge lancia da solo («Ottimizza con Claude», analisi CLAUDE.md). È separato dal login di Claude Desktop. Rosso = clicca per aprire il login (si completa nel browser).</small>
+                </div>
                 <div class="form-group">
                     <label>Dove aprire le sessioni Claude</label>
                     <select id="configSessionMode">
@@ -7748,6 +7755,38 @@ $dataJson = json_encode(ykanPublicData($data));
         // "Save" solo sulle schede che stanno dentro il form (Progetti/Aspetto/Strumenti salvano da sé)
         document.querySelector('#configForm .modal-actions').style.display = document.querySelector(`#configForm [data-panel="${name}"]`) ? '' : 'none';
         if (name === 'progetti') renderProjectsManager();
+        if (name === 'claude-code') claudeAuthCheck();
+    }
+
+    // Login della CLI claude sul PC (via Bridge): verde = ok, rosso = serve login (clic = apre il login).
+    let claudeAuthState = null, claudeAuthPoll = null;
+    async function claudeAuthCheck() {
+        const btn = document.getElementById('claudeAuthBtn');
+        if (!btn) return;
+        try {
+            const r = await bridgeFetch('/claude/auth');
+            const j = await r.json();
+            if (r.status === 404) throw new Error('Bridge da aggiornare');
+            if (!r.ok) throw new Error(j.error || 'HTTP ' + r.status);
+            claudeAuthState = j.loggedIn ? 'ok' : 'login';
+        } catch (e) { claudeAuthState = 'bridge'; btn.title = e.message; }
+        const look = { ok: ['✅ Login OK', '#16a34a'], login: ['🔑 Serve login', '#dc2626'], bridge: ['Bridge non raggiungibile', '#6b7280'] }[claudeAuthState];
+        btn.textContent = look[0];
+        btn.style.background = look[1]; btn.style.color = '#fff'; btn.style.borderColor = look[1];
+        if (claudeAuthState === 'ok' && claudeAuthPoll) { clearInterval(claudeAuthPoll); claudeAuthPoll = null; toast('Claude Code collegato', 'success'); }
+    }
+
+    async function claudeAuthClick() {
+        if (claudeAuthState !== 'login') return claudeAuthCheck();
+        try {
+            const r = await bridgeFetch('/claude/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+            if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || 'HTTP ' + r.status);
+            toast('Si è aperta una finestra sul PC: completa il login nel browser', 'info');
+            // Ricontrolla da solo finché il login non risulta fatto (max 5 minuti)
+            clearInterval(claudeAuthPoll);
+            const until = Date.now() + 300000;
+            claudeAuthPoll = setInterval(() => { if (Date.now() > until) { clearInterval(claudeAuthPoll); claudeAuthPoll = null; } else claudeAuthCheck(); }, 4000);
+        } catch (e) { toast('Login non avviato: ' + e.message, 'error'); }
     }
 
     // Archivio dati (JSON o MySQL) e cartella del .env: vedi ykanStorageInfo() lato PHP.
