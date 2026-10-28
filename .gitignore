@@ -27,3 +27,4 @@ _Ykan_local.json
 
 # Pacchetti di Settings → Strumenti (generati da bridge: npm run build)
 downloads/*.zip
+_wa_bot/

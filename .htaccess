@@ -21,6 +21,13 @@ Require valid-user
     Allow from all
 </Files>
 
+# ---- Exception: whatsapp_bot.php is Meta's webhook (guarded by its signature) --
+<Files "whatsapp_bot.php">
+    Satisfy Any
+    Order allow,deny
+    Allow from all
+</Files>
+
 # ---- Never serve these over HTTP -------------------------------------------
 <Files ".env">
     Require all denied
@@ -34,3 +41,6 @@ Require valid-user
 <Files "_ykan_mcp_audit.log">
     Require all denied
 </Files>
+
+# WhatsApp bot history and log
+RedirectMatch 403 /_wa_bot/
