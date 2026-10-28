@@ -36,6 +36,16 @@ execFileSync(process.execPath, [
 const nm = path.join(root, 'node_modules');
 const outNm = path.join(out, 'node_modules');
 fs.cpSync(path.join(nm, 'ws'), path.join(outNm, 'ws'), { recursive: true });
+// WhatsApp: Baileys e le sue dipendenze (tutto l'albero, letto dai package.json)
+const copyTree = (name, seen = new Set()) => {
+    if (seen.has(name) || !fs.existsSync(path.join(nm, name, 'package.json'))) return;
+    seen.add(name);
+    fs.cpSync(path.join(nm, name), path.join(outNm, name), { recursive: true });
+    const pkg = JSON.parse(fs.readFileSync(path.join(nm, name, 'package.json'), 'utf8'));
+    for (const dep of Object.keys(Object.assign({}, pkg.dependencies, pkg.optionalDependencies))) copyTree(dep, seen);
+};
+const waSeen = new Set();
+for (const m of ['@whiskeysockets/baileys', 'qrcode', 'pino']) copyTree(m, waSeen);
 fs.cpSync(path.join(nm, 'node-pty'), path.join(outNm, 'node-pty'), {
     recursive: true,
     filter: src => {

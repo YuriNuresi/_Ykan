@@ -4568,6 +4568,7 @@ $dataJson = json_encode(ykanPublicData($data));
             <button data-tab="routines" onclick="claudeTab('routines')">Routine <span class="dash-count"></span></button>
             <button data-tab="context" onclick="claudeTab('context')">Contesto <span class="dash-count"></span></button>
             <button data-tab="news" onclick="claudeTab('news')">Novità <span class="dash-count"></span></button>
+            <button data-tab="wa" onclick="claudeTab('wa')">WhatsApp <span class="dash-count"></span></button>
         </div>
         <div id="claudeBody"></div>
     </section>
@@ -8018,6 +8019,115 @@ $dataJson = json_encode(ykanPublicData($data));
         claudeRenderBody();
         if (name === 'context' && !ctxState.inv) ctxLoad();
         if (name === 'news' && !newsState.data && !newsState.busy) newsLoad();
+        if (name === 'wa') waLoad(); else clearTimeout(waState.timer);
+    }
+
+    // === WHATSAPP: collegamento, whitelist e chat del bot che risponde con Claude (tutto via Bridge) ===
+    const waState = { info: undefined, chats: [], open: '', chat: null, timer: 0, busy: false };
+    const WA_STATES = { off: ['⚪', 'Non collegato'], connecting: ['🟡', 'Connessione in corso…'], qr: ['📱', 'Inquadra il QR code'], open: ['🟢', 'Collegato'] };
+
+    async function waLoad() {
+        clearTimeout(waState.timer);
+        try {
+            waState.info = await ctxCall('/whatsapp');
+            waState.chats = (await ctxCall('/whatsapp/chats')).chats || [];
+            if (waState.open) waState.chat = await ctxCall('/whatsapp/chat?num=' + encodeURIComponent(waState.open));
+        } catch (e) { waState.info = /not found|404/i.test(e.message) ? 'old' : { error: e.message }; }
+        if (claudeTabName !== 'wa') return;
+        if (!document.getElementById('waStatus')) claudeRenderBody();
+        else waRefresh();
+        const st = waState.info && waState.info.status;
+        waState.timer = setTimeout(waLoad, st === 'qr' || st === 'connecting' ? 3000 : 10000);
+    }
+
+    function waStatusHtml() {
+        const i = waState.info;
+        const [icon, label] = WA_STATES[i.status] || ['⚪', i.status];
+        let html = `<div class="dash-row" style="flex-wrap:wrap"><b>${icon} ${label}</b>${i.me ? ` <span class="dash-sub">come +${escHtml(i.me)}</span>` : ''}<span style="flex:1"></span>`;
+        if (i.status === 'off') html += `<button class="btn btn-primary" onclick="waAction('/whatsapp/connect')">📱 Collega nuovo dispositivo</button>`;
+        if (i.status === 'open' || i.status === 'qr' || i.status === 'connecting') html += `<button class="btn" onclick="waAction('/whatsapp/disconnect')">Ferma</button>`;
+        if (i.status === 'open') html += `<button class="btn" onclick="waAction('/whatsapp/logout', 'Scollegare questo PC da WhatsApp? Per ricollegarlo servirà un nuovo QR code.')">Scollega dispositivo</button>`;
+        html += '</div>';
+        if (i.error) html += `<div class="dash-sub">⚠️ ${escHtml(i.error)}</div>`;
+        if (i.status === 'qr' && i.qr) html += `<div style="margin-top:10px;display:flex;gap:14px;align-items:center;flex-wrap:wrap">
+            <img src="${escHtml(i.qr)}" alt="QR code WhatsApp" style="width:220px;height:220px;background:#fff;padding:6px;border-radius:8px">
+            <div class="dash-sub" style="max-width:320px">Sul telefono: WhatsApp → Impostazioni → <b>Dispositivi collegati</b> → <b>Collega un dispositivo</b>, poi inquadra il codice. Si aggiorna da solo.</div></div>`;
+        return html;
+    }
+
+    function waChatsHtml() {
+        if (!waState.chats.length) return '<div class="dash-empty">Nessuna chat ancora: compariranno qui quando qualcuno in whitelist scrive.</div>';
+        return waState.chats.map(c => `<div class="dash-item clickable" style="border-left-color:${c.num === waState.open ? 'var(--accent)' : 'var(--border)'}" onclick="waOpen('${escHtml(c.num)}')">
+            <div class="dash-row"><b>${escHtml(c.name || '+' + c.num)}</b><span style="flex:1"></span><span class="dash-sub">${c.at ? new Date(c.at).toLocaleString('it-IT') : ''}</span></div>
+            <div class="dash-sub" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escHtml(c.last)}</div></div>`).join('');
+    }
+
+    function waChatHtml() {
+        const c = waState.chat;
+        if (!waState.open || !c) return '<div class="dash-empty">Scegli una chat per leggerla.</div>';
+        return `<div class="dash-h" style="margin-top:0">${escHtml(c.name || '')} +${escHtml(c.num)}</div>` + c.messages.map(m => m.role === 'note'
+            ? `<div class="dash-sub" style="text-align:center;margin:6px 0">— ${escHtml(m.text)} —</div>`
+            : `<div style="display:flex;justify-content:${m.role === 'assistant' ? 'flex-end' : 'flex-start'};margin:4px 0">
+                <div style="max-width:80%;padding:6px 10px;border-radius:10px;font-size:13px;white-space:pre-wrap;background:${m.role === 'assistant' ? 'var(--accent)' : 'var(--bg2)'};color:${m.role === 'assistant' ? '#fff' : 'inherit'};border:1px solid var(--border)">${escHtml(m.text)}
+                <div style="font-size:10px;opacity:.7;text-align:right">${m.role === 'assistant' ? '🤖 ' : ''}${new Date(m.at).toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit' })}</div></div></div>`).join('');
+    }
+
+    function waHtml() {
+        const i = waState.info;
+        if (i === undefined) return '<div class="dash-empty">Carico…</div>';
+        if (i === 'old') return '<div class="dash-empty">Aggiorna il Bridge alla 0.8.0 per usare WhatsApp (Settings → Strumenti).</div>';
+        if (!i || i.error && !i.status) return `<div class="dash-empty">Bridge locale non raggiungibile${i && i.error ? ': ' + escHtml(i.error) : ''}. WhatsApp gira sul PC con il Bridge.</div>`;
+        if (!i.available) return '<div class="dash-empty">Al Bridge manca la libreria WhatsApp: aggiornalo alla 0.8.0 (Settings → Strumenti).</div>';
+        const c = i.config;
+        return `<div class="dash-sub" style="margin-bottom:10px">Il PC si collega a WhatsApp come dispositivo (come WhatsApp Web) e Claude Code risponde da solo ai numeri in whitelist, dal tuo account. Claude scrive solo testo: non tocca file né comandi. Funziona finché il PC e il Bridge sono accesi.</div>
+            <div class="tool-card" id="waStatus">${waStatusHtml()}</div>
+            <div class="tool-card">
+                <label style="display:flex;gap:8px;align-items:center;font-weight:600"><input type="checkbox" id="waEnabled"${c.enabled ? ' checked' : ''} style="width:auto"> Risposte automatiche attive</label>
+                <div class="form-group" style="margin-top:10px"><label style="font-size:12px">Whitelist: un numero per riga, con prefisso internazionale (es. +39 333 1234567)</label>
+                    <textarea id="waWhitelist" rows="4">${escHtml(c.whitelist.map(n => '+' + n).join('\n'))}</textarea></div>
+                <div class="form-group"><label style="font-size:12px">Modello</label>
+                    <select id="waModel" style="width:auto">${[['haiku', 'Haiku (veloce)'], ['sonnet', 'Sonnet'], ['opus', 'Opus (più bravo, più lento)']].map(([v, l]) => `<option value="${v}"${c.model === v ? ' selected' : ''}>${l}</option>`).join('')}</select></div>
+                <div class="form-group"><label style="font-size:12px">Istruzioni per Claude (vuoto = quelle predefinite)</label>
+                    <textarea id="waPrompt" rows="5" placeholder="${escHtml(i.defaultPrompt)}">${escHtml(c.prompt)}</textarea></div>
+                <button class="btn btn-primary" onclick="waSave()">Salva</button>
+                <span class="dash-sub">Chi è in whitelist può scrivere <b>reset</b> per azzerare la conversazione.</span>
+            </div>
+            <div style="display:grid;grid-template-columns:minmax(0,1fr) minmax(0,2fr);gap:12px">
+                <div><div class="dash-h" style="margin-top:0">Chat</div><div id="waChats">${waChatsHtml()}</div></div>
+                <div id="waChat" style="min-width:0;max-height:520px;overflow-y:auto">${waChatHtml()}</div>
+            </div>`;
+    }
+
+    // Aggiorna solo stato e chat, così i campi che stai scrivendo non si cancellano
+    function waRefresh() {
+        const i = waState.info;
+        if (!i || typeof i !== 'object' || !i.available) return claudeRenderBody();
+        const set = (id, html) => { const el = document.getElementById(id); if (el) el.innerHTML = html; };
+        set('waStatus', waStatusHtml()); set('waChats', waChatsHtml()); set('waChat', waChatHtml());
+    }
+
+    async function waAction(path, ask) {
+        if (ask && !confirm(ask)) return;
+        try { waState.info = await ctxCall(path, {}); } catch (e) { toast('❌ ' + e.message, 'error'); }
+        waRefresh(); waLoad();
+    }
+
+    async function waSave() {
+        const body = { enabled: document.getElementById('waEnabled').checked, whitelist: document.getElementById('waWhitelist').value,
+            model: document.getElementById('waModel').value, prompt: document.getElementById('waPrompt').value.trim() };
+        try {
+            waState.info = await ctxCall('/whatsapp/config', body);
+            toast('✅ Salvato', 'success');
+            document.getElementById('waWhitelist').value = waState.info.config.whitelist.map(n => '+' + n).join('\n');
+        } catch (e) { toast('❌ ' + e.message, 'error'); }
+        waRefresh(); waLoad();
+    }
+
+    async function waOpen(num) {
+        waState.open = num; waState.chat = null; waRefresh();
+        try { waState.chat = await ctxCall('/whatsapp/chat?num=' + encodeURIComponent(num)); } catch (e) { toast('❌ ' + e.message, 'error'); }
+        waRefresh();
+        const el = document.getElementById('waChat'); if (el) el.scrollTop = el.scrollHeight;
     }
 
     // === NOVITÀ: repo GitHub più stellati del periodo (skill, plugin, MCP) + release di Claude Code ===
@@ -8377,6 +8487,8 @@ $dataJson = json_encode(ykanPublicData($data));
             body.innerHTML = ctxRender();
         } else if (claudeTabName === 'news') {
             body.innerHTML = newsHtml();
+        } else if (claudeTabName === 'wa') {
+            body.innerHTML = waHtml();
         } else if (claudeTabName === 'skills') {
             if (claudeSkills === null) body.innerHTML = '<div class="dash-empty">Bridge locale non raggiungibile: avvialo per vedere le skill installate.</div>';
             else if (!claudeSkills.length) body.innerHTML = '<div class="dash-empty">Nessuna skill trovata in ~/.claude/skills.</div>';
