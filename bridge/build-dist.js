@@ -58,6 +58,10 @@ fs.cpSync(path.join(nm, 'node-pty'), path.join(outNm, 'node-pty'), {
     }
 });
 
+// Versione accanto all'exe: il Bridge la legge da qui (dentro l'exe non c'e' package.json)
+const version = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')).version;
+fs.writeFileSync(path.join(out, 'package.json'), JSON.stringify({ name: 'ykan-bridge', version }, null, 2));
+
 // Icona nella tray + avvio automatico nascosto: stessi script della cartella sorgente
 // (tray.ps1 usa ykan-bridge.exe se lo trova accanto a se').
 for (const f of ['tray.ps1', 'autostart-hidden.vbs', 'install-autostart.bat', 'uninstall-autostart.bat']) {
@@ -73,6 +77,8 @@ Estrai tutta la cartella (non avviare l'exe da dentro lo zip), poi:
   in background, senza finestre. Per avviarlo subito: doppio click su autostart-hidden.vbs.
 - Icona "Y" vicino all'orologio (verde = attivo, rossa = fermo): tasto destro per
   Riavvia / Apri log / Termina.
+- Aggiornamenti: tasto destro sull'icona -> "Aggiorna alla x.y.z" (o il pulsante nella board).
+  Il Bridge scarica la versione nuova da Ykan e si riavvia da solo (serve il PC collegato).
 - uninstall-autostart.bat toglie l'avvio automatico.
 - ykan-bridge.exe da solo apre invece una finestra di terminale (utile per vedere gli errori).
 

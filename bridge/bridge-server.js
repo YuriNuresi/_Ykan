@@ -96,7 +96,7 @@ async function heartbeat() {
     if (!link) return;
     try {
         const j = await boardCall(link.server, 'heartbeat', { os: osLabel(), version: BRIDGE_VERSION }, link.token);
-        linkState = { lastBeat: new Date().toISOString(), lastError: '' };
+        linkState = { lastBeat: new Date().toISOString(), lastError: '', latest: String(j.latest || '') };
         if (j.name && j.name !== link.name) writeLink(Object.assign({}, link, { name: j.name })); // rinominato dalla board
     } catch (e) {
         linkState.lastError = e.status === 401 ? 'revocato dalla board' : String((e && e.message) || e);
@@ -201,7 +201,71 @@ function linkInfo() {
     const link = readLink();
     if (!link) return { linked: false, version: BRIDGE_VERSION };
     return { linked: true, name: link.name, account: link.account, server: link.server, bridgeId: link.bridgeId,
-        lastBeat: linkState.lastBeat, lastError: linkState.lastError, version: BRIDGE_VERSION };
+        lastBeat: linkState.lastBeat, lastError: linkState.lastError, version: BRIDGE_VERSION,
+        latest: linkState.latest || '', updateAvailable: updateAvailable() };
+}
+
+// === AGGIORNAMENTO AUTOMATICO ===
+// La board dice nel heartbeat qual e' l'ultima versione; "Aggiorna" (board o icona nella tray)
+// scarica lo zip dalla board con il token del PC e lancia un piccolo script PowerShell che,
+// a Bridge chiuso, copia i file nuovi sopra questa cartella e lo riavvia. Solo per il pacchetto
+// con ykan-bridge.exe: chi lo usa dai sorgenti aggiorna con git.
+const INSTALL_DIR = path.dirname(process.execPath);
+const canSelfUpdate = () => isSea && process.platform === 'win32';
+const updateAvailable = () => !!linkState.latest && compareVersions(linkState.latest, BRIDGE_VERSION) > 0;
+let updating = false;
+
+function updateInfo() {
+    return { current: BRIDGE_VERSION, latest: linkState.latest || '', available: updateAvailable(),
+        linked: !!readLink(), canSelfUpdate: canSelfUpdate(), updating };
+}
+
+async function selfUpdate() {
+    const link = readLink();
+    if (!link) throw new Error('Collega prima questo PC a Ykan (Settings → PC collegati): l\'aggiornamento si scarica dalla board.');
+    if (!canSelfUpdate()) throw new Error('Aggiornamento automatico solo per il Bridge installato con ykan-bridge.exe: dai sorgenti usa git pull e npm install.');
+    if (updating) throw new Error('Aggiornamento gia\' in corso');
+    updating = true;
+    try {
+        const res = await fetch(`${link.server}/_Ykan.php?bridge=update_download`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + link.token },
+            body: JSON.stringify({ token: link.token }),
+            signal: AbortSignal.timeout(10 * 60 * 1000)
+        });
+        const buf = Buffer.from(await res.arrayBuffer());
+        if (!res.ok || buf.slice(0, 2).toString() !== 'PK') {
+            let why = 'HTTP ' + res.status;
+            try { why = JSON.parse(buf.toString('utf8')).error || why; } catch (_) { /* non JSON */ }
+            throw new Error('Download non riuscito: ' + why);
+        }
+        const zip = path.join(os.tmpdir(), 'ykan-bridge-update.zip');
+        fs.writeFileSync(zip, buf);
+        const script = path.join(os.tmpdir(), 'ykan-bridge-update.ps1');
+        fs.writeFileSync(script, [
+            'param($zip, $dest)',
+            '$ErrorActionPreference = "Continue"',
+            'Start-Sleep -Seconds 1',
+            '# Chiude icona nella tray e Bridge di questa cartella (non questo script)',
+            'Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID -and (($_.CommandLine -like "*$dest*tray.ps1*") -or ($_.ExecutablePath -eq (Join-Path $dest "ykan-bridge.exe"))) } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }',
+            '$exe = Join-Path $dest "ykan-bridge.exe"',
+            'for ($i = 0; $i -lt 30; $i++) { try { [IO.File]::Open($exe, "Open", "ReadWrite", "None").Close(); break } catch { Start-Sleep -Milliseconds 500 } }',
+            '$tmp = Join-Path $env:TEMP "ykan-bridge-update"',
+            'Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue',
+            'Expand-Archive -Path $zip -DestinationPath $tmp -Force',
+            'robocopy (Join-Path $tmp "ykan-bridge") $dest /E /R:5 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null',
+            'Start-Process wscript.exe -ArgumentList (\'"\' + (Join-Path $dest "autostart-hidden.vbs") + \'"\')',
+        ].join('\r\n'));
+        const { spawn } = require('child_process');
+        const child = spawn('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', script, zip, INSTALL_DIR],
+            { detached: true, stdio: 'ignore', windowsHide: true });
+        child.unref();
+        console.log('Aggiornamento a ' + (linkState.latest || '?') + ' avviato: il Bridge si riavvia da solo.');
+        return { ok: true, from: BRIDGE_VERSION, to: linkState.latest || '' };
+    } catch (e) {
+        updating = false;
+        throw e;
+    }
 }
 
 // === SESSIONS (invariato rispetto a sessions-server.js) ===
@@ -1916,6 +1980,24 @@ const server = http.createServer((req, res) => {
             const id = String(b.sessionId || '');
             if (!/^[a-zA-Z0-9_-]{1,80}$/.test(id)) return json(400, { error: 'sessione non valida' });
             openInDesktop(id, String(b.dir || '')).then(r => json(200, { ok: true, host: os.hostname(), via: r.via }));
+        }).catch(e => json(500, { error: String((e && e.message) || e) }));
+        return;
+    }
+
+    // Aggiornamento: stato (GET) e avvio (POST). Solo board ammessa (o l'icona nella tray, che si presenta come la board).
+    if (req.method === 'GET' && parsed.pathname === '/update') {
+        if (!isAllowedOrigin(origin)) return json(403, { error: 'origin non ammessa' });
+        return json(200, updateInfo());
+    }
+    if (req.method === 'POST' && parsed.pathname === '/update') {
+        if (!isAllowedOrigin(origin)) return json(403, { error: 'origin non ammessa' });
+        if (!/^application\/json/.test(req.headers['content-type'] || '')) return json(415, { error: 'serve application/json' });
+        readBody(req, 1000).then(async () => {
+            if (!readLink()) throw new Error('Collega prima questo PC a Ykan (Settings → PC collegati): l\'aggiornamento si scarica dalla board.');
+            // Prima un heartbeat, cosi' "latest" e' fresco anche se l'utente clicca appena avviato
+            await heartbeat();
+            if (!updateAvailable()) return json(200, Object.assign(updateInfo(), { ok: false, message: 'Hai gia\' l\'ultima versione' }));
+            json(200, await selfUpdate());
         }).catch(e => json(500, { error: String((e && e.message) || e) }));
         return;
     }

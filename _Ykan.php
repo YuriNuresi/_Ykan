@@ -334,6 +334,18 @@ function ykanBridgeList(int $uid): array {
     }, $st->fetchAll(PDO::FETCH_ASSOC));
 }
 
+// Versione del pacchetto in downloads/: letta dal package.json dentro lo zip, cosi' non puo' mai
+// annunciare una versione diversa da quella che si scarica davvero.
+function ykanBridgeZipVersion(): string {
+    $zipFile = __DIR__ . '/downloads/ykan-bridge-windows.zip';
+    if (!is_file($zipFile) || !class_exists('ZipArchive')) return '';
+    $zip = new ZipArchive();
+    if ($zip->open($zipFile) !== true) return '';
+    $pkg = json_decode((string)$zip->getFromName('ykan-bridge/package.json'), true);
+    $zip->close();
+    return is_array($pkg) ? (string)($pkg['version'] ?? '') : '';
+}
+
 function ykanBridgeEndpoint(): never {
     header('Content-Type: application/json');
     $reply = function (int $code, array $body): never {
@@ -402,7 +414,18 @@ function ykanBridgeEndpoint(): never {
     if ($route === 'heartbeat') {
         $pdo->prepare('UPDATE ykan_bridges SET last_seen = NOW(), os = ?, version = ? WHERE id = ?')
             ->execute([mb_substr((string)($in['os'] ?? ''), 0, 40), mb_substr((string)($in['version'] ?? ''), 0, 20), (int)$bridge['id']]);
-        $reply(200, ['success' => true, 'name' => $bridge['name']]);
+        $reply(200, ['success' => true, 'name' => $bridge['name'], 'latest' => ykanBridgeZipVersion()]);
+    }
+    // Aggiornamento automatico: lo zip del Bridge, solo ai PC collegati (la cartella downloads non e' pubblica)
+    if ($route === 'update_download') {
+        $zip = __DIR__ . '/downloads/ykan-bridge-windows.zip';
+        if (!is_file($zip)) $reply(404, ['success' => false, 'error' => 'Nessun pacchetto del Bridge sul server.']);
+        @set_time_limit(600);
+        header('Content-Type: application/zip');
+        header('Content-Length: ' . filesize($zip));
+        header('Content-Disposition: attachment; filename="ykan-bridge-windows.zip"');
+        readfile($zip);
+        exit;
     }
     $reply(404, ['success' => false, 'error' => 'Chiamata sconosciuta.']);
 }
@@ -6666,7 +6689,7 @@ $dataJson = json_encode(ykanPublicData($data));
         if (bridgeTarget === 'local') {
             const up = !!ykanLocalLink && !ykanLocalLink.outdated;
             dot.className = 'bridge-dot ' + (up ? 'on' : 'off');
-            label.textContent = 'Questo computer' + (bridgeLocalName() ? ' (' + bridgeLocalName() + ')' : '');
+            label.textContent = 'Questo computer' + (bridgeLocalName() ? ' (' + bridgeLocalName() + ')' : '') + (ykanLocalLink && ykanLocalLink.updateAvailable ? ' ⬆️' : '');
             chip.title = up ? 'Bridge di questo computer attivo' : 'Bridge di questo computer non raggiungibile su 127.0.0.1:51820';
         } else {
             const b = ykanBridges.find(x => String(x.id) === bridgeTarget);
@@ -6686,9 +6709,23 @@ $dataJson = json_encode(ykanPublicData($data));
         ykanBridges.filter(b => !(ykanLocalLink && ykanLocalLink.bridgeId === b.id)).forEach(b => {
             html += item(String(b.id), b.name, b.online, b.online ? 'online' : 'offline');
         });
+        if (ykanLocalLink && ykanLocalLink.updateAvailable) html += `<small>⬆️ Bridge ${escHtml(ykanLocalLink.latest)} disponibile (hai la ${escHtml(ykanLocalLink.version)}) — <a href="#" onclick="bridgeSelfUpdate();return false">Aggiorna ora</a></small>`;
         if (bridgeTarget !== 'local') html += '<small>Dashboard, sessioni e avvio in Claude Desktop lavorano su questo PC. Il terminale dal vivo e l\'analisi delle sessioni restano su "Questo computer".</small>';
         html += `<small><a href="#" onclick="showView('settings');settingsTab('generale');toggleBridgeMenu();return false">Gestisci i PC collegati…</a></small>`;
         menu.innerHTML = html;
+    }
+
+    async function bridgeSelfUpdate() {
+        toggleBridgeMenu();
+        toast('⬆️ Scarico l\'aggiornamento del Bridge…', 'success');
+        try {
+            const res = await fetch(BRIDGE_URL + '/update', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+            const j = await res.json();
+            if (!res.ok) throw new Error(j.error || 'HTTP ' + res.status);
+            if (!j.ok) { toast(j.message || 'Nessun aggiornamento', 'success'); return; }
+            toast('✅ Aggiornamento alla ' + j.to + ' in corso: il Bridge si riavvia da solo', 'success');
+            setTimeout(refreshBridges, 20000);
+        } catch (e) { toast('❌ ' + e.message, 'error'); }
     }
 
     function toggleBridgeMenu(ev) {
