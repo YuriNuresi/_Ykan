@@ -3964,6 +3964,93 @@ $dataJson = json_encode(ykanPublicData($data));
         .term-pane { display: none; height: 100%; background: #000; padding: 4px; box-sizing: border-box; }
         .term-pane.active { display: block; }
         @media (max-width: 720px) { .term-body { height: min(260px, 38vh); } }
+
+        /* ============================================================
+           Layout 2026 — shell stile Claude Desktop / gestionale:
+           sidebar fissa a sinistra, pagine con la stessa testata,
+           stessa larghezza e stessi margini per Kanban e Dashboard.
+           I temi custom (customThemeStyle) restano sopra a tutto.
+           ============================================================ */
+        :root {
+            --bg: #faf9f5; --bg2: #f0eee6; --bg3: #ffffff; --text: #141413; --text2: #73726c;
+            --border: #e6e3d9; --accent: #c96442; --accent2: #b05730;
+            --shadow: 0 1px 2px rgba(20,20,19,.05);
+            --radius: 10px; --card-radius: 8px; --font-base: 13.5px;
+            --side-w: 228px; --side-bg: #f5f4ed; --page-pad: 22px 28px 40px;
+            --header-bg: var(--side-bg); --swimlane-bg: var(--bg3); --colhead-bg: var(--bg);
+            --hover: rgba(20,20,19,.05);
+        }
+        .dark {
+            --bg: #262624; --bg2: #30302e; --bg3: #30302e; --text: #f5f4ee; --text2: #a6a39a;
+            --border: #3e3e3a; --accent: #d97757; --accent2: #e08a6d;
+            --shadow: 0 1px 2px rgba(0,0,0,.25);
+            --side-bg: #1f1e1d; --header-bg: #1f1e1d; --header-text: #f5f4ee; --swimlane-bg: #2b2b29; --colhead-bg: #262624; --card-bg: #30302e;
+            --hover: rgba(255,255,255,.06);
+        }
+        body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; padding-left: var(--side-w); -webkit-font-smoothing: antialiased; }
+
+        /* Sidebar (ex header) */
+        .header { position: fixed; left: 0; top: 0; bottom: var(--term-h); width: var(--side-w); z-index: 400;
+            flex-direction: column; align-items: stretch; gap: 4px; padding: 14px 10px; border-bottom: 0; border-right: 1px solid var(--border); overflow-y: auto; }
+        .header h1 { display: flex; align-items: center; gap: 9px; font-size: 15px; font-weight: 600; padding: 6px 8px 14px; letter-spacing: -.01em; }
+        .header h1::before { content: ''; flex: none; width: 22px; height: 22px; border-radius: 6px; background: var(--accent);
+            box-shadow: inset 0 0 0 6px var(--accent), inset 0 0 0 11px rgba(255,255,255,.9); }
+        .header h1:hover { color: inherit; }
+        .view-tabs { flex-direction: column; gap: 2px; margin: 0; }
+        .view-tabs::before { content: 'Spazio di lavoro'; font-size: 11px; font-weight: 600; color: var(--text2); padding: 4px 10px 6px; }
+        .view-tabs button { text-align: left; border: 0; border-radius: 7px; opacity: 1; color: var(--text2); padding: 7px 10px; font-size: 13.5px; }
+        .view-tabs button:hover { background: var(--hover); color: var(--text); }
+        .view-tabs button.active { background: var(--bg3); color: var(--text); box-shadow: 0 0 0 1px var(--border), var(--shadow); }
+        .header-actions { margin: auto 0 0; flex-direction: column; align-items: stretch; gap: 8px; padding-top: 12px; border-top: 1px solid var(--border); }
+        .header-actions > .btn-icon { align-self: flex-start; }
+        .bridge-chip { width: 100%; background: var(--bg3); }
+        .bridge-menu { right: auto; left: 0; top: auto; bottom: calc(100% + 6px); }
+
+        /* Bottoni / input più sobri */
+        .btn { border-radius: 7px; background: var(--bg3); padding: 6px 11px; font-weight: 500; }
+        .btn:hover { border-color: var(--text2); color: var(--text); background: var(--bg3); }
+        .btn-primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+        .btn-primary:hover { background: var(--accent2); border-color: var(--accent2); color: #fff; }
+        .search-input, .filter-select { border-radius: 7px; background: var(--bg3); }
+        .search-input { width: 220px; }
+
+        /* Pagina: stessa geometria per tutte le viste */
+        .page, .dash-view { padding: var(--page-pad); max-width: none; margin: 0; }
+        body[data-view="dashboard"] #kanbanView, body[data-view="settings"] #kanbanView, body[data-view="claude"] #kanbanView { display: none; }
+        .dash-toolbar { min-height: 40px; margin-bottom: 0; padding-bottom: 14px; gap: 8px 10px; }
+        @media (min-width: 1100px) { .dash-toolbar { flex-wrap: nowrap; white-space: nowrap; } .dash-toolbar label { flex-shrink: 0; } }
+        .dash-toolbar h2 { font-size: 22px; font-weight: 600; letter-spacing: -.02em; margin-right: 6px; }
+        .dash-tabs, .kanban-page .filters-bar { margin-bottom: 18px; min-height: 40px; }
+        .dash-tabs { gap: 2px; }
+        .dash-tabs button { opacity: 1; color: var(--text2); padding: 8px 12px; }
+        .dash-tabs button:hover, .dash-tabs button.active { color: var(--text); }
+        .kanban-page .filters-bar { background: transparent; padding: 0 0 8px; border-bottom: 1px solid var(--border); }
+        .kanban-page .board-container { padding: 0; }
+        .dash-projcard, .dash-item, .dash-rev { background: var(--bg3); }
+        .dash-projcard { border-radius: var(--radius); padding: 12px 14px; }
+
+        /* Board */
+        .swimlane { background: var(--bg3); box-shadow: var(--shadow); margin-bottom: 16px; }
+        .swimlane-header { padding: 10px 14px; }
+        .column-header { padding: 9px 12px; }
+        .column-name { font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--text2); }
+        .card:hover { border-color: var(--text2); box-shadow: 0 2px 8px rgba(20,20,19,.08); }
+        .term-footer { left: var(--side-w); }
+
+        /* Telefono / finestra stretta: la sidebar torna una barra in alto */
+        @media (max-width: 860px) {
+            body { padding-left: 0; }
+            .header { position: static; width: auto; flex-direction: row; flex-wrap: wrap; align-items: center; border-right: 0; border-bottom: 1px solid var(--border); padding: 8px 12px; }
+            .header h1 { padding: 0; }
+            .view-tabs { flex-direction: row; overflow-x: auto; }
+            .view-tabs::before { display: none; }
+            .header-actions { margin: 0; flex-direction: row; border-top: 0; padding-top: 0; width: 100%; }
+            .bridge-chip { width: auto; }
+            .bridge-menu { top: calc(100% + 6px); bottom: auto; }
+            .term-footer { left: 0; }
+            .page, .dash-view { padding: 14px 12px 40px; }
+            .search-input { width: 100%; }
+        }
     </style>
     <!-- Custom theme overrides (populated on load + when switching themes) -->
     <style id="customThemeStyle"><?= !empty($data['config']['theme_file']) ? ykanThemeCss($data['config']['theme_file']) : '' ?></style>
@@ -4003,47 +4090,51 @@ $dataJson = json_encode(ykanPublicData($data));
         </div>
     </header>
 
-    <!-- Kanban sub-header: search, filtri e azioni sulla board (visibile solo in vista Kanban) -->
-    <div class="filters-bar">
-        <input type="text" id="searchInput" class="search-input" placeholder="🔍 Search..." oninput="applyFilters()">
-        <select id="filterLabel" class="filter-select" onchange="applyFilters()">
-            <option value="">All labels</option>
-            <?php foreach ($data['labels'] as $l): ?>
-            <option value="<?= $l['id'] ?>"><?= htmlspecialchars($l['name']) ?></option>
-            <?php endforeach; ?>
-        </select>
-        <select id="filterPriority" class="filter-select" onchange="applyFilters()">
-            <option value="">All priorities</option>
-            <option value="high">🔴 High</option>
-            <option value="medium">🟡 Medium</option>
-            <option value="low">🟢 Low</option>
-        </select>
-        <select id="filterDue" class="filter-select" onchange="applyFilters()">
-            <option value="">All due dates</option>
-            <option value="overdue">⚠️ Overdue</option>
-            <option value="today">📅 Today</option>
-            <option value="week">📆 This week</option>
-            <option value="none">❌ No due date</option>
-        </select>
-        <select id="filterEpic" class="filter-select" onchange="applyFilters()" title="Filtra per epic">
-            <option value="">🎯 All epics</option>
-        </select>
-        <button class="btn btn-icon" onclick="clearFilters()" title="Reset filters">✕</button>
-        <span style="flex:1"></span>
-        <button class="btn btn-primary" onclick="quickAddCard()" title="Aggiungi una card rapidamente">＋ Nuova card</button>
-        <button class="btn" onclick="toggleArchive()" title="Card archiviate">📦 Archive</button>
-        <button class="btn" onclick="toggleGithub()" title="Issues, PR e commit di GitHub">🐙 GitHub</button>
-        <button class="btn" onclick="toggleGemini()" title="Analisi del progetto con Gemini AI">🔷 Gemini</button>
-        <button class="btn" onclick="togglePm()" title="PM — PRD / epic / breakdown">📋 PM</button>
-        <button class="btn" onclick="exportJSON()" title="Export JSON">📥 JSON</button>
-        <button class="btn" onclick="exportCSV()" title="Export CSV">📊 CSV</button>
-    </div>
-
-    <!-- Board -->
-    <div class="board-container">
-        <div id="board" class="board"></div>
-        <button class="add-swimlane-btn" onclick="addSwimlane()">+ Add Swimlane</button>
-    </div>
+    <!-- Kanban: stessa testata/geometria della Dashboard -->
+    <section id="kanbanView" class="page kanban-page">
+        <div class="dash-toolbar">
+            <h2>Kanban</h2>
+            <span style="flex:1"></span>
+            <button class="btn btn-primary" onclick="quickAddCard()" title="Aggiungi una card rapidamente">＋ Nuova card</button>
+            <button class="btn" onclick="toggleArchive()" title="Card archiviate">📦 Archive</button>
+            <button class="btn" onclick="toggleGithub()" title="Issues, PR e commit di GitHub">🐙 GitHub</button>
+            <button class="btn" onclick="toggleGemini()" title="Analisi del progetto con Gemini AI">🔷 Gemini</button>
+            <button class="btn" onclick="togglePm()" title="PM — PRD / epic / breakdown">📋 PM</button>
+            <button class="btn" onclick="exportJSON()" title="Export JSON">📥 JSON</button>
+            <button class="btn" onclick="exportCSV()" title="Export CSV">📊 CSV</button>
+        </div>
+        <div class="filters-bar">
+            <input type="text" id="searchInput" class="search-input" placeholder="🔍 Search..." oninput="applyFilters()">
+            <select id="filterLabel" class="filter-select" onchange="applyFilters()">
+                <option value="">All labels</option>
+                <?php foreach ($data['labels'] as $l): ?>
+                <option value="<?= $l['id'] ?>"><?= htmlspecialchars($l['name']) ?></option>
+                <?php endforeach; ?>
+            </select>
+            <select id="filterPriority" class="filter-select" onchange="applyFilters()">
+                <option value="">All priorities</option>
+                <option value="high">🔴 High</option>
+                <option value="medium">🟡 Medium</option>
+                <option value="low">🟢 Low</option>
+            </select>
+            <select id="filterDue" class="filter-select" onchange="applyFilters()">
+                <option value="">All due dates</option>
+                <option value="overdue">⚠️ Overdue</option>
+                <option value="today">📅 Today</option>
+                <option value="week">📆 This week</option>
+                <option value="none">❌ No due date</option>
+            </select>
+            <select id="filterEpic" class="filter-select" onchange="applyFilters()" title="Filtra per epic">
+                <option value="">🎯 All epics</option>
+            </select>
+            <button class="btn btn-icon" onclick="clearFilters()" title="Reset filters">✕</button>
+        </div>
+        <!-- Board -->
+        <div class="board-container">
+            <div id="board" class="board"></div>
+            <button class="add-swimlane-btn" onclick="addSwimlane()">+ Add Swimlane</button>
+        </div>
+    </section>
 
     <!-- Dashboard (scheda: cose non chiuse + attività recente, con sessioni Claude collegate ai task) -->
     <section id="dashboardView" class="dash-view">
