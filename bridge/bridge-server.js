@@ -48,6 +48,45 @@ function isAllowedOrigin(origin) {
 // questo PC e' acceso. Solo chiamate in uscita verso la board: nessuna porta aperta.
 const LINK_FILE = process.env.YKAN_BRIDGE_LINK_FILE || path.join(os.homedir(), '.ykan-bridge-link.json'); // variabile: solo per le prove
 const HEARTBEAT_MS = 20000;
+// Script aggiunto al graph.html di Graphify: la board (altra origine) chiede {ykan:'gfy-export'} e riceve
+// un PNG grande (grafo ingrandito ~2x, testi leggibili) disegnato da vis-network su una tela apposta.
+const GRAPHIFY_EXPORT_SCRIPT = `<script>
+(function () {
+  const ok = o => ${JSON.stringify(ALLOWED_ORIGINS)}.includes(o);
+  window.addEventListener('message', async e => {
+    if (e.source !== parent || !ok(e.origin) || !e.data || e.data.ykan !== 'gfy-export') return;
+    try {
+      const box = document.getElementById('graph');
+      const prev = { w: box.style.width, h: box.style.height, pos: box.style.position, l: box.style.left, t: box.style.top, view: network.getViewPosition(), scale: network.getScale() };
+      // Nel grafo i nodi piccoli hanno l'etichetta a 0px: nell'immagine si mostrano tutte, poi si ripristina
+      const fonts = nodesDS.get().map(n => ({ id: n.id, font: n.font }));
+      nodesDS.update(fonts.map(f => ({ id: f.id, font: Object.assign({}, f.font, { size: Math.max((f.font && f.font.size) || 0, 11) }) })));
+      // Tela grande quanto il grafo ingrandito di K (testi ~2x), con margine per le etichette; lato max 9000px
+      const pos = Object.values(network.getPositions());
+      const xs = pos.map(p => p.x), ys = pos.map(p => p.y);
+      const minX = Math.min(...xs) - 220, maxX = Math.max(...xs) + 220, minY = Math.min(...ys) - 120, maxY = Math.max(...ys) + 120;
+      const K = Math.min(2.2, 9000 / (maxX - minX), 9000 / (maxY - minY));
+      const W = Math.round((maxX - minX) * K), H = Math.round((maxY - minY) * K);
+      Object.assign(box.style, { position: 'fixed', left: '0', top: '0', width: W + 'px', height: H + 'px' });
+      network.setSize(W + 'px', H + 'px');
+      network.moveTo({ position: { x: (minX + maxX) / 2, y: (minY + maxY) / 2 }, scale: K, animation: false });
+      network.redraw();
+      await new Promise(r => setTimeout(r, 300)); // non rAF: si ferma se la finestra non e' in primo piano
+      const src = box.querySelector('canvas');
+      const out = document.createElement('canvas'); out.width = src.width; out.height = src.height;
+      const g = out.getContext('2d'); g.fillStyle = getComputedStyle(document.body).backgroundColor || '#0f0f1a';
+      g.fillRect(0, 0, out.width, out.height); g.drawImage(src, 0, 0);
+      const png = out.toDataURL('image/png');
+      Object.assign(box.style, { position: prev.pos, left: prev.l, top: prev.t, width: prev.w, height: prev.h });
+      nodesDS.update(fonts);
+      network.setSize(prev.w || '100%', prev.h || '100%'); network.moveTo({ position: prev.view, scale: prev.scale, animation: false });
+      parent.postMessage({ ykan: 'gfy-png', png }, e.origin);
+    } catch (err) { parent.postMessage({ ykan: 'gfy-png', error: String(err && err.message || err) }, e.origin); }
+  });
+  parent.postMessage({ ykan: 'gfy-ready' }, '*');
+})();
+</script>`;
+
 const BRIDGE_VERSION = (() => {
     try { return JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8')).version; } catch (_) { return '0.0.0'; }
 })();
@@ -1952,7 +1991,8 @@ const server = http.createServer((req, res) => {
         const file = path.join(t.dir, 'graphify-out', 'graph.html');
         if (!fs.existsSync(file)) { res.writeHead(404); return res.end('nessun grafo per questo progetto'); }
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Content-Security-Policy': "frame-ancestors " + ALLOWED_ORIGINS.join(' ') });
-        return fs.createReadStream(file).pipe(res);
+        // In coda al grafo: esportazione PNG ad alta risoluzione su richiesta della board (postMessage)
+        return res.end(fs.readFileSync(file, 'utf8').replace(/<\/body>(?![\s\S]*<\/body>)/, GRAPHIFY_EXPORT_SCRIPT + '</body>'));
     }
 
     if (req.method === 'POST' && /^\/claude\/context\/(optimize|overrides)$/.test(parsed.pathname)) {

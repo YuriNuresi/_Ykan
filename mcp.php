@@ -28,7 +28,7 @@
  * - Access is gated by MCP_SECRET (in the URL). Only HTTPS. Keep it out of git.
  * - File tools can ONLY touch folders you explicitly linked to a swimlane in
  *   _Ykan (the "Projects" popup). Nothing outside a linked folder is reachable.
- * - Every write is backed up first (<folder>/.ykan_backups/...) and logged
+ * - Every write is backed up first (~/.ykan_backups/<folder>/..., outside every site) and logged
  *   (_ykan_mcp_audit.log next to this file).
  * ============================================================================
  */
@@ -75,7 +75,10 @@ const MCP_DATA_FILE = __DIR__ . '/_Ykan_data.json';
 const MCP_MAX_READ  = 500_000;   // max bytes returned by read_file
 const MCP_MAX_WRITE = 2_000_000; // max bytes accepted by write_file
 const MCP_AUDIT_LOG = __DIR__ . '/_ykan_mcp_audit.log';
-const MCP_DB_BACKUP_DIR = __DIR__ . '/.db_backups';
+// Backup FUORI da ogni sito (home OVH, non e' la docroot di nessun dominio): dentro le cartelle
+// dei siti Apache serviva le copie (index.php.20260731-...) e addirittura le eseguiva come PHP.
+define('MCP_BACKUP_ROOT', dirname(__DIR__) . '/.ykan_backups');
+define('MCP_DB_BACKUP_DIR', MCP_BACKUP_ROOT . '/_db');
 
 // DB credentials from root .env (DB_*)
 define('MCP_DB_HOST',    (string)($__env['DB_HOST']    ?? ''));
@@ -406,7 +409,9 @@ function mcp_safe_path(string $baseReal, string $rel): string {
 function mcp_backup(string $baseReal, string $absFile): void {
     if (!is_file($absFile)) return;
     $rel  = ltrim(substr($absFile, strlen($baseReal)), '/');
-    $dest = $baseReal . '/.ykan_backups/' . $rel . '.' . date('Ymd-His');
+    $root = realpath(MCP_ROOT) ?: $baseReal;
+    $project = ltrim(substr($baseReal, strlen($root)), '/');      // es. "3d/faro", "skanno"
+    $dest = MCP_BACKUP_ROOT . '/' . ($project !== '' ? $project . '/' : '') . $rel . '.' . date('Ymd-His');
     @mkdir(dirname($dest), 0775, true);
     @copy($absFile, $dest);
 }
@@ -618,7 +623,7 @@ function mcp_tool_defs(): array {
         ],
         [
             'name' => 'db_dump_table',
-            'description' => 'Backup a single table to a SQL dump file in ykan/.db_backups/. Call this BEFORE any batch of write operations on that table.',
+            'description' => 'Backup a single table to a SQL dump file in ~/.ykan_backups/_db/ (outside every site). Call this BEFORE any batch of write operations on that table.',
             'inputSchema' => ['type' => 'object', 'properties' => [
                 'table' => ['type' => 'string', 'description' => 'Table name to backup.'],
             ], 'required' => ['table']],
@@ -659,6 +664,31 @@ function mcp_tool_defs(): array {
 }
 
 /** Execute a tool. Returns a plain-text result string. Throws McpError on failure. */
+// Registro per la console della board: chi (dal User-Agent) ha chiesto cosa, e com'è andata.
+const MCP_ACTIVITY_TXT = [
+    'list_projects' => 'elenca i progetti', 'board_summary' => 'riepilogo della board', 'list_tasks' => 'elenca i task',
+    'get_task' => 'legge un task', 'add_task' => 'crea un task', 'move_task' => 'sposta un task', 'complete_task' => 'completa un task',
+    'add_label' => 'crea una label', 'set_task_label' => 'mette una label a un task', 'thread_report' => 'aggiorna lo stato di un thread',
+    'memory_snapshot' => 'legge la memoria salvata', 'memory_propose' => 'propone modifiche alla memoria',
+    'list_files' => 'elenca i file sul server', 'read_file' => 'legge un file sul server', 'edit_file' => 'modifica un file sul server',
+    'write_file' => 'scrive un file sul server', 'search_files' => 'cerca nei file del server', 'db_list_tables' => 'elenca le tabelle',
+    'db_schema' => 'legge lo schema di una tabella', 'db_query' => 'interroga il database', 'db_exec' => 'modifica il database',
+    'db_dump_table' => 'esporta una tabella', 'send_digest_mail' => 'manda la mail di riepilogo', 'send_gmail' => 'manda una mail',
+    'read_gmail' => 'legge la posta', 'sync_google_tasks' => 'sincronizza Google Tasks',
+];
+function mcp_activity_text(string $name, array $a): string {
+    $bits = [];
+    foreach (['project', 'title', 'task', 'task_id', 'id', 'column', 'label', 'state', 'path', 'file', 'table', 'query', 'to', 'subject'] as $k) {
+        if (isset($a[$k]) && is_scalar($a[$k]) && $a[$k] !== '') $bits[] = mb_strimwidth((string)$a[$k], 0, 80, '…');
+    }
+    return (MCP_ACTIVITY_TXT[$name] ?? $name) . ($bits ? ' · ' . implode(' · ', $bits) : '');
+}
+function mcp_activity(string $text, bool $ok = true): void {
+    $ua = (string)($_SERVER['HTTP_USER_AGENT'] ?? '');
+    $actor = preg_match('/claude-code/i', $ua) ? 'claude-code' : (preg_match('/claude|anthropic/i', $ua) ? 'claude-app' : 'claude-mcp');
+    ykanActivity($actor, $text, $ok, null, $ua);
+}
+
 function mcp_run_tool(string $name, array $a): string {
     if (!ykanIsOwner() && !in_array($name, MCP_USER_TOOLS, true)) {
         throw new McpError("Tool '{$name}' disponibile solo al proprietario di questo Ykan.");
@@ -1266,6 +1296,8 @@ function mcp_handle(array $msg): ?array {
 
     switch ($method) {
         case 'initialize':
+            $ci = $params['clientInfo'] ?? [];
+            mcp_activity('si collega al server MCP' . (!empty($ci['name']) ? ' (' . $ci['name'] . (!empty($ci['version']) ? ' ' . $ci['version'] : '') . ')' : ''));
             return mcp_result($id, [
                 'protocolVersion' => $params['protocolVersion'] ?? '2025-06-18',
                 'capabilities'    => ['tools' => (object)[]],
@@ -1287,12 +1319,16 @@ function mcp_handle(array $msg): ?array {
         case 'tools/call':
             $name = $params['name'] ?? '';
             $args = $params['arguments'] ?? [];
+            $what = mcp_activity_text($name, is_array($args) ? $args : []);
             try {
                 $text = mcp_run_tool($name, is_array($args) ? $args : []);
+                mcp_activity($what . ' → ok');
                 return mcp_result($id, ['content' => [['type' => 'text', 'text' => $text]]]);
             } catch (McpError $e) {
+                mcp_activity($what . ' → ' . $e->getMessage(), false);
                 return mcp_result($id, ['content' => [['type' => 'text', 'text' => 'Error: ' . $e->getMessage()]], 'isError' => true]);
             } catch (Throwable $e) {
+                mcp_activity($what . ' → errore del server', false);
                 return mcp_result($id, ['content' => [['type' => 'text', 'text' => 'Server error: ' . $e->getMessage()]], 'isError' => true]);
             }
     }

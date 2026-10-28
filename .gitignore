@@ -27,3 +27,6 @@ _Ykan_local.json
 
 # Pacchetti di Settings → Strumenti (generati da bridge: npm run build)
 downloads/*.zip
+
+# Grafo di Graphify (si rigenera con /graphify)
+graphify-out/

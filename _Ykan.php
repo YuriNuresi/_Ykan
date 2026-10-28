@@ -3,7 +3,7 @@
  * _Ykan - Minimal Kanban Board
  * Single-file PHP Kanban for Scrum/Agile projects
  *
- * @version 1.9.0
+ * @version 2.0.0
  * @license MIT
  * @requires PHP 8.2+
  *
@@ -359,6 +359,7 @@ function ykanBridgeEndpoint(): never {
             ->execute([(int)$uid, $name, hash('sha256', $token), mb_substr((string)($in['os'] ?? ''), 0, 40), mb_substr((string)($in['version'] ?? ''), 0, 20)]);
         $bridgeId = (int)$pdo->lastInsertId();
         $user = ykanUserById((int)$uid);
+        ykanActivity('bridge', 'PC «' . $name . '» collegato all\'account', true, (int)$uid);
         $reply(200, ['success' => true, 'token' => $token, 'bridge_id' => $bridgeId, 'name' => $name, 'account' => $user['email'] ?? '']);
     }
 
@@ -631,6 +632,28 @@ function saveData(array $data): bool {
         return $st->execute([ykanCurrentUserId(), json_encode($data, JSON_UNESCAPED_UNICODE)]);
     }
     return file_put_contents(DATA_FILE, json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE)) !== false;
+}
+
+// === REGISTRO ATTIVITÀ ESTERNE ===
+// Quello che fanno sulla board i client che non sono il browser (Claude via MCP, i Bridge):
+// la console della board lo legge con ?api=activity_feed e lo mostra accanto alle sue richieste.
+// Solo MySQL; le righe più vecchie di 7 giorni si cancellano da sole.
+function ykanActivity(string $actor, string $text, bool $ok = true, ?int $uid = null, string $ua = ''): void {
+    if (!($pdo = ykanDb())) return;
+    try {
+        static $ready = false;
+        if (!$ready) {
+            $pdo->exec("CREATE TABLE IF NOT EXISTS ykan_activity (
+                id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY, user_id INT UNSIGNED NOT NULL, ts DATETIME NOT NULL,
+                actor VARCHAR(30) NOT NULL, ok TINYINT(1) NOT NULL DEFAULT 1, text VARCHAR(500) NOT NULL,
+                ua VARCHAR(160) NOT NULL DEFAULT '', KEY user_id (user_id, id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+            $ready = true;
+        }
+        $pdo->prepare('INSERT INTO ykan_activity (user_id, ts, actor, ok, text, ua) VALUES (?, NOW(), ?, ?, ?, ?)')
+            ->execute([$uid ?? ykanCurrentUserId(), $actor, $ok ? 1 : 0, mb_substr($text, 0, 500), mb_substr($ua, 0, 160)]);
+        if (random_int(1, 200) === 1) $pdo->exec('DELETE FROM ykan_activity WHERE ts < NOW() - INTERVAL 7 DAY');
+    } catch (Throwable $e) {}
 }
 
 // === MEMORIA CLAUDE: snapshot e proposte di ottimizzazione ===
@@ -1212,6 +1235,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['api'])) {
     // Archivio dati: rispondono anche quando MySQL non è raggiungibile, per poterlo sistemare.
     if ($action === 'storage_info') {
         echo json_encode(ykanStorageInfo());
+        exit;
+    }
+    // Console: attività di Claude (MCP) e dei Bridge dopo l'id "after" (0 = le ultime 30).
+    if ($action === 'activity_feed') {
+        $rows = [];
+        if ($pdo = ykanDb()) {
+            try {
+                $after = (int)($input['after'] ?? 0);
+                $sql = $after > 0
+                    ? 'SELECT id, UNIX_TIMESTAMP(ts) AS ts, actor, ok, text FROM ykan_activity WHERE user_id = ? AND id > ? ORDER BY id LIMIT 200'
+                    : 'SELECT * FROM (SELECT id, UNIX_TIMESTAMP(ts) AS ts, actor, ok, text FROM ykan_activity WHERE user_id = ? AND id > ? ORDER BY id DESC LIMIT 30) x ORDER BY id';
+                $st = $pdo->prepare($sql);
+                $st->execute([ykanCurrentUserId(), $after]);
+                $rows = $st->fetchAll(PDO::FETCH_ASSOC);
+            } catch (Throwable $e) {}
+        }
+        echo json_encode(['success' => true, 'items' => $rows], JSON_UNESCAPED_UNICODE);
         exit;
     }
     // Chiave MCP personale (solo MySQL): una per utente, rigenerarla invalida la precedente.
@@ -3950,8 +3990,12 @@ $dataJson = json_encode(ykanPublicData($data));
         .con-list { flex: 1; overflow-y: auto; padding: 4px 10px; font: 12px/1.5 ui-monospace, Consolas, monospace; }
         .con-line { display: flex; gap: 8px; white-space: pre-wrap; word-break: break-word; }
         .con-t { color: var(--text2); flex-shrink: 0; }
-        .lvl-error { color: #ef4444; } .lvl-warn { color: #d97706; } .lvl-net { color: #3b82f6; } .lvl-debug { color: var(--text2); }
-        .con-list.hide-net .lvl-net, .con-list.hide-warn .lvl-warn, .con-list.hide-error .lvl-error,
+        .lvl-error { color: #ef4444; } .lvl-warn { color: #d97706; } .lvl-net { color: #3b82f6; } .lvl-ext { color: #c96442; }
+        .con-who { flex-shrink: 0; width: 1.6em; text-align: center; }
+        .ib { display: inline-block; width: 1.25em; height: 1.25em; vertical-align: -0.28em; background: currentColor;
+            -webkit-mask: var(--ib) center / contain no-repeat; mask: var(--ib) center / contain no-repeat;
+            --ib: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M2 17h20M3 17V8M21 17V8M3 8q9 9 18 0M7.5 12.3V17M12 13.6V17M16.5 12.3V17'/%3E%3C/svg%3E"); } .lvl-debug { color: var(--text2); }
+        .con-list.hide-net .lvl-net, .con-list.hide-ext .lvl-ext, .con-list.hide-warn .lvl-warn, .con-list.hide-error .lvl-error,
         .con-list.hide-log .lvl-log, .con-list.hide-log .lvl-info, .con-list.hide-log .lvl-debug { display: none; }
         .term-tabs { display: flex; gap: 2px; overflow-x: auto; flex: 1; min-width: 0; }
         .term-tab { display: flex; align-items: center; gap: 7px; padding: 5px 8px 5px 12px; font-size: 12px; border-radius: 6px 6px 0 0; background: var(--bg); color: var(--text2); cursor: pointer; white-space: nowrap; flex-shrink: 0; }
@@ -3976,35 +4020,33 @@ $dataJson = json_encode(ykanPublicData($data));
             --border: #e6e3d9; --accent: #c96442; --accent2: #b05730;
             --shadow: 0 1px 2px rgba(20,20,19,.05);
             --radius: 10px; --card-radius: 8px; --font-base: 13.5px;
-            --side-w: 228px; --side-bg: #f5f4ed; --page-pad: 22px 28px 40px;
-            --header-bg: var(--side-bg); --swimlane-bg: var(--bg3); --colhead-bg: var(--bg);
-            --hover: rgba(20,20,19,.05);
+            --side-w: 228px; --page-pad: 22px 28px 40px;
+            --header-bg: var(--bg2); --swimlane-bg: var(--bg3); --colhead-bg: var(--bg);
         }
         .dark {
             --bg: #262624; --bg2: #30302e; --bg3: #30302e; --text: #f5f4ee; --text2: #a6a39a;
             --border: #3e3e3a; --accent: #d97757; --accent2: #e08a6d;
             --shadow: 0 1px 2px rgba(0,0,0,.25);
-            --side-bg: #1f1e1d; --header-bg: #1f1e1d; --header-text: #f5f4ee; --swimlane-bg: #2b2b29; --colhead-bg: #262624; --card-bg: #30302e;
-            --hover: rgba(255,255,255,.06);
+            --header-bg: #1f1e1d; --header-text: #f5f4ee; --swimlane-bg: #2b2b29; --colhead-bg: #262624; --card-bg: #30302e;
         }
         body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; padding-left: var(--side-w); -webkit-font-smoothing: antialiased; }
 
         /* Sidebar (ex header) */
         .header { position: fixed; left: 0; top: 0; bottom: var(--term-h); width: var(--side-w); z-index: 400;
-            flex-direction: column; align-items: stretch; gap: 4px; padding: 14px 10px; border-bottom: 0; border-right: 1px solid var(--border); overflow-y: auto; }
+            flex-direction: column; align-items: stretch; gap: 4px; padding: 14px 10px; border-bottom: 0; border-right: 1px solid color-mix(in srgb, var(--header-text) 10%, transparent); overflow-y: auto; }
         .header h1 { display: flex; align-items: center; gap: 9px; font-size: 15px; font-weight: 600; padding: 6px 8px 14px; letter-spacing: -.01em; }
         .header h1::before { content: ''; flex: none; width: 22px; height: 22px; border-radius: 6px; background: var(--accent);
             box-shadow: inset 0 0 0 6px var(--accent), inset 0 0 0 11px rgba(255,255,255,.9); }
         .header h1:hover { color: inherit; }
         .view-tabs { flex-direction: column; gap: 2px; margin: 0; }
-        .view-tabs::before { content: 'Spazio di lavoro'; font-size: 11px; font-weight: 600; color: var(--text2); padding: 4px 10px 6px; }
-        .view-tabs button { text-align: left; border: 0; border-radius: 7px; opacity: 1; color: var(--text2); padding: 7px 10px; font-size: 13.5px; }
-        .view-tabs button:hover { background: var(--hover); color: var(--text); }
-        .view-tabs button.active { background: var(--bg3); color: var(--text); box-shadow: 0 0 0 1px var(--border), var(--shadow); }
-        .header-actions { margin: auto 0 0; flex-direction: column; align-items: stretch; gap: 8px; padding-top: 12px; border-top: 1px solid var(--border); }
+        .view-tabs::before { content: 'Spazio di lavoro'; font-size: 11px; font-weight: 600; color: var(--header-text); opacity: .55; padding: 4px 10px 6px; }
+        .view-tabs button { text-align: left; border: 0; border-radius: 7px; opacity: .72; color: var(--header-text); padding: 7px 10px; font-size: 13.5px; }
+        .view-tabs button:hover { background: color-mix(in srgb, var(--header-text) 7%, transparent); opacity: 1; }
+        .view-tabs button.active { background: color-mix(in srgb, var(--header-text) 11%, transparent); opacity: 1; font-weight: 600; }
+        .header-actions { margin: auto 0 0; flex-direction: column; align-items: stretch; gap: 8px; padding-top: 12px; border-top: 1px solid color-mix(in srgb, var(--header-text) 12%, transparent); }
         .header-actions > .btn-icon { align-self: flex-start; }
         .bridge-chip { width: 100%; background: var(--bg3); }
-        .bridge-menu { right: auto; left: 0; top: auto; bottom: calc(100% + 6px); }
+        .bridge-menu { right: auto; left: 0; top: auto; bottom: calc(100% + 6px); min-width: 0; width: 100%; }
 
         /* Bottoni / input più sobri */
         .btn { border-radius: 7px; background: var(--bg3); padding: 6px 11px; font-weight: 500; }
@@ -4018,7 +4060,6 @@ $dataJson = json_encode(ykanPublicData($data));
         .page, .dash-view { padding: var(--page-pad); max-width: none; margin: 0; }
         body[data-view="dashboard"] #kanbanView, body[data-view="settings"] #kanbanView, body[data-view="claude"] #kanbanView { display: none; }
         .dash-toolbar { min-height: 40px; margin-bottom: 0; padding-bottom: 14px; gap: 8px 10px; }
-        @media (min-width: 1100px) { .dash-toolbar { flex-wrap: nowrap; white-space: nowrap; } .dash-toolbar label { flex-shrink: 0; } }
         .dash-toolbar h2 { font-size: 22px; font-weight: 600; letter-spacing: -.02em; margin-right: 6px; }
         .dash-tabs, .kanban-page .filters-bar { margin-bottom: 18px; min-height: 40px; }
         .dash-tabs { gap: 2px; }
@@ -4037,12 +4078,38 @@ $dataJson = json_encode(ykanPublicData($data));
         .card:hover { border-color: var(--text2); box-shadow: 0 2px 8px rgba(20,20,19,.08); }
         .term-footer { left: var(--side-w); }
 
+        .bridge-dot.mid { background: #f59e0b; }
+        .stat-sub { margin-left: auto; font-size: 11px; opacity: .65; }
+        .stat-row { display: flex; gap: 9px; align-items: flex-start; padding: 8px 10px; }
+        .stat-row .bridge-dot { margin-top: 5px; }
+        .stat-row b { font-weight: 600; font-size: 13px; display: block; }
+        .stat-row small { padding: 0; }
+        .dash-in { animation: dashIn .28s ease-out both; }
+        @keyframes dashIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+        .dash-loading { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text2); margin-bottom: 10px; }
+        .dash-spin { width: 12px; height: 12px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: dashSpin .7s linear infinite; }
+        @keyframes dashSpin { to { transform: rotate(360deg); } }
+        @media (prefers-reduced-motion: reduce) { .dash-in { animation: none; } }
+        .gfy-wrap { height: calc(100vh - 260px); min-height: 480px; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: #fff; }
+        .gfy-wrap iframe { width: 100%; height: 100%; border: 0; display: block; }
+        .gfy-wrap:fullscreen { height: 100vh; border: 0; border-radius: 0; }
+        /* Pagine della dashboard come voci del menu */
+        .side-group { display: flex; flex-direction: column; gap: 2px; margin: 10px 0; padding: 10px 0; border-block: 1px solid color-mix(in srgb, var(--header-text) 10%, transparent); }
+        .side-group button { display: flex; align-items: center; gap: 6px; }
+        .side-group .dash-count { margin-left: auto; background: color-mix(in srgb, var(--header-text) 10%, transparent); color: inherit; }
+        body:not([data-view="dashboard"]) .side-group button.active { background: none; opacity: .72; font-weight: inherit; }
+        body[data-view="dashboard"] .side-group button.active .dash-count { background: var(--accent); color: #fff; }
+        .view-tabs > button, .side-group button { width: 100%; }
+        .dash-legendrow { border-bottom: 0; min-height: 0; margin-bottom: 10px; }
+        .dash-legendrow .dash-legend { margin-left: 0; }
         /* Telefono / finestra stretta: la sidebar torna una barra in alto */
         @media (max-width: 860px) {
             body { padding-left: 0; }
             .header { position: static; width: auto; flex-direction: row; flex-wrap: wrap; align-items: center; border-right: 0; border-bottom: 1px solid var(--border); padding: 8px 12px; }
             .header h1 { padding: 0; }
             .view-tabs { flex-direction: row; overflow-x: auto; }
+            .side-group { flex-direction: row; margin: 0; padding: 0; border: 0; }
+            .view-tabs > button, .side-group button { width: auto; white-space: nowrap; }
             .view-tabs::before { display: none; }
             .header-actions { margin: 0; flex-direction: row; border-top: 0; padding-top: 0; width: 100%; }
             .bridge-chip { width: auto; }
@@ -4071,8 +4138,17 @@ $dataJson = json_encode(ykanPublicData($data));
     <header class="header">
         <h1 id="projectName" onclick="openConfigModal()"><?= htmlspecialchars($data['config']['project_name'] ?? 'My Project') ?></h1>
         <nav class="view-tabs">
-            <button id="tabKanban" class="active" onclick="showView('kanban')">Kanban</button>
-            <button id="tabDash" onclick="showView('dashboard')">Dashboard</button>
+            <button id="tabKanban" class="active" onclick="showView('kanban')">🗂️ Kanban</button>
+            <button id="tabDash" onclick="showView('dashboard')" hidden>Dashboard</button>
+            <!-- Le schede della Dashboard sono pagine del menu (stessa vista, scheda diversa) -->
+            <div id="dashTabs" class="side-group">
+                <button data-tab="focus" onclick="dashTab('focus')">🎯 Focus <span class="dash-count"></span></button>
+                <button data-tab="resume" onclick="dashTab('resume')">⏸️ Da riprendere <span class="dash-count"></span></button>
+                <button data-tab="week" onclick="dashTab('week')">📅 Attività <span class="dash-count"></span></button>
+                <button data-tab="review" onclick="dashTab('review')">👀 Revisione sessioni <span class="dash-count"></span></button>
+                <button data-tab="git" onclick="dashTab('git')">🌿 Git <span class="dash-count"></span></button>
+                <button data-tab="graphify" onclick="dashTab('graphify')">🕸️ Graphify <span class="dash-count"></span></button>
+            </div>
             <button id="tabSettings" onclick="showView('settings')">⚙️ Settings</button>
             <button id="tabClaude" onclick="showView('claude')">🤖 Claude</button>
         </nav>
@@ -4082,6 +4158,19 @@ $dataJson = json_encode(ykanPublicData($data));
                     <span class="bridge-dot" id="bridgeChipDot"></span><span id="bridgeChipLabel">Questo computer</span>
                 </button>
                 <div class="bridge-menu" id="bridgeMenu"></div>
+            </div>
+            <!-- Stato collegamenti: Claude (CLI via Bridge / API sul server) e Git (locale via Bridge / GitHub) -->
+            <div class="bridge-wrap stat-wrap" id="statClaudeWrap" style="display:none">
+                <button type="button" class="bridge-chip" onclick="toggleStatMenu('Claude', event)" title="Collegamento a Claude">
+                    <span class="bridge-dot" id="statClaudeDot"></span><span>Claude</span><span class="stat-sub" id="statClaudeSub">…</span>
+                </button>
+                <div class="bridge-menu" id="statClaudeMenu"></div>
+            </div>
+            <div class="bridge-wrap stat-wrap" id="statGitWrap" style="display:none">
+                <button type="button" class="bridge-chip" onclick="toggleStatMenu('Git', event)" title="Collegamento a Git e GitHub">
+                    <span class="bridge-dot" id="statGitDot"></span><span>Git</span><span class="stat-sub" id="statGitSub">…</span>
+                </button>
+                <div class="bridge-menu" id="statGitMenu"></div>
             </div>
             <div id="claudeUsageBadge" class="usage-mini" style="display:none" title="Consumo Claude — clic per aggiornare. Richiede l'estensione Chrome Ykan Usage Badge (extension/)." onclick="claudeUsageRefresh()"></div>
             <button class="btn btn-icon" onclick="toggleTheme()" title="Toggle light/dark">
@@ -4139,7 +4228,7 @@ $dataJson = json_encode(ykanPublicData($data));
     <!-- Dashboard (scheda: cose non chiuse + attività recente, con sessioni Claude collegate ai task) -->
     <section id="dashboardView" class="dash-view">
         <div class="dash-toolbar">
-            <h2>Dashboard</h2>
+            <h2 id="dashTitle">Dashboard</h2>
             <span id="dashBridge" class="dash-bridge"></span>
             <span style="flex:1"></span>
             <label style="font-size:12px;color:var(--text2)">Progetto
@@ -4156,13 +4245,7 @@ $dataJson = json_encode(ykanPublicData($data));
             <button class="btn" onclick="showBurndown()" title="Burndown Chart">📈 Burndown</button>
             <button class="btn" onclick="loadDashboard()">↻ Aggiorna</button>
         </div>
-        <div id="dashTabs" class="dash-tabs">
-            <button data-tab="focus" onclick="dashTab('focus')">🎯 Focus <span class="dash-count"></span></button>
-            <button data-tab="resume" onclick="dashTab('resume')">Da riprendere <span class="dash-count"></span></button>
-            <button data-tab="week" onclick="dashTab('week')">Attività <span class="dash-count"></span></button>
-            <button data-tab="review" onclick="dashTab('review')">Revisione sessioni <span class="dash-count"></span></button>
-            <button data-tab="git" onclick="dashTab('git')">Git <span class="dash-count"></span></button>
-            <button data-tab="graphify" onclick="dashTab('graphify')">🕸️ Graphify <span class="dash-count"></span></button>
+        <div class="dash-tabs dash-legendrow">
             <span class="dash-legend"><i class="st-todo"></i>To Do <i class="st-doing"></i>Claude Do / In corso <i class="st-done"></i>Fatto / archiviato</span>
         </div>
         <div id="dashboardBody"></div>
@@ -4415,7 +4498,7 @@ $dataJson = json_encode(ykanPublicData($data));
                     <button type="button" class="btn" onclick="addLabel()" style="margin-top:8px">+ Add Label</button>
                 </div>
                 <div class="form-group" id="bridgesGroup" style="display:none">
-                    <label>PC collegati (Bridge)</label>
+                    <label><i class="ib"></i> PC collegati (Bridge)</label>
                     <small style="color:var(--text2);display:block;margin-bottom:6px">Ogni PC con il Bridge acceso si collega al tuo account: poi dall'header scegli su quale PC lavorare, anche da un altro computer.</small>
                     <div id="bridgesManager"></div>
                     <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">
@@ -4533,7 +4616,7 @@ $dataJson = json_encode(ykanPublicData($data));
             <div class="tool-card">
                 <div class="tool-head">
                     <div>
-                        <h3>🖥 Ykan Bridge per Windows</h3>
+                        <h3><i class="ib"></i> Ykan Bridge per Windows</h3>
                         <small>Programma che gira sul tuo PC e collega la board a Claude Code.</small>
                     </div>
                     <?php if ($ykanDl['bridge']): ?>
@@ -4777,8 +4860,9 @@ $dataJson = json_encode(ykanPublicData($data));
     // Installato per primo per non perdere gli errori di avvio. Nei body i valori che sembrano
     // segreti (key/token/secret/password) vengono oscurati.
     const ykanLog = { entries: [], max: 1000, listeners: [] };
-    function ykanLogAdd(level, text) {
-        const e = { t: new Date(), level, text: String(text).slice(0, 2000) };
+    // who = chi ha fatto l'azione: 'you' (tu dalla board), 'bridge', 'claude', 'web' (il browser verso altri siti)
+    function ykanLogAdd(level, text, who, t) {
+        const e = { t: t || new Date(), level, text: String(text).slice(0, 2000), who: who || '' };
         ykanLog.entries.push(e);
         if (ykanLog.entries.length > ykanLog.max) ykanLog.entries.shift();
         ykanLog.listeners.forEach(fn => { try { fn(e); } catch (_) {} });
@@ -4801,26 +4885,123 @@ $dataJson = json_encode(ykanPublicData($data));
         window.addEventListener('unhandledrejection', e => ykanLogAdd('error', 'Promise rifiutata: ' + fmt(e.reason)));
 
         const redact = (k, v) => /key|token|secret|pass/i.test(k) ? '***' : v;
+        // Console leggibile: "Bridge (questo PC) · legge le sessioni di Faro" invece di http://127.0.0.1:51820/sessions?dir=…
+        const API_TXT = {
+            get_data: 'carica la board', get_summary: 'riepilogo della board', storage_info: 'dove sono salvati i dati',
+            complete_task: 'completa un task', move_task: 'sposta un task', save_config: 'salva le impostazioni', bridge_list: 'elenco dei PC collegati',
+            bridge_pair_code: 'crea il codice per collegare un PC', bridge_rename: 'rinomina un PC', bridge_revoke: 'scollega un PC',
+            loose_ends: 'cerca le cose in sospeso', session_state: 'salva lo stato di una sessione', link_session: 'collega una sessione a un task',
+            add_card: 'crea una card', update_card: 'modifica una card', move_card: 'sposta una card', delete_card: 'elimina una card',
+            archive_card: 'archivia una card', restore_card: 'ripristina una card', add_swimlane: 'crea un progetto',
+            update_swimlane: 'modifica un progetto', delete_swimlane: 'elimina un progetto', reorder_swimlanes: 'riordina i progetti',
+            add_column: 'crea una colonna', update_column: 'modifica una colonna', delete_column: 'elimina una colonna',
+            add_label: 'crea una label', update_label: 'modifica una label', delete_label: 'elimina una label',
+            github_repo_status: 'chiede a GitHub lo stato dei repository', github_repo_info: 'chiede a GitHub le info del repo',
+            github_prs: 'chiede a GitHub le pull request', github_issues: 'chiede a GitHub le issue', github_commits: 'chiede a GitHub i commit',
+            gemini_analyze: 'fa analizzare il progetto a Gemini', analyze_project: "fa analizzare il progetto all'AI",
+            ai_standup: "chiede all'AI lo standup", ai_estimate: "chiede all'AI una stima", ai_categorize: "chiede all'AI una categoria",
+            claude_execute: 'fa lavorare Claude (API) su una card', claude_status: 'controlla Claude', verify_task: 'fa verificare un task',
+            burndown_data: 'dati per il burndown', scan_todos: 'cerca i TODO nei file', list_project_files: 'elenca i file del progetto',
+            list_themes: 'elenca i temi', save_theme: 'salva un tema', delete_theme: 'elimina un tema', save_env_dir: 'salva la cartella del .env',
+            mcp_key: 'chiave del server MCP', routine_save: 'salva una routine', routine_fire: 'avvia una routine', routine_delete: 'elimina una routine',
+            memory_review_get: 'legge le proposte di memoria', memory_snapshot_save: 'salva la memoria di Claude',
+            memory_proposals_save: 'salva le proposte di memoria', memory_proposal_state: 'aggiorna una proposta di memoria',
+            pm_list: 'PM: elenca i documenti', pm_read: 'PM: legge un documento', pm_prd: 'PM: scrive il PRD', pm_epic: "PM: scrive l'epic", pm_breakdown: 'PM: spezza in task'
+        };
+        const BRIDGE_TXT = {
+            '/link': "stato del collegamento all'account", '/unlink': "scollega il PC dall'account", '/sessions': 'legge le sessioni di Claude Code',
+            '/session': 'apre una sessione di Claude Code', '/reviews': 'legge i giudizi di Claude sulle sessioni', '/analyze': 'fa analizzare una sessione a Claude',
+            '/git': 'legge lo stato git', '/git/init': 'prepara il repository git', '/graphify/info': 'cerca il grafo Graphify', '/graphify/graph': 'apre il grafo Graphify',
+            '/claude/auth': 'controlla il login di Claude Code', '/claude/auth/login': 'apre il login di Claude Code',
+            '/claude/skills': 'elenca le skill di Claude', '/claude/skill': 'legge una skill', '/claude/skill/write': 'salva una skill',
+            '/claude/skill/copy': 'copia una skill', '/claude/skill/override': 'attiva/disattiva una skill nel progetto',
+            '/claude/plugins': 'elenca i plugin di Claude', '/claude/memory': 'legge la memoria di Claude', '/claude/memory/file': 'legge un file di memoria',
+            '/claude/memory/write': 'salva un file di memoria', '/claude/memory/delete': 'elimina un file di memoria', '/claude/memory/analyze': 'fa analizzare la memoria a Claude',
+            '/claude/context': 'misura il contesto di Claude', '/claude/context/project': 'misura il contesto del progetto',
+            '/desktop/new': 'apre una nuova sessione in Claude Desktop', '/desktop/resume': 'riprende la sessione in Claude Desktop',
+            '/desktop-archive': 'archivia la sessione in Claude Desktop', '/rc': 'stato del controllo remoto', '/rc/start': 'avvia il controllo remoto',
+            '/rc/stop': 'ferma il controllo remoto', '/rc/answer': 'risponde a Claude dal controllo remoto'
+        };
+        // boardData, BRIDGE_URL e ykanBridges sono dichiarati più giù: prima di lì (TDZ) leggerli lancia, typeof compreso
+        const late = f => { try { return f(); } catch (_) { return undefined; } };
+        const projectOf = dir => {
+            const l = dir && late(() => boardData.swimlanes.find(x => x.local_path && x.local_path.toLowerCase() === dir.toLowerCase()));
+            return l ? l.name : (dir ? dir.split(/[\\/]/).filter(Boolean).pop() : '');
+        };
+        const bridgeTxt = (path, who) => {
+            const u = new URL(path, 'http://x');
+            const txt = BRIDGE_TXT[u.pathname] || (/^\/claude\/context\//.test(u.pathname) ? 'ottimizza il contesto di Claude' : 'chiama ' + u.pathname);
+            const proj = projectOf(u.searchParams.get('dir') || '');
+            return who + ' · ' + txt + (proj ? ' di ' + proj : '');
+        };
+        const describe = (url, body) => {
+            const api = url.match(/^\?api=([\w-]+)/);
+            if (api) {
+                if (api[1] === 'bridge_relay' && body) {
+                    try {
+                        const b = JSON.parse(body);
+                        const pc = late(() => ykanBridges.find(x => x.id === Number(b.bridge_id)));
+                        return bridgeTxt(b.path, 'Bridge di ' + (pc ? pc.name : 'un altro PC') + ' (via server)');
+                    } catch (_) {}
+                }
+                return 'Server Ykan · ' + (API_TXT[api[1]] || api[1]);
+            }
+            const bu = late(() => BRIDGE_URL);
+            if (bu && url.startsWith(bu)) return bridgeTxt(url.slice(bu.length), 'Bridge (questo PC)');
+            try { const u = new URL(url, location.href); if (u.origin !== location.origin) return 'Browser → ' + u.host + ' · ' + u.pathname.slice(0, 60); } catch (_) {}
+            return url.replace(location.origin, '').slice(0, 80);
+        };
+        const whoOf = url => {
+            if (/^\?api=bridge_relay/.test(url)) return 'bridge';
+            if (/^\?api=/.test(url)) return 'you';
+            const bu = late(() => BRIDGE_URL);
+            if (bu && url.startsWith(bu)) return 'bridge';
+            try { if (new URL(url, location.href).origin !== location.origin) return 'web'; } catch (_) {}
+            return 'you';
+        };
         const origFetch = window.fetch.bind(window);
         window.fetch = function (input, init) {
             const url = typeof input === 'string' ? input : ((input && input.url) || String(input));
+            if (/^\?api=activity_feed/.test(url)) return origFetch(input, init); // il feed stesso non si registra
+            const who = whoOf(url);
             const method = ((init && init.method) || (input && input.method) || 'GET').toUpperCase();
-            const api = url.match(/^\?api=([\w-]+)/);
-            let label = api ? 'api ' + api[1] : method + ' ' + url.replace(location.origin, '');
-            if (init && typeof init.body === 'string' && init.body !== '{}') {
-                try { label += ' ' + JSON.stringify(JSON.parse(init.body), redact).slice(0, 160); } catch (_) {}
+            const body = init && typeof init.body === 'string' ? init.body : '';
+            const what = describe(url, body);
+            let label = what + (method !== 'GET' ? ' (' + method + ')' : '');
+            if (body && body !== '{}' && !/^\?api=bridge_relay/.test(url)) {
+                try { label += ' ' + JSON.stringify(JSON.parse(body), redact).slice(0, 160); } catch (_) {}
             }
-            ykanLogAdd('net', '→ ' + label);
+            ykanLogAdd('net', '→ ' + label, who);
             const t0 = performance.now();
             return origFetch(input, init).then(res => {
-                ykanLogAdd(res.ok ? 'net' : 'error', '← ' + res.status + ' ' + (api ? api[1] : url.replace(location.origin, '').slice(0, 80)) + ' (' + Math.round(performance.now() - t0) + ' ms)');
+                ykanLogAdd(res.ok ? 'net' : 'error', '← ' + res.status + ' ' + what + ' (' + Math.round(performance.now() - t0) + ' ms)', who);
                 return res;
             }, err => {
-                ykanLogAdd('error', '✖ ' + (api ? api[1] : url.slice(0, 80)) + ': ' + (err && err.message || err));
+                ykanLogAdd('error', '✖ ' + what + ': ' + (err && err.message || err), who);
                 throw err;
             });
         };
     })();
+
+    // Attività esterne (Claude via MCP, i Bridge) registrate dal server: ogni 5 s, a scheda visibile.
+    const ACT_WHO = { 'claude-code': ['claude', 'Claude Code'], 'claude-app': ['claude', 'Claude (connettore)'], 'claude-mcp': ['claude', 'Claude'], bridge: ['bridge', 'Bridge'] };
+    let actAfter = 0;
+    async function ykanActivityPoll() {
+        if (document.hidden) return;
+        try {
+            const j = await (await fetch('?api=activity_feed', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ after: actAfter }) })).json();
+            (j.items || []).forEach(it => {
+                actAfter = Math.max(actAfter, Number(it.id));
+                const w = ACT_WHO[it.actor] || ['', it.actor];
+                ykanLogAdd(Number(it.ok) ? 'ext' : 'error', w[1] + ' · ' + it.text, w[0], new Date(Number(it.ts) * 1000));
+            });
+        } catch (_) {}
+    }
+    setTimeout(ykanActivityPoll, 1500);
+    setInterval(ykanActivityPoll, 5000);
+
+    // Icona del Bridge (un ponte ad arco), uguale ovunque: <i class="ib"></i>
+    const BRIDGE_ICO = '<i class="ib" title="Bridge"></i>';
 
     let boardData = <?= $dataJson ?>;
     // Utente del login Google (null se Ykan gira senza login: file JSON o MySQL senza Google).
@@ -4828,6 +5009,7 @@ $dataJson = json_encode(ykanPublicData($data));
     const YKAN_OWNER = <?= ykanIsOwner() ? 'true' : 'false' ?>; // cartelle/file/temi/.env solo al proprietario
     // true when the server .env provides GITHUB_TOKEN (the value itself never reaches the browser)
     const ykanGithubEnvToken = <?= ykanEnv('GITHUB_TOKEN') !== '' ? 'true' : 'false' ?>;
+    const ykanAnthropicEnvKey = <?= ykanEnv('ANTHROPIC_KEY') !== '' ? 'true' : 'false' ?>;
     let draggedCard = null;
     // Which swimlanes are collapsed, persisted across render() calls so moving/editing
     // a card doesn't reset every project back to "all collapsed".
@@ -5341,6 +5523,7 @@ $dataJson = json_encode(ykanPublicData($data));
         dashProject = document.getElementById('dashProject').value;
         dashDays = parseInt(document.getElementById('dashDays').value, 10);
         dashSaveFilters();
+        gfy.info = null; // il codice dell'iframe del grafo vale 5 minuti: cambiando progetto se ne chiede uno nuovo
         loadDashboard();
     }
     const dashInProject = name => !dashProject || name === dashProject;
@@ -5377,7 +5560,7 @@ $dataJson = json_encode(ykanPublicData($data));
         document.getElementById('tabSettings').classList.toggle('active', view === 'settings');
         document.getElementById('tabClaude').classList.toggle('active', view === 'claude');
         try { localStorage.setItem('ykan_view', view); } catch (_) {}
-        if (view === 'dashboard') loadDashboard();
+        if (view === 'dashboard') { dashSetTitle(); loadDashboard(); }
         if (view === 'settings') loadSettingsView();
         if (view === 'claude') loadClaudeView();
     }
@@ -5391,22 +5574,6 @@ $dataJson = json_encode(ykanPublicData($data));
     function dashCardDone(c) {
         const col = boardData.columns.find(x => x.id === c.column_id);
         return !!c.archived || DASH_DONE_RE.test(col ? col.name : '');
-    }
-
-    async function fetchAllSessions() {
-        const out = { ok: false, anyLane: false, byLane: {} };
-        const lanes = boardData.swimlanes.filter(l => l.local_path);
-        out.anyLane = lanes.length > 0;
-        await Promise.all(lanes.map(async l => {
-            try {
-                const r = await bridgeFetch('/sessions?dir=' + encodeURIComponent(l.local_path));
-                if (!r.ok) throw new Error('HTTP ' + r.status);
-                out.byLane[l.id] = (await r.json()).sessions || [];
-                out.byLane[l.id].forEach(s => sessionIndex.set(s.id, { laneId: l.id, s }));
-                out.ok = true;
-            } catch (_) { /* bridge spento: si mostrano solo i task */ }
-        }));
-        return out;
     }
 
     // Sessions -> loose ends + task links. A session is linked to a task either explicitly
@@ -5454,25 +5621,68 @@ $dataJson = json_encode(ykanPublicData($data));
         return { all, items };
     }
 
+    // Caricamento progressivo: i task del server compaiono subito, poi le sessioni
+    // progetto per progetto man mano che il Bridge risponde (con una riga che dice cosa sta leggendo).
+    let dashLoadGen = 0;
     async function loadDashboard() {
+        const gen = ++dashLoadGen;
         const body = document.getElementById('dashboardBody');
         body.innerHTML = '<div class="dash-empty">Carico…</div>';
+        dashSeen.clear();
         dashSyncFilterUi();
         dashGit = null;
-        const [res, sess, reviews] = await Promise.all([
-            api('loose_ends', { stale_days: dashStaleDays, recent_days: dashDays }), fetchAllSessions(), fetchReviews()]);
-        if (!res.success) { body.innerHTML = '<div class="dash-empty">Errore nel caricamento.</div>'; return; }
-
         const bridge = document.getElementById('dashBridge');
-        if (!sess.anyLane) {
-            bridge.className = 'dash-bridge'; bridge.textContent = 'sessioni: nessuna cartella locale collegata';
-        } else if (sess.ok) {
-            bridge.className = 'dash-bridge ok'; bridge.textContent = '● Bridge connesso';
-        } else {
-            bridge.className = 'dash-bridge ko'; bridge.textContent = '● Bridge non raggiungibile (solo task)';
-        }
-        dashData = { res, sd: dashSessions(sess), reviews };
+        const lanes = boardData.swimlanes.filter(l => l.local_path);
+        const sess = { ok: false, anyLane: lanes.length > 0, byLane: {} };
+        const reviewsP = fetchReviews();
+        const res = await api('loose_ends', { stale_days: dashStaleDays, recent_days: dashDays });
+        if (gen !== dashLoadGen) return;
+        if (!res.success) { body.innerHTML = '<div class="dash-empty">Errore nel caricamento.</div>'; return; }
+        dashData = { res, sd: dashSessions(sess), reviews: {}, loading: lanes.length ? 'sessioni dal Bridge…' : '' };
         dashRender();
+        reviewsP.then(r => { if (gen === dashLoadGen) { dashData.reviews = r; dashRenderSoon(); } });
+
+        if (!sess.anyLane) { bridge.className = 'dash-bridge'; bridge.textContent = 'sessioni: nessuna cartella locale collegata'; return; }
+        bridge.className = 'dash-bridge'; bridge.innerHTML = BRIDGE_ICO + ' Bridge: leggo le sessioni…';
+        let done = 0;
+        await Promise.all(lanes.map(async l => {
+            try {
+                const r = await bridgeFetch('/sessions?dir=' + encodeURIComponent(l.local_path));
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                sess.byLane[l.id] = (await r.json()).sessions || [];
+                sess.byLane[l.id].forEach(s => sessionIndex.set(s.id, { laneId: l.id, s }));
+                sess.ok = true;
+            } catch (_) { /* bridge spento: si mostrano solo i task */ }
+            if (gen !== dashLoadGen) return;
+            done++;
+            dashData.sd = dashSessions(sess);
+            dashData.loading = done < lanes.length ? `sessioni: letto ${l.name} (${done}/${lanes.length})…` : '';
+            dashRenderSoon();
+        }));
+        if (gen !== dashLoadGen) return;
+        if (sess.ok) { bridge.className = 'dash-bridge ok'; bridge.innerHTML = BRIDGE_ICO + ' Bridge connesso'; }
+        else { bridge.className = 'dash-bridge ko'; bridge.innerHTML = BRIDGE_ICO + ' Bridge non raggiungibile (solo task)'; }
+    }
+    // Un render ogni 50 ms al massimo, anche se più progetti rispondono insieme
+    let dashRenderQueued = false;
+    function dashRenderSoon() {
+        if (dashRenderQueued) return;
+        dashRenderQueued = true;
+        setTimeout(() => { dashRenderQueued = false; dashRender(); }, 50); // non rAF: si ferma con la scheda in background
+    }
+    // Gli elementi mai visti prima entrano uno alla volta (ritardo crescente); quelli già a schermo restano fermi
+    const dashSeen = new Set();
+    function dashAnimateNew(body) {
+        let n = 0;
+        body.querySelectorAll('.dash-projcard, .focus-row, .dash-item, .dash-rev, .rv-row, .wk-day, .git-row, .dash-ev').forEach(el => {
+            // le card progetto cambiano % mentre arrivano i dati: le riconosco dal nome (inizio del testo)
+            const len = el.matches('.dash-projcard, .focus-row') ? 40 : 160;
+            const key = el.className.replace(/ (dash-in|focus-top)/g, '') + '|' + el.textContent.replace(/\s+/g, ' ').trim().slice(0, len);
+            if (dashSeen.has(key)) return;
+            dashSeen.add(key);
+            el.classList.add('dash-in');
+            el.style.animationDelay = Math.min(n++ * 45, 1200) + 'ms';
+        });
     }
 
     // Giudizi di Claude sulle sessioni (dal Bridge): validi solo se la sessione non è cambiata dopo la revisione
@@ -5491,7 +5701,16 @@ $dataJson = json_encode(ykanPublicData($data));
     function dashTab(name) {
         dashTabName = name;
         try { localStorage.setItem('ykan_dash_tab', name); } catch (_) {}
-        dashRender();
+        dashSetTitle();
+        dashSeen.clear();
+        if (document.body.dataset.view !== 'dashboard') showView('dashboard');
+        else dashRender();
+    }
+    // Titolo pagina = nome della voce di menu (senza emoji e contatore)
+    function dashSetTitle() {
+        const b = document.querySelector(`#dashTabs button[data-tab="${dashTabName}"]`);
+        const t = b ? [...b.childNodes].filter(n => n.nodeType === 3).map(n => n.textContent).join('').replace(/^[^\p{L}]+/u, '').trim() : '';
+        document.getElementById('dashTitle').textContent = t || 'Dashboard';
     }
 
     function dashOpenCard(id) { openCardModal(id); }
@@ -5545,29 +5764,52 @@ $dataJson = json_encode(ykanPublicData($data));
         document.querySelectorAll('#dashTabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === 'graphify'));
         if (!gfy.info) { body.innerHTML = '<div class="dash-empty">Cerco i grafi nei progetti…</div>'; gfyLoad(); return; }
         const lanes = boardData.swimlanes.filter(l => l.local_path);
-        if (Object.values(gfy.info).every(v => v === null)) { body.innerHTML = '<div class="dash-empty">Bridge locale non raggiungibile: il grafo si legge dal PC (vale solo per «Questo computer»).</div>'; return; }
+        if (Object.values(gfy.info).every(v => v === null)) { body.innerHTML = '<div class="dash-empty"><i class="ib"></i> Bridge locale non raggiungibile: il grafo si legge dal PC (vale solo per «Questo computer»).</div>'; return; }
         const withGraph = lanes.filter(l => gfy.info[l.id] && gfy.info[l.id].exists);
         const btn = document.querySelector('#dashTabs button[data-tab="graphify"] .dash-count');
         if (btn) btn.textContent = withGraph.length || '';
+        // Si sceglie solo dal filtro "Progetto" in alto; con "Tutti" resta il primo progetto che ha un grafo
+        if (dashProject) { const pl = lanes.find(l => l.name === dashProject); if (pl) gfy.sel = pl.id; }
         const sel = boardData.swimlanes.find(l => l.id === gfy.sel);
-        const inf = sel && gfy.info[sel.id];
-        body.innerHTML = `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">
-                ${lanes.map(l => { const i = gfy.info[l.id]; const has = i && i.exists;
-                    return `<button class="btn${l.id === gfy.sel ? ' btn-primary' : ''}" ${has ? `onclick="gfySelect('${escHtml(l.id)}')"` : 'disabled'} title="${has ? 'grafo del ' + new Date(i.modified).toLocaleDateString('it-IT') : 'nessun grafo: lancia /graphify in una sessione di questo progetto'}" style="${has ? '' : 'opacity:.5'}">${escHtml(l.name)}${has ? '' : ' —'}</button>`; }).join('')}
-                <span style="flex:1"></span><button class="btn" onclick="gfy.info=null;gfyRender()">↻</button>
+        const inf = sel && gfy.info[sel.id] && gfy.info[sel.id].exists ? gfy.info[sel.id] : null;
+        body.innerHTML = `<div style="display:flex;gap:6px;align-items:center;margin-bottom:10px">
+                <span style="flex:1"></span>
+                ${inf ? `<button class="btn" onclick="gfyFullscreen()" title="Grafo a tutto schermo (Esc per uscire)">⛶ Tutto schermo</button>
+                <button class="btn" id="gfyExportBtn" onclick="gfyExport()" disabled title="Aggiorna e riavvia il Bridge per abilitare l'esportazione">🖼️ Esporta PNG</button>` : ''}
+                <button class="btn" onclick="gfy.info=null;gfyRender()" title="Ricarica">↻</button>
             </div>`
-            + (!inf ? '<div class="dash-empty">Nessun progetto ha ancora un grafo. In una sessione di Claude Code nel progetto scrivi <code>/graphify</code>: crea <code>graphify-out/</code> e qui compare.</div>'
+            + (!inf && sel ? `<div class="dash-empty">${escHtml(sel.name)} non ha ancora un grafo. In una sessione di Claude Code nel progetto scrivi <code>/graphify</code>: crea <code>graphify-out/</code> e qui compare.</div>`
+            : !inf ? '<div class="dash-empty">Nessun progetto ha ancora un grafo. In una sessione di Claude Code nel progetto scrivi <code>/graphify</code>: crea <code>graphify-out/</code> e qui compare.</div>'
             : `<div class="dash-sub" style="margin-bottom:6px;white-space:pre-wrap">${escHtml(inf.summary)} · aggiornato il ${new Date(inf.modified).toLocaleDateString('it-IT')} — per rigenerarlo: <code>/graphify</code> in una sessione del progetto</div>
-               <iframe src="${BRIDGE_URL}/graphify/graph?t=${encodeURIComponent(inf.token || '')}" style="width:100%;height:calc(100vh - 260px);min-height:480px;border:1px solid var(--border);border-radius:8px;background:#fff"></iframe>`);
+               <div id="gfyFrameWrap" class="gfy-wrap"><iframe id="gfyFrame" allow="fullscreen" src="${BRIDGE_URL}/graphify/graph?t=${encodeURIComponent(inf.token || '')}"></iframe></div>`);
     }
 
-    // Il codice per l'iframe vale 5 minuti: prima di mostrare un grafo se ne chiede uno nuovo.
-    async function gfySelect(id) {
-        gfy.sel = id;
-        const lane = boardData.swimlanes.find(l => l.id === id);
-        try { const r = await fetch(BRIDGE_URL + '/graphify/info?dir=' + encodeURIComponent(lane.local_path)); if (r.ok) gfy.info[id] = await r.json(); } catch (_) { }
-        gfyRender();
+    function gfyFullscreen() {
+        const w = document.getElementById('gfyFrameWrap');
+        if (w && w.requestFullscreen) w.requestFullscreen().catch(e => toast('Tutto schermo non disponibile: ' + e.message, 'error'));
     }
+    // Il PNG lo disegna il grafo stesso (dentro l'iframe del Bridge): qui si chiede e si scarica
+    function gfyExport() {
+        const f = document.getElementById('gfyFrame');
+        if (!f) return;
+        const b = document.getElementById('gfyExportBtn'); b.disabled = true; b.textContent = "⏳ Preparo l'immagine…";
+        f.contentWindow.postMessage({ ykan: 'gfy-export' }, new URL(BRIDGE_URL).origin);
+    }
+    window.addEventListener('message', e => {
+        const f = document.getElementById('gfyFrame');
+        if (!f || e.source !== f.contentWindow || !e.data) return;
+        const b = document.getElementById('gfyExportBtn');
+        if (e.data.ykan === 'gfy-ready' && b) { b.disabled = false; b.title = 'Scarica il grafo come immagine grande (testi leggibili)'; }
+        if (e.data.ykan === 'gfy-png') {
+            if (b) { b.disabled = false; b.textContent = '🖼️ Esporta PNG'; }
+            if (e.data.error) return toast('Esportazione non riuscita: ' + e.data.error, 'error');
+            const lane = boardData.swimlanes.find(l => l.id === gfy.sel);
+            const a = document.createElement('a');
+            a.href = e.data.png;
+            a.download = 'grafo-' + String(lane ? lane.name : 'progetto').replace(/[^\w-]+/g, '_').replace(/^_+|_+$/g, '') + '.png';
+            a.click();
+        }
+    });
 
     function dashRender() {
         if (dashTabName === 'graphify') return gfyRender();
@@ -5590,6 +5832,9 @@ $dataJson = json_encode(ykanPublicData($data));
         else if (dashTabName === 'review') body.innerHTML = dashReviewHtml(sd);
         else if (dashTabName === 'git') { body.innerHTML = dashGitHtml(); if (!dashGit) dashGitLoad(); }
         else body.innerHTML = dashResumeHtml(res, sd);
+        const busy = dashData.loading || (['focus', 'git'].includes(dashTabName) && dashGit && dashGit.loading);
+        if (busy) body.insertAdjacentHTML('afterbegin', `<div class="dash-loading"><span class="dash-spin"></span>${escHtml(busy)}</div>`);
+        dashAnimateNew(body);
     }
 
     // ---- Tab "Da riprendere": progetti per ultima attività, poi le cose aperte ----
@@ -5815,24 +6060,36 @@ $dataJson = json_encode(ykanPublicData($data));
         return lane.github_repo || (info && info.suggestedRemote) || '';
     }
 
+    // Progressivo come le sessioni: Focus e Git si aggiornano a ogni repository letto,
+    // poi arriva lo stato GitHub (issue/PR) per tutti insieme.
     async function dashGitLoad() {
         const lanes = boardData.swimlanes.filter(l => l.local_path);
-        const byLane = {};
-        let ok = false;
+        const g = dashGit = { byLane: {}, ok: false, anyLane: lanes.length > 0, gh: {}, hasToken: false, asked: false,
+            loading: lanes.length ? 'repository dal Bridge…' : '' };
+        dashRenderSoon();
+        let done = 0;
         await Promise.all(lanes.map(async l => {
             try {
                 const r = await bridgeFetch('/git?dir=' + encodeURIComponent(l.local_path));
-                if (r.ok) { byLane[l.id] = await r.json(); ok = true; }
+                if (r.ok) { g.byLane[l.id] = await r.json(); g.ok = true; }
             } catch (_) { /* bridge spento */ }
+            if (dashGit !== g) return;
+            done++;
+            g.loading = `git: letto ${l.name} (${done}/${lanes.length})…`;
+            dashRenderSoon();
         }));
-        const repos = [...new Set(boardData.swimlanes.map(l => dashGitRepoOf(l, byLane[l.id])).filter(Boolean))];
-        let gh = {}, hasToken = false;
+        if (dashGit !== g) return;
+        const repos = [...new Set(boardData.swimlanes.map(l => dashGitRepoOf(l, g.byLane[l.id])).filter(Boolean))];
         if (repos.length) {
+            g.loading = 'stato GitHub (issue e PR)…';
+            dashRenderSoon();
             const r = await api('github_repo_status', { repos });
-            if (r.success) { gh = r.repos || {}; hasToken = !!r.has_token; }
+            if (dashGit !== g) return;
+            if (r.success) { g.gh = r.repos || {}; g.hasToken = !!r.has_token; }
         }
-        dashGit = { byLane, ok, anyLane: lanes.length > 0, gh, hasToken, asked: repos.length > 0 };
-        dashRender();
+        g.asked = repos.length > 0;
+        g.loading = '';
+        dashRenderSoon();
     }
 
     function dashGitRows() {
@@ -5851,7 +6108,7 @@ $dataJson = json_encode(ykanPublicData($data));
 
     function dashGitHtml() {
         if (!dashGit) return '<div class="dash-empty">Leggo i repository…</div>';
-        if (dashGit.anyLane && !dashGit.ok) return '<div class="dash-empty">Bridge locale non raggiungibile: avvialo per vedere lo stato dei repository.</div>';
+        if (dashGit.anyLane && !dashGit.ok && !dashGit.loading) return '<div class="dash-empty"><i class="ib"></i> Bridge locale non raggiungibile: avvialo per vedere lo stato dei repository.</div>';
         const rows = dashGitRows();
         const repos = rows.filter(x => x.info.repo);
         const dirty = repos.filter(x => x.info.changed || x.info.untracked).length;
@@ -6039,7 +6296,6 @@ $dataJson = json_encode(ykanPublicData($data));
 
     function dashFocusHtml() {
         if (!dashData) return '<div class="dash-empty">Carico…</div>';
-        if (dashGit === null) return '<div class="dash-empty">Leggo lo stato dei repository…</div>';
         const rows = dashFocusData();
         if (!rows.length) return '<div class="dash-empty">Nessun progetto. Aggiungine uno dalla Kanban. 🎉</div>';
 
@@ -6593,7 +6849,7 @@ $dataJson = json_encode(ykanPublicData($data));
         box.innerHTML = '<div style="font-size:13px;font-weight:500">🕒 Sessioni Claude</div><div class="dash-empty">Carico…</div>';
         let list;
         try { list = await fetchLaneSessions(lane); } catch (_) {
-            box.innerHTML = '<div style="font-size:13px;font-weight:500">🕒 Sessioni Claude</div><div class="dash-empty">Bridge locale non raggiungibile.</div>';
+            box.innerHTML = '<div style="font-size:13px;font-weight:500">🕒 Sessioni Claude</div><div class="dash-empty"><i class="ib"></i> Bridge locale non raggiungibile.</div>';
             return;
         }
         if (document.getElementById('cardId').value !== card.id) return; // card changed while loading
@@ -6730,6 +6986,72 @@ $dataJson = json_encode(ykanPublicData($data));
         menu.innerHTML = html;
     }
 
+    // --- Chip di stato Claude / Git (sotto "Questo computer") ---
+    const statState = { Claude: null, Git: null };
+    async function statClaudeLoad() {
+        let cli = { state: 'bridge', note: '<i class="ib"></i> Bridge non raggiungibile' };
+        try {
+            const r = await bridgeFetch('/claude/auth');
+            const j = await r.json();
+            if (r.status === 404) cli = { state: 'bridge', note: 'Bridge da aggiornare' };
+            else if (!r.ok) cli = { state: 'bridge', note: j.error || 'HTTP ' + r.status };
+            else cli = j.loggedIn ? { state: 'ok', note: [j.authMethod, j.email].filter(Boolean).join(' · ') || 'collegata' } : { state: 'login', note: 'serve il login' };
+        } catch (_) { /* bridge spento */ }
+        statState.Claude = { cli, api: ykanAnthropicEnvKey };
+        statRender('Claude');
+    }
+    async function statGitLoad() {
+        const lanes = boardData.swimlanes.filter(l => l.local_path);
+        let reached = false, repos = 0;
+        await Promise.all(lanes.map(async l => {
+            try {
+                const r = await bridgeFetch('/git?dir=' + encodeURIComponent(l.local_path));
+                if (r.ok) { reached = true; if ((await r.json()).repo) repos++; }
+            } catch (_) { /* bridge spento */ }
+        }));
+        statState.Git = { reached, repos, lanes: lanes.length,
+            token: ykanGithubEnvToken ? '.env del server' : (boardData.config.github_token ? 'Settings' : ''),
+            repo: boardData.config.github_repo || '' };
+        statRender('Git');
+    }
+    function statRender(kind) {
+        const st = statState[kind];
+        const dot = document.getElementById('stat' + kind + 'Dot'), sub = document.getElementById('stat' + kind + 'Sub');
+        const row = (on, name, note) => `<div class="stat-row"><span class="bridge-dot ${on === true ? 'on' : on === false ? 'off' : 'mid'}"></span><div><b>${escHtml(name)}</b><small>${escHtml(note).replace('<i class="ib"></i>', BRIDGE_ICO)}</small></div></div>`;
+        let html, a, b;
+        if (kind === 'Claude') {
+            a = st.cli.state === 'ok'; b = st.api;
+            sub.textContent = a && b ? 'CLI + API' : a ? 'CLI' : b ? 'API' : 'off';
+            html = row(a, 'Claude Code CLI', st.cli.state === 'ok' ? 'via <i class="ib"></i> Bridge · ' + st.cli.note : st.cli.note)
+                 + row(b, 'API Anthropic', b ? 'ANTHROPIC_KEY nel .env del server' : 'ANTHROPIC_KEY non configurata')
+                 + `<small><a href="#" onclick="showView('settings');settingsTab('claude-code');toggleStatMenu('Claude');return false">Login e impostazioni…</a></small>`;
+        } else {
+            a = st.reached; b = !!st.token;
+            sub.textContent = a && b ? 'locale + GitHub' : a ? 'locale' : b ? 'GitHub' : 'off';
+            html = row(a, 'Git locale', a ? 'via <i class="ib"></i> Bridge · ' + st.repos + ' repo su ' + st.lanes + ' progetti collegati' : (st.lanes ? '<i class="ib"></i> Bridge non raggiungibile' : 'nessun progetto con cartella locale'))
+                 + row(b, 'GitHub', b ? 'token da ' + st.token + (st.repo ? ' · repo ' + st.repo : '') : 'token non configurato')
+                 + `<small><a href="#" onclick="showView('settings');settingsTab('github');toggleStatMenu('Git');return false">Impostazioni GitHub…</a></small>`;
+        }
+        dot.className = 'bridge-dot ' + (a && b ? 'on' : a || b ? 'mid' : 'off');
+        document.getElementById('stat' + kind + 'Menu').innerHTML = html;
+    }
+    function statInit() {
+        if (!YKAN_USER) return;
+        ['Claude', 'Git'].forEach(k => document.getElementById('stat' + k + 'Wrap').style.display = '');
+        statClaudeLoad(); statGitLoad();
+    }
+    function toggleStatMenu(kind, ev) {
+        if (ev) ev.stopPropagation();
+        const m = document.getElementById('stat' + kind + 'Menu');
+        const open = !m.classList.contains('open');
+        document.querySelectorAll('.bridge-menu.open').forEach(x => x.classList.remove('open'));
+        m.classList.toggle('open', open);
+        if (open) (kind === 'Claude' ? statClaudeLoad : statGitLoad)(); // ricontrolla a ogni apertura
+    }
+    document.addEventListener('click', e => {
+        document.querySelectorAll('.stat-wrap .bridge-menu.open').forEach(m => { if (!m.parentElement.contains(e.target)) m.classList.remove('open'); });
+    });
+
     function toggleBridgeMenu(ev) {
         if (ev) ev.stopPropagation();
         document.getElementById('bridgeMenu').classList.toggle('open');
@@ -6819,7 +7141,7 @@ $dataJson = json_encode(ykanPublicData($data));
             renderSessionsList(data.sessions || []);
         } catch (e) {
             list.innerHTML = `<div style="padding:12px;font-size:13px;color:var(--text2)">
-                Bridge locale non raggiungibile su <code>${escHtml(BRIDGE_URL)}</code>.<br>
+                <i class="ib"></i> Bridge locale non raggiungibile su <code>${escHtml(BRIDGE_URL)}</code>.<br>
                 Avvialo sul tuo PC con: <code>node bridge/bridge-server.js</code>
             </div>`;
         }
@@ -7090,11 +7412,12 @@ $dataJson = json_encode(ykanPublicData($data));
 
     // Console: mostra ykanLog (log del browser + richieste). Lo scroll segue le righe nuove solo
     // se eri già in fondo; il badge rosso sulla scheda conta gli errori arrivati mentre era nascosta.
+    const CON_WHO = { you: ['👤', 'tu, dalla board'], bridge: [BRIDGE_ICO, 'Bridge'], claude: ['🤖', 'Claude'], web: ['🌐', 'il browser verso un altro sito'] };
     function termBuildConsole(spec) {
         const pane = spec.paneEl;
         pane.classList.add('con');
         pane.innerHTML = `<div class="con-bar">
-                ${[['net', 'richieste'], ['log', 'log'], ['warn', 'warning'], ['error', 'errori']].map(([k, l]) =>
+                ${[['ext', 'Claude e Bridge'], ['net', 'richieste'], ['log', 'log'], ['warn', 'warning'], ['error', 'errori']].map(([k, l]) =>
                     `<label><input type="checkbox" data-hide="${k}" checked> ${l}</label>`).join('')}
                 <span style="flex:1"></span>
                 <button type="button" class="btn" style="padding:1px 8px;font-size:11px" data-act="copy">Copia</button>
@@ -7114,9 +7437,13 @@ $dataJson = json_encode(ykanPublicData($data));
             const t = document.createElement('span');
             t.className = 'con-t';
             t.textContent = e.t.toLocaleTimeString('it-IT') + '.' + String(e.t.getMilliseconds()).padStart(3, '0');
+            const w = document.createElement('span');
+            w.className = 'con-who';
+            const who = CON_WHO[e.who];
+            if (who) { w.innerHTML = who[0]; w.title = who[1]; }
             const m = document.createElement('span');
             m.textContent = e.text;
-            row.append(t, m);
+            row.append(t, w, m);
             list.appendChild(row);
             while (list.childElementCount > ykanLog.max) list.firstChild.remove();
             if (nearEnd) list.scrollTop = list.scrollHeight;
@@ -7133,7 +7460,7 @@ $dataJson = json_encode(ykanPublicData($data));
             list.classList.toggle('hide-' + cb.dataset.hide, !cb.checked)));
         pane.querySelector('[data-act="clear"]').addEventListener('click', () => { ykanLog.entries.length = 0; list.innerHTML = ''; });
         pane.querySelector('[data-act="copy"]').addEventListener('click', () => {
-            const txt = ykanLog.entries.map(e => e.t.toISOString().slice(11, 23) + ' [' + e.level + '] ' + e.text).join('\n');
+            const txt = ykanLog.entries.map(e => e.t.toISOString().slice(11, 23) + ' [' + e.level + '] ' + (e.who ? '(' + e.who + ') ' : '') + e.text).join('\n');
             navigator.clipboard.writeText(txt).then(() => toast('Console copiata'), () => toast('Copia non riuscita', 'error'));
         });
         spec.onShow = () => { unread = 0; badge.style.display = 'none'; list.scrollTop = list.scrollHeight; };
@@ -7907,8 +8234,8 @@ $dataJson = json_encode(ykanPublicData($data));
             if (!r.ok) throw new Error(j.error || 'HTTP ' + r.status);
             claudeAuthState = j.loggedIn ? 'ok' : 'login';
         } catch (e) { claudeAuthState = 'bridge'; btn.title = e.message; }
-        const look = { ok: ['✅ Login OK', '#16a34a'], login: ['🔑 Serve login', '#dc2626'], bridge: ['Bridge non raggiungibile', '#6b7280'] }[claudeAuthState];
-        btn.textContent = look[0];
+        const look = { ok: ['✅ Login OK', '#16a34a'], login: ['🔑 Serve login', '#dc2626'], bridge: ['<i class="ib"></i> Bridge non raggiungibile', '#6b7280'] }[claudeAuthState];
+        btn.innerHTML = look[0].replace('<i class="ib"></i>', BRIDGE_ICO);
         btn.style.background = look[1]; btn.style.color = '#fff'; btn.style.borderColor = look[1];
         if (claudeAuthState === 'ok' && claudeAuthPoll) { clearInterval(claudeAuthPoll); claudeAuthPoll = null; toast('Claude Code collegato', 'success'); }
     }
@@ -8244,7 +8571,7 @@ $dataJson = json_encode(ykanPublicData($data));
     }
 
     function ctxRender() {
-        if (ctxState.err) return `<div class="dash-empty">Bridge non raggiungibile o non aggiornato: ${escHtml(ctxState.err)}</div>`;
+        if (ctxState.err) return `<div class="dash-empty"><i class="ib"></i> Bridge non raggiungibile o non aggiornato: ${escHtml(ctxState.err)}</div>`;
         const inv = ctxState.inv;
         if (!inv) return '<div class="dash-empty">Carico…</div>';
         const h = t => `<h3 style="margin:18px 0 8px;font-size:15px">${t}</h3>`;
@@ -8331,8 +8658,8 @@ $dataJson = json_encode(ykanPublicData($data));
 
     function claudeUpdateBridgeBadge() {
         const badge = document.getElementById('claudeBridge');
-        if (claudeSkills === null) { badge.className = 'dash-bridge ko'; badge.textContent = '● Bridge non raggiungibile'; }
-        else { badge.className = 'dash-bridge ok'; badge.textContent = '● Bridge connesso'; }
+        if (claudeSkills === null) { badge.className = 'dash-bridge ko'; badge.innerHTML = BRIDGE_ICO + ' Bridge non raggiungibile'; }
+        else { badge.className = 'dash-bridge ok'; badge.innerHTML = BRIDGE_ICO + ' Bridge connesso'; }
     }
 
     function claudeCard(key, badgeHtml, title, subtitle, whenIso) {
@@ -8360,7 +8687,7 @@ $dataJson = json_encode(ykanPublicData($data));
         if (claudeTabName === 'context') {
             body.innerHTML = ctxRender();
         } else if (claudeTabName === 'skills') {
-            if (claudeSkills === null) body.innerHTML = '<div class="dash-empty">Bridge locale non raggiungibile: avvialo per vedere le skill installate.</div>';
+            if (claudeSkills === null) body.innerHTML = '<div class="dash-empty"><i class="ib"></i> Bridge locale non raggiungibile: avvialo per vedere le skill installate.</div>';
             else if (!claudeSkills.length) body.innerHTML = '<div class="dash-empty">Nessuna skill trovata in ~/.claude/skills.</div>';
             else {
                 body.innerHTML = skillsHeaderHtml() + claudeSkills.map(skillCardHtml).join('');
@@ -8377,7 +8704,7 @@ $dataJson = json_encode(ykanPublicData($data));
             const mem = claudeMemory[laneId];
             if (!laneId) body.innerHTML = '<div class="dash-empty">Scegli un progetto nel menu in alto per vedere e ottimizzare la sua memoria. (I progetti compaiono lì quando sono collegati a una cartella: Kanban → 🔗 Projects.)</div>';
             else if (mem === undefined) body.innerHTML = '<div class="dash-empty">Carico…</div>';
-            else if (mem === null) body.innerHTML = memReviewHtml(laneId) + '<div class="dash-empty">Bridge locale non raggiungibile.</div>';
+            else if (mem === null) body.innerHTML = memReviewHtml(laneId) + '<div class="dash-empty"><i class="ib"></i> Bridge locale non raggiungibile.</div>';
             else if (!mem.exists || !mem.files.length) body.innerHTML = '<div class="dash-empty">Nessuna memoria per questo progetto — Claude non ha ancora salvato nulla qui.</div>';
             else {
                 counts.memory = mem.files.length;
@@ -8587,7 +8914,7 @@ $dataJson = json_encode(ykanPublicData($data));
 
     function pluginsHtml() {
         if (claudePlugins === undefined) return '<div class="dash-empty">Carico…</div>';
-        if (claudePlugins === null) return '<div class="dash-empty">Bridge locale non raggiungibile.</div>';
+        if (claudePlugins === null) return '<div class="dash-empty"><i class="ib"></i> Bridge locale non raggiungibile.</div>';
         if (claudePlugins === 'old') return '<div class="dash-empty">Aggiorna il Bridge alla 0.6.0 per vedere e gestire i plugin.</div>';
         if (claudePluginsError) return '<div class="dash-empty">Non riesco a leggere i plugin: ' + escHtml(claudePluginsError) + '</div>';
         if (!claudePlugins.length) return '<div class="dash-empty">Nessun plugin installato. Si installano con /plugin in Claude Code.</div>';
@@ -8654,7 +8981,7 @@ $dataJson = json_encode(ykanPublicData($data));
 
     function rcHtml() {
         if (rcServers === undefined) return '<div class="dash-empty">Carico…</div>';
-        if (rcServers === null) return '<div class="dash-empty">Bridge locale non raggiungibile.</div>';
+        if (rcServers === null) return '<div class="dash-empty"><i class="ib"></i> Bridge locale non raggiungibile.</div>';
         if (rcServers === 'old') return '<div class="dash-empty">Aggiorna il Bridge alla 0.7.0 per gestire Remote Control da qui.</div>';
         const only = claudeSelectedLane();
         const lanes = only ? [only] : boardData.swimlanes.filter(l => l.local_path);
@@ -10103,6 +10430,7 @@ ${epicRows}</div>`);
         let v = 'kanban';
         try { v = localStorage.getItem('ykan_view') || 'kanban'; } catch (_) {}
         showView(v);
+        statInit();
     }, 0);
     // pannello terminale sempre presente in fondo; a DOM completo perché il <template> del changelog sta dopo lo script
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', termInit);
@@ -10490,11 +10818,26 @@ ${epicRows}</div>`);
         <div class="changelog-content">
 
             <div class="changelog-version">
+                <h3>v2.0.0 - October 2026</h3>
+                <ul>
+                    <li>🧭 <strong>New layout</strong> - left sidebar in Claude Desktop style; Kanban and every Dashboard page share the same header and size; follows custom themes</li>
+                    <li>📑 <strong>Dashboard pages in the sidebar</strong> - Focus, Da riprendere, Attività, Revisione sessioni, Git, Graphify as separate pages, with progressive loading</li>
+                    <li>🟢 <strong>Status chips</strong> - Claude (CLI via Bridge / API key) and Git (local / GitHub) under «Questo computer»</li>
+                    <li>🕸️ <strong>Graphify</strong> - human-readable graphs per project with named areas, fullscreen and large PNG export</li>
+                    <li>🖥️ <strong>Readable console</strong> - every request says who did it (👤 you, <i class="ib"></i> Bridge, 🤖 Claude, 🌐 other sites) and what, including Claude's MCP calls logged on the server</li>
+                    <li>👥 <strong>Google login and per-user boards</strong> - MySQL storage, owner-only server functions, personal MCP keys</li>
+                    <li><i class="ib"></i> <strong>Linked PCs</strong> - the Bridge pairs with your account; work on another PC through the server relay, open Claude Desktop there</li>
+                    <li>🤖 <strong>Claude panel</strong> - skills, plugins, memory, context optimisation, Remote Control and routines managed from Ykan; card threads</li>
+                    <li>📦 <strong>Downloadable Bridge</strong> - tray icon and hidden autostart included; Chrome usage-badge extension</li>
+                </ul>
+            </div>
+
+            <div class="changelog-version">
                 <h3>v1.9.0 - September 2026</h3>
                 <ul>
                     <li>🎯 <strong>Focus tab</strong> - su cosa lavorare ora e quanto manca per la stable, progetto per progetto</li>
                     <li>📊 <strong>Dashboard tab</strong> - cross-project view: Da riprendere, Attività, Revisione sessioni, Git</li>
-                    <li>🌉 <strong>Local Bridge</strong> - optional Node helper (<code>bridge/</code>) on <code>127.0.0.1</code> feeding real Claude Code session history and a live terminal</li>
+                    <li><i class="ib"></i> <strong>Local Bridge</strong> - optional Node helper (<code>bridge/</code>) on <code>127.0.0.1</code> feeding real Claude Code session history and a live terminal</li>
                     <li>🗄️ <strong>Database tools</strong> - <code>db_query</code>, <code>db_exec</code>, <code>db_schema</code>, <code>db_dump_table</code> exposed via <code>mcp.php</code></li>
                     <li>✉️ <strong>Mail tool</strong> - <code>send_digest_mail</code> sends an HTML summary email</li>
                     <li>🔁 <strong>Google Tasks sync</strong> - optional bidirectional sync (<code>sync_google_tasks</code>)</li>
