@@ -2503,6 +2503,56 @@ PROMPT;
                 return ['success' => true, 'stats' => $stats];
             })(),
 
+            // Novità Claude Code: repo più stellati del periodo + release ufficiali (cache 3h, token GitHub opzionale)
+            'claude_news' => (function() use ($data, $input) {
+                $days = in_array((int)($input['days'] ?? 30), [7, 30, 90], true) ? (int)$input['days'] : 30;
+                $kinds = [
+                    'all'     => 'claude-code',
+                    'skills'  => 'topic:claude-skills',
+                    'plugins' => 'topic:claude-code-plugin',
+                    'mcp'     => 'mcp-server claude',
+                ];
+                $kind = isset($kinds[$input['kind'] ?? '']) ? $input['kind'] : 'all';
+                $since = date('Y-m-d', time() - $days * 86400);
+                $cache = sys_get_temp_dir() . '/ykan_claude_news_' . md5($kind . $since) . '.json';
+                if (empty($input['refresh']) && is_file($cache) && filemtime($cache) > time() - 10800) {
+                    $hit = json_decode((string)file_get_contents($cache), true);
+                    if (is_array($hit)) return $hit + ['cached' => true];
+                }
+                $token = ykanGithubToken($data);
+                $gh = function (string $url) use ($token): array {
+                    $h = ["Accept: application/vnd.github+json", "User-Agent: _Ykan-Kanban", "X-GitHub-Api-Version: 2022-11-28"];
+                    if ($token) $h[] = "Authorization: Bearer {$token}";
+                    $ch = curl_init($url);
+                    curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_HTTPHEADER => $h, CURLOPT_TIMEOUT => 15]);
+                    $res = curl_exec($ch);
+                    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                    curl_close($ch);
+                    $j = json_decode((string)$res, true);
+                    if ($code !== 200) throw new RuntimeException('GitHub API: ' . ($j['message'] ?? "HTTP {$code}"));
+                    return $j;
+                };
+                try {
+                    $q = $kinds[$kind] . " created:>{$since} fork:false";
+                    $search = $gh('https://api.github.com/search/repositories?' . http_build_query(['q' => $q, 'sort' => 'stars', 'order' => 'desc', 'per_page' => 30]));
+                    $rels = $gh('https://api.github.com/repos/anthropics/claude-code/releases?per_page=8');
+                } catch (Throwable $e) {
+                    return ['success' => false, 'error' => $e->getMessage()];
+                }
+                $repos = array_map(fn($r) => [
+                    'name' => $r['full_name'], 'url' => $r['html_url'], 'desc' => (string)($r['description'] ?? ''),
+                    'stars' => (int)$r['stargazers_count'], 'lang' => (string)($r['language'] ?? ''),
+                    'created' => substr($r['created_at'], 0, 10), 'topics' => $r['topics'] ?? [],
+                ], $search['items'] ?? []);
+                $releases = array_map(fn($r) => [
+                    'tag' => $r['tag_name'], 'url' => $r['html_url'], 'date' => substr((string)$r['published_at'], 0, 10),
+                    'body' => mb_substr((string)($r['body'] ?? ''), 0, 1500),
+                ], is_array($rels) ? $rels : []);
+                $out = ['success' => true, 'repos' => $repos, 'releases' => $releases, 'since' => $since, 'fetched' => date('c')];
+                @file_put_contents($cache, json_encode($out));
+                return $out;
+            })(),
+
             // GitHub API - List Issues
             'github_issues' => (function() use ($data) {
                 $token = ykanGithubToken($data);
@@ -4517,6 +4567,7 @@ $dataJson = json_encode(ykanPublicData($data));
             <button data-tab="rc" onclick="claudeTab('rc')">Remote Control <span class="dash-count"></span></button>
             <button data-tab="routines" onclick="claudeTab('routines')">Routine <span class="dash-count"></span></button>
             <button data-tab="context" onclick="claudeTab('context')">Contesto <span class="dash-count"></span></button>
+            <button data-tab="news" onclick="claudeTab('news')">Novità <span class="dash-count"></span></button>
         </div>
         <div id="claudeBody"></div>
     </section>
@@ -4752,7 +4803,7 @@ $dataJson = json_encode(ykanPublicData($data));
             });
             if (res.status === 401 && YKAN_USER) { location.reload(); return { success: false }; } // sessione scaduta: torna alla pagina di accesso
             const result = await res.json();
-            const silentActions = ['get_data', 'gemini_analyze', 'claude_execute', 'claude_status', 'list_themes', 'burndown_data', 'loose_ends', 'link_session', 'session_state', 'github_repo_status', 'bridge_list', 'bridge_pair_code', 'memory_review_get', 'memory_snapshot_save', 'memory_proposal_state', 'memory_proposals_save'];
+            const silentActions = ['get_data', 'gemini_analyze', 'claude_execute', 'claude_status', 'list_themes', 'burndown_data', 'loose_ends', 'link_session', 'session_state', 'github_repo_status', 'bridge_list', 'bridge_pair_code', 'memory_review_get', 'memory_snapshot_save', 'memory_proposal_state', 'memory_proposals_save', 'claude_news'];
             if (result.success) {
                 if (!silentActions.includes(action)) {
                     toast('Salvato', 'success');
@@ -7966,6 +8017,62 @@ $dataJson = json_encode(ykanPublicData($data));
         document.querySelectorAll('#claudeView .dash-tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
         claudeRenderBody();
         if (name === 'context' && !ctxState.inv) ctxLoad();
+        if (name === 'news' && !newsState.data && !newsState.busy) newsLoad();
+    }
+
+    // === NOVITÀ: repo GitHub più stellati del periodo (skill, plugin, MCP) + release di Claude Code ===
+    const newsState = { days: 30, kind: 'all', data: null, err: '', busy: false };
+
+    async function newsLoad(refresh) {
+        newsState.busy = true; newsState.err = ''; claudeRenderBody();
+        const r = await api('claude_news', { days: newsState.days, kind: newsState.kind, refresh: !!refresh });
+        newsState.busy = false;
+        if (r.success) newsState.data = r; else { newsState.data = null; newsState.err = r.error || 'Errore'; }
+        claudeRenderBody();
+    }
+
+    function newsSet(key, val) { newsState[key] = key === 'days' ? +val : val; newsLoad(); }
+
+    // comando d'installazione suggerito dai topic del repo; null se non si capisce cosa sia
+    function newsInstallCmd(r) {
+        const t = r.topics.join(' ');
+        if (/claude-code-plugin|claude-plugin|marketplace/.test(t)) return '/plugin marketplace add ' + r.name;
+        if (/skill/.test(t)) return 'git clone https://github.com/' + r.name + ' ~/.claude/skills/' + r.name.split('/')[1];
+        return null;
+    }
+
+    function newsCopy(btn, text) {
+        navigator.clipboard.writeText(text).then(() => toast('📋 Copiato', 'success'), () => toast('❌ Copia non riuscita', 'error'));
+    }
+
+    function newsHtml() {
+        const sel = (key, opts) => `<select onchange="newsSet('${key}', this.value)" style="width:auto;padding:2px 4px">${opts.map(([v, l]) => `<option value="${v}"${String(newsState[key]) === String(v) ? ' selected' : ''}>${l}</option>`).join('')}</select>`;
+        let html = `<div class="dash-row" style="flex-wrap:wrap;margin-bottom:10px">
+            ${sel('kind', [['all', 'Tutto Claude Code'], ['skills', 'Skill'], ['plugins', 'Plugin'], ['mcp', 'Server MCP']])}
+            ${sel('days', [[7, 'Ultimi 7 giorni'], [30, 'Ultimi 30 giorni'], [90, 'Ultimi 90 giorni']])}
+            <span style="flex:1"></span>
+            ${newsState.data ? `<span class="dash-sub">aggiornato ${new Date(newsState.data.fetched).toLocaleString('it-IT')}</span>` : ''}
+            <button class="btn" onclick="newsLoad(true)"${newsState.busy ? ' disabled' : ''}>↻ Ricarica da GitHub</button></div>`;
+        if (newsState.busy && !newsState.data) return html + '<div class="dash-empty">Carico da GitHub…</div>';
+        if (newsState.err) return html + `<div class="dash-empty">❌ ${escHtml(newsState.err)}</div>`;
+        if (!newsState.data) return html;
+        const d = newsState.data;
+        html += '<div class="dash-h">Più stellati creati dal ' + new Date(d.since).toLocaleDateString('it-IT') + '</div>';
+        html += d.repos.length ? d.repos.map(r => {
+            const cmd = newsInstallCmd(r);
+            return `<div class="dash-item" style="border-left-color:var(--accent)">
+                <div class="dash-row"><a href="${escHtml(r.url)}" target="_blank" rel="noopener"><b>${escHtml(r.name)}</b></a>
+                <span style="flex:1"></span><span style="white-space:nowrap">★ ${r.stars.toLocaleString('it-IT')}</span></div>
+                <div class="dash-sub">${escHtml(r.desc)}</div>
+                <div class="dash-sub">${escHtml(r.lang || '—')} · creato ${new Date(r.created).toLocaleDateString('it-IT')}${r.topics.slice(0, 5).map(t => ` <span class="git-tag">${escHtml(t)}</span>`).join('')}</div>
+                ${cmd ? `<div class="dash-row" style="margin-top:6px"><code style="font-size:11px;overflow-x:auto;white-space:nowrap;min-width:0;flex:1">${escHtml(cmd)}</code>
+                    <button class="btn" data-cmd="${escHtml(cmd)}" onclick="newsCopy(this, this.dataset.cmd)">Copia</button></div>` : ''}
+            </div>`;
+        }).join('') : '<div class="dash-empty">Nessun repo trovato nel periodo.</div>';
+        html += '<div class="dash-h">Release di Claude Code</div>';
+        html += d.releases.map(r => `<details class="dash-item" style="border-left-color:var(--text2)"><summary><a href="${escHtml(r.url)}" target="_blank" rel="noopener"><b>${escHtml(r.tag)}</b></a> <span class="dash-sub">${new Date(r.date).toLocaleDateString('it-IT')}</span></summary>
+            <div class="dash-sub" style="white-space:pre-wrap">${escHtml(r.body)}</div></details>`).join('') || '<div class="dash-empty">Nessuna release.</div>';
+        return html;
     }
 
     // === CONTEXT MANAGER: cosa entra in ogni sessione (plugin, skill, MCP, CLAUDE.md) e interruttori ===
@@ -8268,6 +8375,8 @@ $dataJson = json_encode(ykanPublicData($data));
             routines: (boardData.routines || []).length || '' };
         if (claudeTabName === 'context') {
             body.innerHTML = ctxRender();
+        } else if (claudeTabName === 'news') {
+            body.innerHTML = newsHtml();
         } else if (claudeTabName === 'skills') {
             if (claudeSkills === null) body.innerHTML = '<div class="dash-empty">Bridge locale non raggiungibile: avvialo per vedere le skill installate.</div>';
             else if (!claudeSkills.length) body.innerHTML = '<div class="dash-empty">Nessuna skill trovata in ~/.claude/skills.</div>';
