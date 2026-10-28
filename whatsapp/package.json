@@ -1,0 +1,16 @@
+{
+  "name": "ykan-whatsapp-bot",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Bot WhatsApp come dispositivo collegato: risponde con Claude ai numeri in whitelist.",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "@whiskeysockets/baileys": "6.7.18",
+    "pino": "^9.0.0",
+    "qrcode-terminal": "^0.12.0"
+  }
+}
