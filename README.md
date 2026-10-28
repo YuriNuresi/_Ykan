@@ -4,7 +4,7 @@
 
 A lightweight, self-contained Kanban board that runs from a single PHP file. Perfect for developers who want a simple, fast, and AI-enhanced project management tool without complex setups.
 
-![Version](https://img.shields.io/badge/version-2.0.0-blue)
+![Version](https://img.shields.io/badge/version-2.1.0-blue)
 ![PHP](https://img.shields.io/badge/PHP-8.2+-purple)
 ![License](https://img.shields.io/badge/license-MIT-green)
 [![Demo](https://img.shields.io/badge/demo-live-brightgreen)](https://portale3d.it/projects/_Ykan/demo.php)
@@ -156,6 +156,13 @@ POST ?api=github_commits     # Get GitHub commits
 ---
 
 ## Changelog
+
+### v2.1.0 (October 2026)
+- WhatsApp on the PC: the Bridge links as a WhatsApp device (QR code) and Claude Code answers whitelisted numbers; WhatsApp page in the Claude panel
+- Chat with Ykan from your own WhatsApp chat: board cards via `mcp.php`, project files with `#progetto`, `#comandi` for the list; no shell, no .env
+- Novità page: most-starred repos and Claude Code releases
+- Bridge 0.9.0: profiles (several accounts, folders chosen on the PC) and self-update from the tray or the board
+- `mcp.php` accepts a linked PC (Bridge) token with board tools only, also via the `X-Ykan-Key` header
 
 ### v2.0.0 (October 2026)
 - New layout: left sidebar in Claude Desktop style, Kanban and Dashboard pages with the same header and geometry, sidebar follows custom themes

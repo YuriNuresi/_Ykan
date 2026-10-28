@@ -1,5 +1,5 @@
 # Ykan Bridge nella tray di Windows: avvia il Bridge (node bridge-server.js) nascosto e mette
-# un'icona vicino all'orologio con il menu Riavvia / Termina / Apri log. Icona verde = attivo,
+# un'icona vicino all'orologio con il menu Aggiorna / Riavvia / Termina / Apri log. Icona verde = attivo,
 # rossa = fermo. Nessuna dipendenza: solo PowerShell + WinForms, gia' presenti in Windows.
 # Lanciato da autostart-hidden.vbs (o a mano: powershell -STA -File tray.ps1).
 # NB: script volutamente solo ASCII (PowerShell 5.1 legge i file senza BOM come ANSI).
@@ -67,9 +67,11 @@ function Start-Bridge {
     Free-Port
     # Nel pacchetto scaricato c'e' ykan-bridge.exe; nella cartella sorgente si usa node
     $exe = Join-Path $here 'ykan-bridge.exe'
-    if (Test-Path $exe) { $file = $exe; $argList = @() } else { $file = 'node'; $argList = @('bridge-server.js') }
-    $script:node = Start-Process -FilePath $file -ArgumentList $argList -WorkingDirectory $here `
-        -WindowStyle Hidden -PassThru -RedirectStandardOutput $logOut -RedirectStandardError $logErr
+    # -ArgumentList vuoto fa fallire Start-Process in PowerShell 5.1: si passa solo se serve
+    $sp = @{ WorkingDirectory = $here; WindowStyle = 'Hidden'; PassThru = $true
+             RedirectStandardOutput = $logOut; RedirectStandardError = $logErr }
+    if (Test-Path $exe) { $sp.FilePath = $exe } else { $sp.FilePath = 'node'; $sp.ArgumentList = @('bridge-server.js') }
+    $script:node = Start-Process @sp
     $script:wasRunning = $true
     Update-State
 }
@@ -85,6 +87,7 @@ $menu = New-Object System.Windows.Forms.ContextMenuStrip
 $miStatus = $menu.Items.Add('Ykan Bridge')
 $miStatus.Enabled = $false
 [void]$menu.Items.Add('-')
+$miUpdate = $menu.Items.Add('Cerca aggiornamenti')
 $miRestart = $menu.Items.Add('Riavvia')
 $miLog = $menu.Items.Add('Apri log')
 [void]$menu.Items.Add('-')
@@ -92,6 +95,30 @@ $miExit = $menu.Items.Add('Termina')
 
 $miRestart.add_Click({ Stop-Bridge; Start-Sleep -Milliseconds 400; Start-Bridge })
 $miLog.add_Click({ if (Test-Path $logOut) { Start-Process notepad.exe $logOut } })
+
+# Aggiornamento: chiede al Bridge (si presenta come la board, l'unica origine ammessa)
+$boardOrigin = @{ Origin = 'https://ykan.portale3d.it' }
+function Get-UpdateInfo {
+    try { return Invoke-RestMethod -Uri "http://127.0.0.1:$port/update" -Headers $boardOrigin -TimeoutSec 3 } catch { return $null }
+}
+$menu.add_Opening({
+    $u = Get-UpdateInfo
+    if ($u -and $u.available) { $miUpdate.Text = "Aggiorna alla $($u.latest)" }
+    elseif ($u) { $miUpdate.Text = "Cerca aggiornamenti (hai la $($u.current))" }
+    else { $miUpdate.Text = 'Cerca aggiornamenti' }
+})
+$miUpdate.add_Click({
+    try {
+        $r = Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:$port/update" -Headers $boardOrigin -ContentType 'application/json' -Body '{}' -TimeoutSec 600
+        if ($r.ok) { $ni.ShowBalloonTip(5000, 'Ykan Bridge', "Aggiornamento alla $($r.to) in corso: il Bridge si riavvia da solo.", 'Info') }
+        else { $ni.ShowBalloonTip(4000, 'Ykan Bridge', [string]$r.message, 'Info') }
+    } catch {
+        $msg = $_.ErrorDetails.Message
+        try { $msg = ($msg | ConvertFrom-Json).error } catch { }
+        if (-not $msg) { $msg = $_.Exception.Message }
+        [System.Windows.Forms.MessageBox]::Show("Aggiornamento non riuscito: $msg", 'Ykan Bridge') | Out-Null
+    }
+})
 $miExit.add_Click({
     Stop-Bridge
     $timer.Stop()

@@ -143,7 +143,9 @@ if ($method === 'GET' && !isset($_GET['mcp'])) {
 // ---- Auth gate ----------------------------------------------------------------
 function mcp_provided_secret(): string {
     if (isset($_GET['k'])) return (string)$_GET['k'];
-    $hdr = $_SERVER['HTTP_AUTHORIZATION'] ?? '';
+    // OVH toglie l'header Authorization: il Bridge manda la chiave in X-Ykan-Key
+    if (!empty($_SERVER['HTTP_X_YKAN_KEY'])) return (string)$_SERVER['HTTP_X_YKAN_KEY'];
+    $hdr = $_SERVER['HTTP_AUTHORIZATION'] ?? $_SERVER['REDIRECT_HTTP_AUTHORIZATION'] ?? '';
     if (stripos($hdr, 'Bearer ') === 0) return trim(substr($hdr, 7));
     return '';
 }
@@ -161,7 +163,15 @@ function mcp_resolve_user(string $key): ?int {
     $st = ykanDb()->prepare('SELECT user_id FROM ykan_mcp_keys WHERE key_hash = ?');
     $st->execute([hash('sha256', $key)]);
     $uid = $st->fetchColumn();
-    return $uid === false ? null : (int)$uid;
+    if ($uid !== false) return (int)$uid;
+    // Token di un PC collegato (Bridge): solo gli strumenti della board, anche per il proprietario.
+    // Lo usa la console WhatsApp del Bridge, cosi' non serve una chiave in piu'.
+    $st = ykanDb()->prepare('SELECT user_id FROM ykan_bridges WHERE token_hash = ?');
+    $st->execute([hash('sha256', $key)]);
+    $uid = $st->fetchColumn();
+    if ($uid === false) return null;
+    $GLOBALS['mcpBoardOnly'] = true;
+    return (int)$uid;
 }
 
 $__uid = mcp_resolve_user(mcp_provided_secret());
@@ -690,7 +700,7 @@ function mcp_activity(string $text, bool $ok = true): void {
 }
 
 function mcp_run_tool(string $name, array $a): string {
-    if (!ykanIsOwner() && !in_array($name, MCP_USER_TOOLS, true)) {
+    if ((!ykanIsOwner() || !empty($GLOBALS['mcpBoardOnly'])) && !in_array($name, MCP_USER_TOOLS, true)) {
         throw new McpError("Tool '{$name}' disponibile solo al proprietario di questo Ykan.");
     }
     $data = mcp_load();
@@ -1313,7 +1323,7 @@ function mcp_handle(array $msg): ?array {
 
         case 'tools/list':
             $defs = mcp_tool_defs();
-            if (!ykanIsOwner()) $defs = array_values(array_filter($defs, fn($t) => in_array($t['name'], MCP_USER_TOOLS, true)));
+            if (!ykanIsOwner() || !empty($GLOBALS['mcpBoardOnly'])) $defs = array_values(array_filter($defs, fn($t) => in_array($t['name'], MCP_USER_TOOLS, true)));
             return mcp_result($id, ['tools' => $defs]);
 
         case 'tools/call':

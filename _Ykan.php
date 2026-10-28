@@ -334,6 +334,18 @@ function ykanBridgeList(int $uid): array {
     }, $st->fetchAll(PDO::FETCH_ASSOC));
 }
 
+// Versione del pacchetto in downloads/: letta dal package.json dentro lo zip, cosi' non puo' mai
+// annunciare una versione diversa da quella che si scarica davvero.
+function ykanBridgeZipVersion(): string {
+    $zipFile = __DIR__ . '/downloads/ykan-bridge-windows.zip';
+    if (!is_file($zipFile) || !class_exists('ZipArchive')) return '';
+    $zip = new ZipArchive();
+    if ($zip->open($zipFile) !== true) return '';
+    $pkg = json_decode((string)$zip->getFromName('ykan-bridge/package.json'), true);
+    $zip->close();
+    return is_array($pkg) ? (string)($pkg['version'] ?? '') : '';
+}
+
 function ykanBridgeEndpoint(): never {
     header('Content-Type: application/json');
     $reply = function (int $code, array $body): never {
@@ -403,7 +415,18 @@ function ykanBridgeEndpoint(): never {
     if ($route === 'heartbeat') {
         $pdo->prepare('UPDATE ykan_bridges SET last_seen = NOW(), os = ?, version = ? WHERE id = ?')
             ->execute([mb_substr((string)($in['os'] ?? ''), 0, 40), mb_substr((string)($in['version'] ?? ''), 0, 20), (int)$bridge['id']]);
-        $reply(200, ['success' => true, 'name' => $bridge['name']]);
+        $reply(200, ['success' => true, 'name' => $bridge['name'], 'latest' => ykanBridgeZipVersion()]);
+    }
+    // Aggiornamento automatico: lo zip del Bridge, solo ai PC collegati (la cartella downloads non e' pubblica)
+    if ($route === 'update_download') {
+        $zip = __DIR__ . '/downloads/ykan-bridge-windows.zip';
+        if (!is_file($zip)) $reply(404, ['success' => false, 'error' => 'Nessun pacchetto del Bridge sul server.']);
+        @set_time_limit(600);
+        header('Content-Type: application/zip');
+        header('Content-Length: ' . filesize($zip));
+        header('Content-Disposition: attachment; filename="ykan-bridge-windows.zip"');
+        readfile($zip);
+        exit;
     }
     $reply(404, ['success' => false, 'error' => 'Chiamata sconosciuta.']);
 }
@@ -632,6 +655,27 @@ function saveData(array $data): bool {
         return $st->execute([ykanCurrentUserId(), json_encode($data, JSON_UNESCAPED_UNICODE)]);
     }
     return file_put_contents(DATA_FILE, json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE)) !== false;
+}
+
+// === BIGLIETTI PER IL BRIDGE ===
+// Il Bridge del PC risponde solo agli account che ha collegato (profili, vedi profileFor in
+// bridge-server.js): la board gli manda un biglietto per ogni PC dell'account, valido 24 ore.
+// firma = HMAC-SHA256(chiave = hash del token del PC, "bridgeId.userId.scadenza"): il server ha
+// l'hash, il Bridge il token, nessun segreto nuovo.
+function ykanBridgeTickets(int $uid): string {
+    if (ykanStorageMode() !== 'mysql' || !($pdo = ykanDb())) return '';
+    try {
+        $st = $pdo->prepare('SELECT id, token_hash FROM ykan_bridges WHERE user_id = ?');
+        $st->execute([$uid]);
+        $rows = $st->fetchAll(PDO::FETCH_ASSOC);
+    } catch (Throwable $e) { return ''; }
+    $exp = time() + 86400;
+    $out = [];
+    foreach ($rows as $b) {
+        $msg = $b['id'] . '.' . $uid . '.' . $exp;
+        $out[] = $msg . '.' . hash_hmac('sha256', $msg, $b['token_hash']);
+    }
+    return implode(',', $out);
 }
 
 // === REGISTRO ATTIVITÀ ESTERNE ===
@@ -1235,6 +1279,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['api'])) {
     // Archivio dati: rispondono anche quando MySQL non è raggiungibile, per poterlo sistemare.
     if ($action === 'storage_info') {
         echo json_encode(ykanStorageInfo());
+        exit;
+    }
+    if ($action === 'bridge_tickets') {
+        echo json_encode(['success' => true, 'ticket' => ykanBridgeTickets(ykanCurrentUserId())]);
         exit;
     }
     // Console: attività di Claude (MCP) e dei Bridge dopo l'id "after" (0 = le ultime 30).
@@ -2541,6 +2589,56 @@ PROMPT;
                 $stats['avg_velocity'] = count($archivedByDay) > 0 ? round(array_sum($archivedByDay) / count($archivedByDay), 1) : 0;
 
                 return ['success' => true, 'stats' => $stats];
+            })(),
+
+            // Novità Claude Code: repo più stellati del periodo + release ufficiali (cache 3h, token GitHub opzionale)
+            'claude_news' => (function() use ($data, $input) {
+                $days = in_array((int)($input['days'] ?? 30), [7, 30, 90], true) ? (int)$input['days'] : 30;
+                $kinds = [
+                    'all'     => 'claude-code',
+                    'skills'  => 'topic:claude-skills',
+                    'plugins' => 'topic:claude-code-plugin',
+                    'mcp'     => 'mcp-server claude',
+                ];
+                $kind = isset($kinds[$input['kind'] ?? '']) ? $input['kind'] : 'all';
+                $since = date('Y-m-d', time() - $days * 86400);
+                $cache = sys_get_temp_dir() . '/ykan_claude_news_' . md5($kind . $since) . '.json';
+                if (empty($input['refresh']) && is_file($cache) && filemtime($cache) > time() - 10800) {
+                    $hit = json_decode((string)file_get_contents($cache), true);
+                    if (is_array($hit)) return $hit + ['cached' => true];
+                }
+                $token = ykanGithubToken($data);
+                $gh = function (string $url) use ($token): array {
+                    $h = ["Accept: application/vnd.github+json", "User-Agent: _Ykan-Kanban", "X-GitHub-Api-Version: 2022-11-28"];
+                    if ($token) $h[] = "Authorization: Bearer {$token}";
+                    $ch = curl_init($url);
+                    curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_HTTPHEADER => $h, CURLOPT_TIMEOUT => 15]);
+                    $res = curl_exec($ch);
+                    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                    curl_close($ch);
+                    $j = json_decode((string)$res, true);
+                    if ($code !== 200) throw new RuntimeException('GitHub API: ' . ($j['message'] ?? "HTTP {$code}"));
+                    return $j;
+                };
+                try {
+                    $q = $kinds[$kind] . " created:>{$since} fork:false";
+                    $search = $gh('https://api.github.com/search/repositories?' . http_build_query(['q' => $q, 'sort' => 'stars', 'order' => 'desc', 'per_page' => 30]));
+                    $rels = $gh('https://api.github.com/repos/anthropics/claude-code/releases?per_page=8');
+                } catch (Throwable $e) {
+                    return ['success' => false, 'error' => $e->getMessage()];
+                }
+                $repos = array_map(fn($r) => [
+                    'name' => $r['full_name'], 'url' => $r['html_url'], 'desc' => (string)($r['description'] ?? ''),
+                    'stars' => (int)$r['stargazers_count'], 'lang' => (string)($r['language'] ?? ''),
+                    'created' => substr($r['created_at'], 0, 10), 'topics' => $r['topics'] ?? [],
+                ], $search['items'] ?? []);
+                $releases = array_map(fn($r) => [
+                    'tag' => $r['tag_name'], 'url' => $r['html_url'], 'date' => substr((string)$r['published_at'], 0, 10),
+                    'body' => mb_substr((string)($r['body'] ?? ''), 0, 1500),
+                ], is_array($rels) ? $rels : []);
+                $out = ['success' => true, 'repos' => $repos, 'releases' => $releases, 'since' => $since, 'fetched' => date('c')];
+                @file_put_contents($cache, json_encode($out));
+                return $out;
             })(),
 
             // GitHub API - List Issues
@@ -3991,8 +4089,11 @@ $dataJson = json_encode(ykanPublicData($data));
         .con-line { display: flex; gap: 8px; white-space: pre-wrap; word-break: break-word; }
         .con-t { color: var(--text2); flex-shrink: 0; }
         .lvl-error { color: #ef4444; } .lvl-warn { color: #d97706; } .lvl-net { color: #3b82f6; } .lvl-ext { color: #c96442; }
-        .con-who { flex-shrink: 0; width: 1.6em; text-align: center; }
-        .ib { display: inline-block; width: 1.25em; height: 1.25em; vertical-align: -0.28em; background: currentColor;
+        .con-who { flex-shrink: 0; width: 1.6em; text-align: center; cursor: help; }
+        .con-line.who-you { color: #8b5cf6; } .con-line.who-bridge { color: #16a34a; } .con-line.who-claude { color: #c96442; } .con-line.who-web { color: #3b82f6; }
+        .con-line.who-you.lvl-error, .con-line.who-bridge.lvl-error, .con-line.who-claude.lvl-error, .con-line.who-web.lvl-error { color: #ef4444; }
+        .con-line .ib { background: currentColor; }
+        .ib { display: inline-block; width: 1.25em; height: 1.25em; vertical-align: -0.28em; background: #16a34a;
             -webkit-mask: var(--ib) center / contain no-repeat; mask: var(--ib) center / contain no-repeat;
             --ib: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M2 17h20M3 17V8M21 17V8M3 8q9 9 18 0M7.5 12.3V17M12 13.6V17M16.5 12.3V17'/%3E%3C/svg%3E"); } .lvl-debug { color: var(--text2); }
         .con-list.hide-net .lvl-net, .con-list.hide-ext .lvl-ext, .con-list.hide-warn .lvl-warn, .con-list.hide-error .lvl-error,
@@ -4097,8 +4198,12 @@ $dataJson = json_encode(ykanPublicData($data));
         .side-group { display: flex; flex-direction: column; gap: 2px; margin: 10px 0; padding: 10px 0; border-block: 1px solid color-mix(in srgb, var(--header-text) 10%, transparent); }
         .side-group button { display: flex; align-items: center; gap: 6px; }
         .side-group .dash-count { margin-left: auto; background: color-mix(in srgb, var(--header-text) 10%, transparent); color: inherit; }
-        body:not([data-view="dashboard"]) .side-group button.active { background: none; opacity: .72; font-weight: inherit; }
-        body[data-view="dashboard"] .side-group button.active .dash-count { background: var(--accent); color: #fff; }
+        .side-sub { margin: 2px 0 6px; padding: 0 0 0 14px; border: 0; }
+        .side-sub button { font-size: 13px; padding-top: 5px; padding-bottom: 5px; }
+        body:not([data-view="dashboard"]) .side-sub[data-for="dashboard"], body:not([data-view="claude"]) .side-sub[data-for="claude"],
+        body:not([data-view="settings"]) .side-sub[data-for="settings"] { display: none; }
+        .side-sub button.active .dash-count { background: var(--accent); color: #fff; }
+        #claudeView > .dash-tabs, #settingsView > .dash-tabs { display: none; }
         .view-tabs > button, .side-group button { width: 100%; }
         .dash-legendrow { border-bottom: 0; min-height: 0; margin-bottom: 10px; }
         .dash-legendrow .dash-legend { margin-left: 0; }
@@ -4139,9 +4244,9 @@ $dataJson = json_encode(ykanPublicData($data));
         <h1 id="projectName" onclick="openConfigModal()"><?= htmlspecialchars($data['config']['project_name'] ?? 'My Project') ?></h1>
         <nav class="view-tabs">
             <button id="tabKanban" class="active" onclick="showView('kanban')">🗂️ Kanban</button>
-            <button id="tabDash" onclick="showView('dashboard')" hidden>Dashboard</button>
-            <!-- Le schede della Dashboard sono pagine del menu (stessa vista, scheda diversa) -->
-            <div id="dashTabs" class="side-group">
+            <!-- Menu ad albero: ogni sezione ha le sue pagine, aperte solo quando la sezione è attiva -->
+            <button id="tabDash" class="side-head" onclick="showView('dashboard')">📁 Progetti</button>
+            <div id="dashTabs" class="side-group side-sub" data-for="dashboard">
                 <button data-tab="focus" onclick="dashTab('focus')">🎯 Focus <span class="dash-count"></span></button>
                 <button data-tab="resume" onclick="dashTab('resume')">⏸️ Da riprendere <span class="dash-count"></span></button>
                 <button data-tab="week" onclick="dashTab('week')">📅 Attività <span class="dash-count"></span></button>
@@ -4149,8 +4254,28 @@ $dataJson = json_encode(ykanPublicData($data));
                 <button data-tab="git" onclick="dashTab('git')">🌿 Git <span class="dash-count"></span></button>
                 <button data-tab="graphify" onclick="dashTab('graphify')">🕸️ Graphify <span class="dash-count"></span></button>
             </div>
-            <button id="tabSettings" onclick="showView('settings')">⚙️ Settings</button>
-            <button id="tabClaude" onclick="showView('claude')">🤖 Claude</button>
+            <button id="tabClaude" class="side-head" onclick="showView('claude')">🤖 Claude</button>
+            <div id="claudeNav" class="side-group side-sub" data-for="claude">
+                <button data-tab="skills" onclick="claudeNav('skills')">Skills <span class="dash-count"></span></button>
+                <button data-tab="plugins" onclick="claudeNav('plugins')">Plugin <span class="dash-count"></span></button>
+                <button data-tab="memory" onclick="claudeNav('memory')">Memoria <span class="dash-count"></span></button>
+                <button data-tab="routines" onclick="claudeNav('routines')">Routine <span class="dash-count"></span></button>
+                <button data-tab="context" onclick="claudeNav('context')">Contesto <span class="dash-count"></span></button>
+                <button data-tab="rc" onclick="claudeNav('rc')">Remote Control <span class="dash-count"></span></button>
+            <button data-tab="news" onclick="showView('claude');claudeTab('news')">Novità <span class="dash-count"></span></button>
+            <button data-tab="wa" onclick="showView('claude');claudeTab('wa')">WhatsApp <span class="dash-count"></span></button>
+            </div>
+            <button id="tabSettings" class="side-head" onclick="showView('settings')">⚙️ Settings</button>
+            <div id="settingsNav" class="side-group side-sub" data-for="settings">
+                <button data-tab="generale" onclick="settingsNav('generale')">Generale</button>
+                <button data-tab="progetti" onclick="settingsNav('progetti')">Progetti</button>
+                <button data-tab="account" onclick="settingsNav('account')">Account</button>
+                <button data-tab="bridge" onclick="settingsNav('bridge')">Bridge</button>
+                <button data-tab="claude-code" onclick="settingsNav('claude-code')">Claude Code</button>
+                <button data-tab="github" onclick="settingsNav('github')">GitHub</button>
+                <button data-tab="aspetto" onclick="settingsNav('aspetto')">Aspetto</button>
+                <button data-tab="strumenti" onclick="settingsNav('strumenti')">Strumenti</button>
+            </div>
         </nav>
         <div class="header-actions">
             <div class="bridge-wrap" id="bridgeWrap" style="display:none">
@@ -4463,7 +4588,7 @@ $dataJson = json_encode(ykanPublicData($data));
     <!-- Settings: tutte le configurazioni/setup dell'app, divise a schede -->
     <section id="settingsView" class="dash-view">
         <div class="dash-toolbar">
-            <h2>Settings</h2>
+            <h2 id="settingsTitle">Generale</h2>
         </div>
         <div class="dash-tabs">
             <button data-tab="generale" class="active" onclick="settingsTab('generale')">Generale</button>
@@ -4497,30 +4622,11 @@ $dataJson = json_encode(ykanPublicData($data));
                     <div id="labelsManager"></div>
                     <button type="button" class="btn" onclick="addLabel()" style="margin-top:8px">+ Add Label</button>
                 </div>
-                <div class="form-group" id="bridgesGroup" style="display:none">
-                    <label><i class="ib"></i> PC collegati (Bridge)</label>
-                    <small style="color:var(--text2);display:block;margin-bottom:6px">Ogni PC con il Bridge acceso si collega al tuo account: poi dall'header scegli su quale PC lavorare, anche da un altro computer.</small>
-                    <div id="bridgesManager"></div>
-                    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">
-                        <button type="button" class="btn" id="bridgeLinkHereBtn" onclick="linkThisPc()">🖥 Collega questo PC</button>
-                        <button type="button" class="btn" onclick="pairCodeOtherPc()">🔢 Codice per un altro PC</button>
-                    </div>
-                    <div id="bridgePairBox" style="display:none;margin-top:8px;font-size:13px"></div>
+                <div class="form-group">
+                    <label>Gemini API Key</label>
+                    <input type="password" id="configGeminiKey" placeholder="Enter your API key...">
                 </div>
-                <div class="form-group" id="accountGroup" style="display:none">
-                    <label>Account</label>
-                    <div style="display:flex;gap:10px;align-items:center">
-                        <img id="accountAvatar" alt="" referrerpolicy="no-referrer" style="width:28px;height:28px;border-radius:50%">
-                        <span id="accountLabel" style="flex:1"></span>
-                        <a class="btn" href="?auth=logout">Esci</a>
-                    </div>
-                </div>
-                <div class="form-group" id="mcpKeyGroup" style="display:none">
-                    <label>Connettore MCP personale</label>
-                    <small style="color:var(--text2);display:block;margin-bottom:6px">Per gestire la tua board da claude.ai o dall'app Claude: Settings → Connectors → Add custom connector, incolla l'indirizzo. Rigenerarlo disattiva quello vecchio.</small>
-                    <button type="button" class="btn" onclick="createMcpKey()">🔑 Genera indirizzo del connettore</button>
-                    <input type="text" id="mcpKeyUrl" readonly style="display:none;margin-top:8px;width:100%" onclick="this.select()">
-                </div>
+                <button type="button" class="btn" onclick="testGeminiKey()">🧪 Verifica chiave</button>
                 <div class="form-group" id="storageGroup">
                     <label>Archivio dati</label>
                     <div id="storageStatus" style="font-size:13px;color:var(--text2);margin-bottom:8px">…</div>
@@ -4535,12 +4641,22 @@ $dataJson = json_encode(ykanPublicData($data));
                 </div>
             </div>
 
-            <div class="settings-panel" data-panel="api-ai" style="display:none">
-                <div class="form-group">
-                    <label>Gemini API Key</label>
-                    <input type="password" id="configGeminiKey" placeholder="Enter your API key...">
+            <div class="settings-panel" data-panel="account" style="display:none">
+                <div class="form-group" id="accountGroup" style="display:none">
+                    <label>Account</label>
+                    <div style="display:flex;gap:10px;align-items:center">
+                        <img id="accountAvatar" alt="" referrerpolicy="no-referrer" style="width:28px;height:28px;border-radius:50%">
+                        <span id="accountLabel" style="flex:1"></span>
+                        <a class="btn" href="?auth=logout">Esci</a>
+                    </div>
                 </div>
-                <button type="button" class="btn" onclick="testGeminiKey()">🧪 Verifica chiave</button>
+                <div class="form-group" id="mcpKeyGroup" style="display:none">
+                    <label>Connettore MCP personale</label>
+                    <small style="color:var(--text2);display:block;margin-bottom:6px">Per gestire la tua board da claude.ai o dall'app Claude: Settings → Connectors → Add custom connector, incolla l'indirizzo. Rigenerarlo disattiva quello vecchio.</small>
+                    <button type="button" class="btn" onclick="createMcpKey()">🔑 Genera indirizzo del connettore</button>
+                    <input type="text" id="mcpKeyUrl" readonly style="display:none;margin-top:8px;width:100%" onclick="this.select()">
+                </div>
+                <div class="form-group" id="accountNoLogin" style="display:none;color:var(--text2);font-size:13px">Questa board gira senza login Google (archivio su file o MySQL senza Google): non c'è un account da gestire.</div>
             </div>
 
             <div class="settings-panel" data-panel="claude-code" style="display:none">
@@ -4612,6 +4728,54 @@ $dataJson = json_encode(ykanPublicData($data));
         </div>
 
         <?php $ykanDl = ykanDownloads(); $dlSize = fn($b) => $b < 1048576 ? max(1, round($b / 1024)) . ' KB' : number_format($b / 1048576, 1, ',', '') . ' MB'; ?>
+        <div class="settings-panel tools-panel" data-panel="bridge" style="display:none;max-width:720px">
+                <div class="form-group" id="bridgesGroup">
+                    <label><i class="ib"></i> PC collegati (Bridge)</label>
+                    <small style="color:var(--text2);display:block;margin-bottom:6px">Ogni PC con il Bridge acceso si collega al tuo account: poi dall'header scegli su quale PC lavorare, anche da un altro computer.</small>
+                    <div id="bridgesManager"></div>
+                    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">
+                        <button type="button" class="btn" id="bridgeLinkHereBtn" onclick="linkThisPc()">🖥 Collega questo PC</button>
+                        <button type="button" class="btn" onclick="pairCodeOtherPc()">🔢 Codice per un altro PC</button>
+                    </div>
+                    <div id="bridgePairBox" style="display:none;margin-top:8px;font-size:13px"></div>
+                </div>
+                <div class="form-group" id="bridgeNoLogin" style="display:none;color:var(--text2);font-size:13px">I PC collegati servono con il login Google (board online): qui il Bridge si usa solo su questo computer.</div>
+                <div class="form-group">
+                    <label>Profili e cartelle di questo PC</label>
+                    <small style="color:var(--text2);display:block;margin-bottom:6px">Quali account Ykan usano il Bridge di questo computer e quali cartelle vede ciascuno. Si cambia solo da qui, sul PC: la pagina la apre il Bridge.</small>
+                    <a class="btn" href="http://127.0.0.1:51820/profiles" target="_blank" rel="noopener"><i class="ib"></i> Apri profili e cartelle</a>
+                </div>
+            <div class="tool-card">
+                <div class="tool-head">
+                    <div>
+                        <h3><i class="ib"></i> Ykan Bridge per Windows</h3>
+                        <small>Programma che gira sul tuo PC e collega la board a Claude Code.</small>
+                    </div>
+                    <?php if ($ykanDl['bridge']): ?>
+                        <a class="btn btn-primary" href="?download=bridge">⬇ Scarica</a>
+                    <?php else: ?>
+                        <span class="tool-missing">Non ancora pubblicato</span>
+                    <?php endif; ?>
+                </div>
+                <?php if ($ykanDl['bridge']): ?>
+                    <div class="tool-meta"><?= htmlspecialchars($ykanDl['bridge']['name']) ?> · <?= $dlSize($ykanDl['bridge']['size']) ?> · aggiornato il <?= $ykanDl['bridge']['date'] ?></div>
+                <?php endif; ?>
+                <p>Serve per i pulsanti <b>▶️ PLAY</b> e <b>Riprendi</b> (terminale nella board), per il pannello <b>🤖 Claude</b> (skill e memoria) e per lavorare su questo PC anche da un altro computer.</p>
+                <p class="tool-req">Richiede Windows 64 bit e <a href="https://docs.anthropic.com/it/docs/claude-code/overview" target="_blank" rel="noopener">Claude Code</a> installato (comando <code>claude</code>).</p>
+                <h4>Istruzioni d'uso</h4>
+                <ol>
+                    <li>Scarica lo zip e fai <b>tasto destro → Estrai tutto</b> in una cartella che non cancellerai, ad esempio <code>Documenti\Ykan Bridge</code>.</li>
+                    <li>Apri la cartella estratta e fai doppio clic su <code>ykan-bridge.exe</code>.<br>
+                        Se Windows mostra "PC protetto da Windows" clicca <b>Ulteriori informazioni → Esegui comunque</b>: il programma non è firmato, non è un virus.</li>
+                    <li>Si apre una finestra nera: è il Bridge acceso. <b>Lasciala aperta</b> (anche ridotta a icona) mentre usi Ykan.</li>
+                    <li>Torna qui in <a href="#" onclick="settingsTab('bridge');return false">Bridge → PC collegati</a> e clicca <b>🖥 Collega questo PC</b>. Da un altro computer usa invece <b>🔢 Codice per un altro PC</b>.</li>
+                </ol>
+                <p class="tool-note">Non spostare <code>ykan-bridge.exe</code> fuori dalla sua cartella: la cartella <code>node_modules</code> deve stargli accanto. Il Bridge accetta connessioni solo da questo PC (<code>127.0.0.1:51820</code>).<br>
+                    <b>Aggiornare:</b> chiudi la finestra del Bridge, scarica il nuovo zip ed estrailo sopra la vecchia cartella sostituendo i file, poi riavvialo.</p>
+            </div>
+
+        </div>
+
         <div class="settings-panel tools-panel" data-panel="strumenti" style="display:none;max-width:720px">
             <div class="tool-card">
                 <div class="tool-head">
@@ -4636,7 +4800,7 @@ $dataJson = json_encode(ykanPublicData($data));
                     <li>Apri la cartella estratta e fai doppio clic su <code>ykan-bridge.exe</code>.<br>
                         Se Windows mostra "PC protetto da Windows" clicca <b>Ulteriori informazioni → Esegui comunque</b>: il programma non è firmato, non è un virus.</li>
                     <li>Si apre una finestra nera: è il Bridge acceso. <b>Lasciala aperta</b> (anche ridotta a icona) mentre usi Ykan.</li>
-                    <li>Torna qui in <a href="#" onclick="settingsTab('generale');return false">Generale → PC collegati</a> e clicca <b>🖥 Collega questo PC</b>. Da un altro computer usa invece <b>🔢 Codice per un altro PC</b>.</li>
+                    <li>Torna qui in <a href="#" onclick="settingsTab('bridge');return false">Bridge → PC collegati</a> e clicca <b>🖥 Collega questo PC</b>. Da un altro computer usa invece <b>🔢 Codice per un altro PC</b>.</li>
                 </ol>
                 <p class="tool-note">Non spostare <code>ykan-bridge.exe</code> fuori dalla sua cartella: la cartella <code>node_modules</code> deve stargli accanto. Il Bridge accetta connessioni solo da questo PC (<code>127.0.0.1:51820</code>).<br>
                     <b>Aggiornare:</b> chiudi la finestra del Bridge, scarica il nuovo zip ed estrailo sopra la vecchia cartella sostituendo i file, poi riavvialo.</p>
@@ -4677,7 +4841,7 @@ $dataJson = json_encode(ykanPublicData($data));
          dal Bridge locale (~/.claude/skills, ~/.claude/projects/*/memory) -->
     <section id="claudeView" class="dash-view">
         <div class="dash-toolbar">
-            <h2>🤖 Claude</h2>
+            <h2 id="claudeTitle">Skills</h2>
             <span id="claudeBridge" class="dash-bridge"></span>
             <span style="flex:1"></span>
             <label style="font-size:12px;color:var(--text2)">Progetto
@@ -4689,6 +4853,8 @@ $dataJson = json_encode(ykanPublicData($data));
             <button data-tab="plugins" onclick="claudeTab('plugins')">Plugin <span class="dash-count"></span></button>
             <button data-tab="memory" onclick="claudeTab('memory')">Memoria <span class="dash-count"></span></button>
             <button data-tab="rc" onclick="claudeTab('rc')">Remote Control <span class="dash-count"></span></button>
+            <button data-tab="news" onclick="showView('claude');claudeTab('news')">Novità <span class="dash-count"></span></button>
+            <button data-tab="wa" onclick="showView('claude');claudeTab('wa')">WhatsApp <span class="dash-count"></span></button>
             <button data-tab="routines" onclick="claudeTab('routines')">Routine <span class="dash-count"></span></button>
             <button data-tab="context" onclick="claudeTab('context')">Contesto <span class="dash-count"></span></button>
         </div>
@@ -4861,8 +5027,9 @@ $dataJson = json_encode(ykanPublicData($data));
     // segreti (key/token/secret/password) vengono oscurati.
     const ykanLog = { entries: [], max: 1000, listeners: [] };
     // who = chi ha fatto l'azione: 'you' (tu dalla board), 'bridge', 'claude', 'web' (il browser verso altri siti)
-    function ykanLogAdd(level, text, who, t) {
-        const e = { t: t || new Date(), level, text: String(text).slice(0, 2000), who: who || '' };
+    // title: chi esattamente (es. "Bridge di PC casa (via server)"), va nel tooltip dell'icona
+    function ykanLogAdd(level, text, who, t, title) {
+        const e = { t: t || new Date(), level, text: String(text).slice(0, 2000), who: who || '', title: title || '' };
         ykanLog.entries.push(e);
         if (ykanLog.entries.length > ykanLog.max) ykanLog.entries.shift();
         ykanLog.listeners.forEach(fn => { try { fn(e); } catch (_) {} });
@@ -4932,7 +5099,7 @@ $dataJson = json_encode(ykanPublicData($data));
             const u = new URL(path, 'http://x');
             const txt = BRIDGE_TXT[u.pathname] || (/^\/claude\/context\//.test(u.pathname) ? 'ottimizza il contesto di Claude' : 'chiama ' + u.pathname);
             const proj = projectOf(u.searchParams.get('dir') || '');
-            return who + ' · ' + txt + (proj ? ' di ' + proj : '');
+            return [txt + (proj ? ' di ' + proj : ''), who];
         };
         const describe = (url, body) => {
             const api = url.match(/^\?api=([\w-]+)/);
@@ -4944,12 +5111,12 @@ $dataJson = json_encode(ykanPublicData($data));
                         return bridgeTxt(b.path, 'Bridge di ' + (pc ? pc.name : 'un altro PC') + ' (via server)');
                     } catch (_) {}
                 }
-                return 'Server Ykan · ' + (API_TXT[api[1]] || api[1]);
+                return [API_TXT[api[1]] || api[1], 'tu → Server Ykan'];
             }
             const bu = late(() => BRIDGE_URL);
             if (bu && url.startsWith(bu)) return bridgeTxt(url.slice(bu.length), 'Bridge (questo PC)');
-            try { const u = new URL(url, location.href); if (u.origin !== location.origin) return 'Browser → ' + u.host + ' · ' + u.pathname.slice(0, 60); } catch (_) {}
-            return url.replace(location.origin, '').slice(0, 80);
+            try { const u = new URL(url, location.href); if (u.origin !== location.origin) return [u.host + ' · ' + u.pathname.slice(0, 60), 'il browser verso ' + u.host]; } catch (_) {}
+            return [url.replace(location.origin, '').slice(0, 80), 'tu'];
         };
         const whoOf = url => {
             if (/^\?api=bridge_relay/.test(url)) return 'bridge';
@@ -4964,20 +5131,26 @@ $dataJson = json_encode(ykanPublicData($data));
             const url = typeof input === 'string' ? input : ((input && input.url) || String(input));
             if (/^\?api=activity_feed/.test(url)) return origFetch(input, init); // il feed stesso non si registra
             const who = whoOf(url);
+            const bt = late(() => BRIDGE_URL);
+            if (bt && url.startsWith(bt) && window.ykanBridgeTicket) {
+                const h = new Headers((init && init.headers) || {});
+                h.set('X-Ykan-Ticket', window.ykanBridgeTicket);
+                init = Object.assign({}, init, { headers: h });
+            }
             const method = ((init && init.method) || (input && input.method) || 'GET').toUpperCase();
             const body = init && typeof init.body === 'string' ? init.body : '';
-            const what = describe(url, body);
+            const [what, title] = describe(url, body);
             let label = what + (method !== 'GET' ? ' (' + method + ')' : '');
             if (body && body !== '{}' && !/^\?api=bridge_relay/.test(url)) {
                 try { label += ' ' + JSON.stringify(JSON.parse(body), redact).slice(0, 160); } catch (_) {}
             }
-            ykanLogAdd('net', '→ ' + label, who);
+            ykanLogAdd('net', '→ ' + label, who, null, title);
             const t0 = performance.now();
             return origFetch(input, init).then(res => {
-                ykanLogAdd(res.ok ? 'net' : 'error', '← ' + res.status + ' ' + what + ' (' + Math.round(performance.now() - t0) + ' ms)', who);
+                ykanLogAdd(res.ok ? 'net' : 'error', '← ' + res.status + ' ' + what + ' (' + Math.round(performance.now() - t0) + ' ms)', who, null, title);
                 return res;
             }, err => {
-                ykanLogAdd('error', '✖ ' + what + ': ' + (err && err.message || err), who);
+                ykanLogAdd('error', '✖ ' + what + ': ' + (err && err.message || err), who, null, title);
                 throw err;
             });
         };
@@ -4993,7 +5166,7 @@ $dataJson = json_encode(ykanPublicData($data));
             (j.items || []).forEach(it => {
                 actAfter = Math.max(actAfter, Number(it.id));
                 const w = ACT_WHO[it.actor] || ['', it.actor];
-                ykanLogAdd(Number(it.ok) ? 'ext' : 'error', w[1] + ' · ' + it.text, w[0], new Date(Number(it.ts) * 1000));
+                ykanLogAdd(Number(it.ok) ? 'ext' : 'error', it.text, w[0], new Date(Number(it.ts) * 1000), w[1]);
             });
         } catch (_) {}
     }
@@ -5025,7 +5198,7 @@ $dataJson = json_encode(ykanPublicData($data));
             });
             if (res.status === 401 && YKAN_USER) { location.reload(); return { success: false }; } // sessione scaduta: torna alla pagina di accesso
             const result = await res.json();
-            const silentActions = ['get_data', 'gemini_analyze', 'claude_execute', 'claude_status', 'list_themes', 'burndown_data', 'loose_ends', 'link_session', 'session_state', 'github_repo_status', 'bridge_list', 'bridge_pair_code', 'memory_review_get', 'memory_snapshot_save', 'memory_proposal_state', 'memory_proposals_save'];
+            const silentActions = ['get_data', 'gemini_analyze', 'claude_execute', 'claude_status', 'list_themes', 'burndown_data', 'loose_ends', 'link_session', 'session_state', 'github_repo_status', 'bridge_list', 'bridge_pair_code', 'memory_review_get', 'memory_snapshot_save', 'memory_proposal_state', 'memory_proposals_save', 'claude_news'];
             if (result.success) {
                 if (!silentActions.includes(action)) {
                     toast('Salvato', 'success');
@@ -5632,7 +5805,8 @@ $dataJson = json_encode(ykanPublicData($data));
         dashSyncFilterUi();
         dashGit = null;
         const bridge = document.getElementById('dashBridge');
-        const lanes = boardData.swimlanes.filter(l => l.local_path);
+        // Con un progetto scelto nel filtro si leggono dal Bridge solo le sue sessioni
+        const lanes = boardData.swimlanes.filter(l => l.local_path && dashInProject(l.name));
         const sess = { ok: false, anyLane: lanes.length > 0, byLane: {} };
         const reviewsP = fetchReviews();
         const res = await api('loose_ends', { stale_days: dashStaleDays, recent_days: dashDays });
@@ -6063,7 +6237,7 @@ $dataJson = json_encode(ykanPublicData($data));
     // Progressivo come le sessioni: Focus e Git si aggiornano a ogni repository letto,
     // poi arriva lo stato GitHub (issue/PR) per tutti insieme.
     async function dashGitLoad() {
-        const lanes = boardData.swimlanes.filter(l => l.local_path);
+        const lanes = boardData.swimlanes.filter(l => l.local_path && dashInProject(l.name));
         const g = dashGit = { byLane: {}, ok: false, anyLane: lanes.length > 0, gh: {}, hasToken: false, asked: false,
             loading: lanes.length ? 'repository dal Bridge…' : '' };
         dashRenderSoon();
@@ -6079,7 +6253,7 @@ $dataJson = json_encode(ykanPublicData($data));
             dashRenderSoon();
         }));
         if (dashGit !== g) return;
-        const repos = [...new Set(boardData.swimlanes.map(l => dashGitRepoOf(l, g.byLane[l.id])).filter(Boolean))];
+        const repos = [...new Set(boardData.swimlanes.filter(l => dashInProject(l.name)).map(l => dashGitRepoOf(l, g.byLane[l.id])).filter(Boolean))];
         if (repos.length) {
             g.loading = 'stato GitHub (issue e PR)…';
             dashRenderSoon();
@@ -6873,6 +7047,12 @@ $dataJson = json_encode(ykanPublicData($data));
 
     // === SESSIONS (local Claude Code session history, read-only via local Bridge) ===
     const BRIDGE_URL = 'http://127.0.0.1:51820';
+    // Biglietti per il Bridge (vedi ykanBridgeTickets): si rinnovano ogni 6 ore e dopo un collegamento.
+    window.ykanBridgeTicket = <?= json_encode(!empty($GLOBALS['ykanUser']) ? ykanBridgeTickets(ykanCurrentUserId()) : '') ?>;
+    async function refreshBridgeTicket() {
+        try { const r = await api('bridge_tickets'); if (r && r.success) window.ykanBridgeTicket = r.ticket; } catch (_) {}
+    }
+    if (window.ykanBridgeTicket) setInterval(refreshBridgeTicket, 6 * 3600 * 1000);
 
     // Tutte le chiamate al Bridge passano da qui. "Questo computer" → 127.0.0.1 come sempre;
     // un PC collegato → relay della board online (?api=bridge_relay), che risponde con lo stato e
@@ -6959,10 +7139,13 @@ $dataJson = json_encode(ykanPublicData($data));
         const label = document.getElementById('bridgeChipLabel');
         const chip = document.getElementById('bridgeChip');
         if (bridgeTarget === 'local') {
-            const up = !!ykanLocalLink && !ykanLocalLink.outdated;
+            const up = !!ykanLocalLink && !ykanLocalLink.outdated && ykanLocalLink.mine !== false;
+            const other = !!ykanLocalLink && ykanLocalLink.mine === false;
             dot.className = 'bridge-dot ' + (up ? 'on' : 'off');
-            label.textContent = 'Questo computer' + (bridgeLocalName() ? ' (' + bridgeLocalName() + ')' : '');
-            chip.title = up ? 'Bridge di questo computer attivo' : 'Bridge di questo computer non raggiungibile su 127.0.0.1:51820';
+            label.textContent = 'Questo computer' + (bridgeLocalName() ? ' (' + bridgeLocalName() + ')' : '') + (ykanLocalLink && ykanLocalLink.updateAvailable ? ' ⬆️' : '');
+            chip.title = up ? 'Bridge di questo computer attivo'
+                : other ? 'Il Bridge di questo computer è collegato a un altro account: collegalo anche al tuo da Impostazioni → PC collegati'
+                : 'Bridge di questo computer non raggiungibile su 127.0.0.1:51820';
         } else {
             const b = ykanBridges.find(x => String(x.id) === bridgeTarget);
             dot.className = 'bridge-dot ' + (b && b.online ? 'on' : 'off');
@@ -6974,15 +7157,16 @@ $dataJson = json_encode(ykanPublicData($data));
 
     function renderBridgeMenu() {
         const menu = document.getElementById('bridgeMenu');
-        const up = !!ykanLocalLink && !ykanLocalLink.outdated;
+        const up = !!ykanLocalLink && !ykanLocalLink.outdated && ykanLocalLink.mine !== false;
         const item = (id, name, on, extra) => `<button type="button" class="${bridgeTarget === id ? 'sel' : ''}" onclick="setBridgeTarget('${id}');toggleBridgeMenu()">
             <span class="bridge-dot ${on ? 'on' : 'off'}"></span><span style="flex:1">${escHtml(name)}</span><span style="color:var(--text2);font-size:12px">${extra}</span></button>`;
-        let html = item('local', 'Questo computer' + (bridgeLocalName() ? ' (' + bridgeLocalName() + ')' : ''), up, up ? 'locale' : 'spento');
+        let html = item('local', 'Questo computer' + (bridgeLocalName() ? ' (' + bridgeLocalName() + ')' : ''), up, up ? 'locale' : ykanLocalLink && ykanLocalLink.mine === false ? 'altro account' : 'spento');
         ykanBridges.filter(b => !(ykanLocalLink && ykanLocalLink.bridgeId === b.id)).forEach(b => {
             html += item(String(b.id), b.name, b.online, b.online ? 'online' : 'offline');
         });
+        if (ykanLocalLink && ykanLocalLink.updateAvailable) html += `<small>⬆️ Bridge ${escHtml(ykanLocalLink.latest)} disponibile (hai la ${escHtml(ykanLocalLink.version)}) — <a href="#" onclick="bridgeSelfUpdate();return false">Aggiorna ora</a></small>`;
         if (bridgeTarget !== 'local') html += '<small>Dashboard, sessioni e avvio in Claude Desktop lavorano su questo PC. Il terminale dal vivo e l\'analisi delle sessioni restano su "Questo computer".</small>';
-        html += `<small><a href="#" onclick="showView('settings');settingsTab('generale');toggleBridgeMenu();return false">Gestisci i PC collegati…</a></small>`;
+        html += `<small><a href="#" onclick="settingsNav('bridge');toggleBridgeMenu();return false">Gestisci i PC collegati…</a></small>`;
         menu.innerHTML = html;
     }
 
@@ -7024,13 +7208,13 @@ $dataJson = json_encode(ykanPublicData($data));
             sub.textContent = a && b ? 'CLI + API' : a ? 'CLI' : b ? 'API' : 'off';
             html = row(a, 'Claude Code CLI', st.cli.state === 'ok' ? 'via <i class="ib"></i> Bridge · ' + st.cli.note : st.cli.note)
                  + row(b, 'API Anthropic', b ? 'ANTHROPIC_KEY nel .env del server' : 'ANTHROPIC_KEY non configurata')
-                 + `<small><a href="#" onclick="showView('settings');settingsTab('claude-code');toggleStatMenu('Claude');return false">Login e impostazioni…</a></small>`;
+                 + `<small><a href="#" onclick="settingsNav('claude-code');toggleStatMenu('Claude');return false">Login e impostazioni…</a></small>`;
         } else {
             a = st.reached; b = !!st.token;
             sub.textContent = a && b ? 'locale + GitHub' : a ? 'locale' : b ? 'GitHub' : 'off';
             html = row(a, 'Git locale', a ? 'via <i class="ib"></i> Bridge · ' + st.repos + ' repo su ' + st.lanes + ' progetti collegati' : (st.lanes ? '<i class="ib"></i> Bridge non raggiungibile' : 'nessun progetto con cartella locale'))
                  + row(b, 'GitHub', b ? 'token da ' + st.token + (st.repo ? ' · repo ' + st.repo : '') : 'token non configurato')
-                 + `<small><a href="#" onclick="showView('settings');settingsTab('github');toggleStatMenu('Git');return false">Impostazioni GitHub…</a></small>`;
+                 + `<small><a href="#" onclick="settingsNav('github');toggleStatMenu('Git');return false">Impostazioni GitHub…</a></small>`;
         }
         dot.className = 'bridge-dot ' + (a && b ? 'on' : a || b ? 'mid' : 'off');
         document.getElementById('stat' + kind + 'Menu').innerHTML = html;
@@ -7051,6 +7235,19 @@ $dataJson = json_encode(ykanPublicData($data));
     document.addEventListener('click', e => {
         document.querySelectorAll('.stat-wrap .bridge-menu.open').forEach(m => { if (!m.parentElement.contains(e.target)) m.classList.remove('open'); });
     });
+
+    async function bridgeSelfUpdate() {
+        toggleBridgeMenu();
+        toast('⬆️ Scarico l\'aggiornamento del Bridge…', 'success');
+        try {
+            const res = await fetch(BRIDGE_URL + '/update', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+            const j = await res.json();
+            if (!res.ok) throw new Error(j.error || 'HTTP ' + res.status);
+            if (!j.ok) { toast(j.message || 'Nessun aggiornamento', 'success'); return; }
+            toast('✅ Aggiornamento alla ' + j.to + ' in corso: il Bridge si riavvia da solo', 'success');
+            setTimeout(refreshBridges, 20000);
+        } catch (e) { toast('❌ ' + e.message, 'error'); }
+    }
 
     function toggleBridgeMenu(ev) {
         if (ev) ev.stopPropagation();
@@ -7075,7 +7272,8 @@ $dataJson = json_encode(ykanPublicData($data));
         const btn = document.getElementById('bridgeLinkHereBtn');
         if (!ykanLocalLink) { btn.disabled = true; btn.title = 'Il Bridge di questo computer non risponde: avvialo e riprova'; }
         else if (ykanLocalLink.outdated) { btn.disabled = true; btn.title = 'Il Bridge di questo computer è troppo vecchio: aggiornalo (serve la 0.2.0)'; }
-        else { btn.disabled = false; btn.title = here ? 'Questo PC è già collegato: ricollegarlo lo registra di nuovo' : ''; }
+        else { btn.disabled = false; btn.title = here ? 'Questo PC è già collegato: ricollegarlo lo registra di nuovo'
+            : ykanLocalLink.mine === false ? 'Il Bridge è collegato a un altro account: collegandolo aggiungi il tuo, con le cartelle che sceglierai dal PC' : ''; }
     }
 
     async function linkThisPc() {
@@ -7087,7 +7285,10 @@ $dataJson = json_encode(ykanPublicData($data));
             const res = await fetch(BRIDGE_URL + '/link', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code: r.code, name }) });
             const j = await res.json();
             if (!res.ok) throw new Error(j.error || 'errore ' + res.status);
-            toast('Collegato: ' + j.name, 'success');
+            await refreshBridgeTicket();
+            toast(j.folders && !j.folders.length
+                ? 'Collegato: ' + j.name + '. Ora scegli sul PC le cartelle permesse: icona del Bridge nella tray → Profili e cartelle'
+                : 'Collegato: ' + j.name, 'success');
         } catch (e) {
             toast('Collegamento non riuscito: ' + e.message, 'error');
         }
@@ -7287,14 +7488,15 @@ $dataJson = json_encode(ykanPublicData($data));
             return;
         }
         let wsUrl = 'ws://127.0.0.1:51820/pty?dir=' + encodeURIComponent(lane.local_path);
+        if (window.ykanBridgeTicket) wsUrl += '&ticket=' + encodeURIComponent(window.ykanBridgeTicket);
         if (context.launch) wsUrl += '&launch=' + encodeURIComponent(context.launch);
         if (context.prompt) wsUrl += '&prompt=' + encodeURIComponent(context.prompt);
         if (context.sessionId) wsUrl += '&sessionId=' + encodeURIComponent(context.sessionId);
         const socket = new WebSocket(wsUrl);
         sess.socket = socket;
-        ykanLogAdd('net', 'Terminale: connessione a ' + lane.name + (context.launch ? ' (' + context.launch + ')' : ''));
+        ykanLogAdd('net', 'Terminale: connessione a ' + lane.name + (context.launch ? ' (' + context.launch + ')' : ''), 'bridge');
         socket.onopen = () => {
-            ykanLogAdd('net', 'Terminale aperto: ' + lane.name);
+            ykanLogAdd('net', 'Terminale aperto: ' + lane.name, 'bridge');
             fitAddon.fit();
             socket.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
         };
@@ -7303,9 +7505,9 @@ $dataJson = json_encode(ykanPublicData($data));
             if (msg.type === 'data') term.write(msg.data);
             else if (msg.type === 'exit') { term.writeln('\r\n[processo terminato, codice ' + msg.code + ']'); tabEl.classList.add('dead'); }
         };
-        socket.onclose = () => ykanLogAdd('net', 'Terminale chiuso: ' + lane.name);
+        socket.onclose = () => ykanLogAdd('net', 'Terminale chiuso: ' + lane.name, 'bridge');
         socket.onerror = () => {
-            ykanLogAdd('error', 'Terminale: Bridge locale non raggiungibile su ws://127.0.0.1:51820');
+            ykanLogAdd('error', 'Terminale: Bridge locale non raggiungibile su ws://127.0.0.1:51820', 'bridge');
             term.writeln('\r\nBridge locale non raggiungibile su ws://127.0.0.1:51820. Avvialo con: node bridge/bridge-server.js');
         };
 
@@ -7412,7 +7614,8 @@ $dataJson = json_encode(ykanPublicData($data));
 
     // Console: mostra ykanLog (log del browser + richieste). Lo scroll segue le righe nuove solo
     // se eri già in fondo; il badge rosso sulla scheda conta gli errori arrivati mentre era nascosta.
-    const CON_WHO = { you: ['👤', 'tu, dalla board'], bridge: [BRIDGE_ICO, 'Bridge'], claude: ['🤖', 'Claude'], web: ['🌐', 'il browser verso un altro sito'] };
+    // Ogni "personaggio" ha icona e colore suo: tu viola, Bridge verde, Claude arancio, altri siti blu
+    const CON_WHO = { you: ['👤', 'tu → Server Ykan'], bridge: ['<i class="ib"></i>', 'Bridge'], claude: ['🤖', 'Claude'], web: ['🌐', 'il browser verso un altro sito'] };
     function termBuildConsole(spec) {
         const pane = spec.paneEl;
         pane.classList.add('con');
@@ -7433,14 +7636,14 @@ $dataJson = json_encode(ykanPublicData($data));
         const addLine = e => {
             const nearEnd = list.scrollHeight - list.scrollTop - list.clientHeight < 40;
             const row = document.createElement('div');
-            row.className = 'con-line lvl-' + e.level;
+            row.className = 'con-line lvl-' + e.level + (e.who ? ' who-' + e.who : '');
             const t = document.createElement('span');
             t.className = 'con-t';
             t.textContent = e.t.toLocaleTimeString('it-IT') + '.' + String(e.t.getMilliseconds()).padStart(3, '0');
             const w = document.createElement('span');
             w.className = 'con-who';
             const who = CON_WHO[e.who];
-            if (who) { w.innerHTML = who[0]; w.title = who[1]; }
+            if (who) { w.innerHTML = who[0]; w.title = e.title || who[1]; }
             const m = document.createElement('span');
             m.textContent = e.text;
             row.append(t, w, m);
@@ -8212,7 +8415,10 @@ $dataJson = json_encode(ykanPublicData($data));
     let settingsTabName = (() => { try { return localStorage.getItem('ykan_settings_tab') || 'generale'; } catch (_) { return 'generale'; } })();
 
     function settingsTab(name) {
+        if (name === 'api-ai') name = 'generale'; // la chiave Gemini ora sta in Generale
         settingsTabName = name;
+        document.querySelectorAll('#settingsNav button').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
+        document.getElementById('settingsTitle').textContent = sideNavTitle('settingsNav', name) || 'Settings';
         try { localStorage.setItem('ykan_settings_tab', name); } catch (_) {}
         document.querySelectorAll('#settingsView .dash-tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
         document.querySelectorAll('#settingsView .settings-panel').forEach(p => p.style.display = p.dataset.panel === name ? 'block' : 'none');
@@ -8304,8 +8510,10 @@ $dataJson = json_encode(ykanPublicData($data));
         settingsTab(settingsTabName);
         document.getElementById('storageGroup').style.display = YKAN_OWNER ? '' : 'none';
         if (YKAN_OWNER) loadStorageInfo(false);
+        document.getElementById('bridgesGroup').style.display = YKAN_USER ? 'block' : 'none';
+        document.getElementById('bridgeNoLogin').style.display = YKAN_USER ? 'none' : 'block';
+        document.getElementById('accountNoLogin').style.display = YKAN_USER ? 'none' : 'block';
         if (YKAN_USER) {
-            document.getElementById('bridgesGroup').style.display = 'block';
             refreshBridges();
             document.getElementById('mcpKeyGroup').style.display = 'block';
             document.getElementById('accountGroup').style.display = 'block';
@@ -8378,12 +8586,191 @@ $dataJson = json_encode(ykanPublicData($data));
     let claudeTabName = 'skills';
     const claudeExpanded = new Set(); // chiavi "skill|id" o "mem|laneId|file" con contenuto già mostrato
 
+    // Voce del menu laterale: apre la pagina Claude (se serve) sulla scheda scelta
+    function claudeNav(name) {
+        if (document.body.dataset.view !== 'claude') { claudeTabName = name; showView('claude'); } else claudeTab(name);
+    }
+    function settingsNav(name) {
+        settingsTabName = name;
+        if (document.body.dataset.view !== 'settings') showView('settings'); else settingsTab(name);
+    }
+    const sideNavTitle = (navId, name) => {
+        const b = document.querySelector(`#${navId} button[data-tab="${name}"]`);
+        return b ? [...b.childNodes].filter(n => n.nodeType === 3).map(n => n.textContent).join('').trim() : '';
+    };
     function claudeTab(name) {
         claudeTabName = name;
+        document.querySelectorAll('#claudeNav button').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
+        document.getElementById('claudeTitle').textContent = sideNavTitle('claudeNav', name) || 'Claude';
         if (name === 'rc') rcFetch();
         document.querySelectorAll('#claudeView .dash-tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
         claudeRenderBody();
         if (name === 'context' && !ctxState.inv) ctxLoad();
+        if (name === 'news' && !newsState.data && !newsState.busy) newsLoad();
+        if (name === 'wa') waLoad(); else clearTimeout(waState.timer);
+    }
+
+    // === WHATSAPP: collegamento, whitelist e chat del bot che risponde con Claude (tutto via Bridge) ===
+    const waState = { info: undefined, chats: [], open: '', chat: null, timer: 0, busy: false };
+    const WA_STATES = { off: ['⚪', 'Non collegato'], connecting: ['🟡', 'Connessione in corso…'], qr: ['📱', 'Inquadra il QR code'], open: ['🟢', 'Collegato'] };
+
+    async function waLoad() {
+        clearTimeout(waState.timer);
+        try {
+            waState.info = await ctxCall('/whatsapp');
+            waState.chats = (await ctxCall('/whatsapp/chats')).chats || [];
+            if (waState.open) waState.chat = await ctxCall('/whatsapp/chat?num=' + encodeURIComponent(waState.open));
+        } catch (e) { waState.info = /not found|404/i.test(e.message) ? 'old' : { error: e.message }; }
+        if (claudeTabName !== 'wa') return;
+        if (!document.getElementById('waStatus')) claudeRenderBody();
+        else waRefresh();
+        const st = waState.info && waState.info.status;
+        waState.timer = setTimeout(waLoad, st === 'qr' || st === 'connecting' ? 3000 : 10000);
+    }
+
+    function waStatusHtml() {
+        const i = waState.info;
+        const [icon, label] = WA_STATES[i.status] || ['⚪', i.status];
+        let html = `<div class="dash-row" style="flex-wrap:wrap"><b>${icon} ${label}</b>${i.me ? ` <span class="dash-sub">come +${escHtml(i.me)}</span>` : ''}<span style="flex:1"></span>`;
+        if (i.status === 'off') html += `<button class="btn btn-primary" onclick="waAction('/whatsapp/connect')">📱 Collega nuovo dispositivo</button>`;
+        if (i.status === 'open' || i.status === 'qr' || i.status === 'connecting') html += `<button class="btn" onclick="waAction('/whatsapp/disconnect')">Ferma</button>`;
+        if (i.status === 'open') html += `<button class="btn" onclick="waAction('/whatsapp/logout', 'Scollegare questo PC da WhatsApp? Per ricollegarlo servirà un nuovo QR code.')">Scollega dispositivo</button>`;
+        html += '</div>';
+        if (i.error) html += `<div class="dash-sub">⚠️ ${escHtml(i.error)}</div>`;
+        if (i.status === 'qr' && i.qr) html += `<div style="margin-top:10px;display:flex;gap:14px;align-items:center;flex-wrap:wrap">
+            <img src="${escHtml(i.qr)}" alt="QR code WhatsApp" style="width:220px;height:220px;background:#fff;padding:6px;border-radius:8px">
+            <div class="dash-sub" style="max-width:320px">Sul telefono: WhatsApp → Impostazioni → <b>Dispositivi collegati</b> → <b>Collega un dispositivo</b>, poi inquadra il codice. Si aggiorna da solo.</div></div>`;
+        return html;
+    }
+
+    function waChatsHtml() {
+        if (!waState.chats.length) return '<div class="dash-empty">Nessuna chat ancora: compariranno qui quando qualcuno in whitelist scrive.</div>';
+        return waState.chats.map(c => `<div class="dash-item clickable" style="border-left-color:${c.num === waState.open ? 'var(--accent)' : 'var(--border)'}" onclick="waOpen('${escHtml(c.num)}')">
+            <div class="dash-row"><b>${escHtml(c.name || '+' + c.num)}</b><span style="flex:1"></span><span class="dash-sub">${c.at ? new Date(c.at).toLocaleString('it-IT') : ''}</span></div>
+            <div class="dash-sub" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escHtml(c.last)}</div></div>`).join('');
+    }
+
+    function waChatHtml() {
+        const c = waState.chat;
+        if (!waState.open || !c) return '<div class="dash-empty">Scegli una chat per leggerla.</div>';
+        return `<div class="dash-h" style="margin-top:0">${escHtml(c.name || '')} +${escHtml(c.num)}</div>` + c.messages.map(m => m.role === 'note'
+            ? `<div class="dash-sub" style="text-align:center;margin:6px 0">— ${escHtml(m.text)} —</div>`
+            : `<div style="display:flex;justify-content:${m.role === 'assistant' ? 'flex-end' : 'flex-start'};margin:4px 0">
+                <div style="max-width:80%;padding:6px 10px;border-radius:10px;font-size:13px;white-space:pre-wrap;background:${m.role === 'assistant' ? 'var(--accent)' : 'var(--bg2)'};color:${m.role === 'assistant' ? '#fff' : 'inherit'};border:1px solid var(--border)">${escHtml(m.text)}
+                <div style="font-size:10px;opacity:.7;text-align:right">${m.role === 'assistant' ? '🤖 ' : ''}${new Date(m.at).toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit' })}</div></div></div>`).join('');
+    }
+
+    function waHtml() {
+        const i = waState.info;
+        if (i === undefined) return '<div class="dash-empty">Carico…</div>';
+        if (i === 'old') return '<div class="dash-empty">Aggiorna il Bridge alla 0.8.0 per usare WhatsApp (Settings → Strumenti).</div>';
+        if (!i || i.error && !i.status) return `<div class="dash-empty">Bridge locale non raggiungibile${i && i.error ? ': ' + escHtml(i.error) : ''}. WhatsApp gira sul PC con il Bridge.</div>`;
+        if (!i.available) return '<div class="dash-empty">Al Bridge manca la libreria WhatsApp: aggiornalo alla 0.8.0 (Settings → Strumenti).</div>';
+        const c = i.config;
+        return `<div class="dash-sub" style="margin-bottom:10px">Il PC si collega a WhatsApp come dispositivo (come WhatsApp Web) e Claude Code risponde da solo ai numeri in whitelist, dal tuo account. Claude scrive solo testo: non tocca file né comandi. Funziona finché il PC e il Bridge sono accesi.</div>
+            <div class="tool-card" id="waStatus">${waStatusHtml()}</div>
+            <div class="tool-card">
+                <label style="display:flex;gap:8px;align-items:center;font-weight:600"><input type="checkbox" id="waEnabled"${c.enabled ? ' checked' : ''} style="width:auto"> Risposte automatiche attive</label>
+                <div class="form-group" style="margin-top:10px"><label style="font-size:12px">Whitelist: un numero per riga, con prefisso internazionale (es. +39 333 1234567)</label>
+                    <textarea id="waWhitelist" rows="4">${escHtml(c.whitelist.map(n => '+' + n).join('\n'))}</textarea></div>
+                <div class="form-group"><label style="font-size:12px">Modello</label>
+                    <select id="waModel" style="width:auto">${[['haiku', 'Haiku (veloce)'], ['sonnet', 'Sonnet'], ['opus', 'Opus (più bravo, più lento)']].map(([v, l]) => `<option value="${v}"${c.model === v ? ' selected' : ''}>${l}</option>`).join('')}</select></div>
+                <div class="form-group"><label style="font-size:12px">Istruzioni per Claude (vuoto = quelle predefinite)</label>
+                    <textarea id="waPrompt" rows="5" placeholder="${escHtml(i.defaultPrompt)}">${escHtml(c.prompt)}</textarea></div>
+                <button class="btn btn-primary" onclick="waSave()">Salva</button>
+                <span class="dash-sub">Chi è in whitelist può scrivere <b>reset</b> per azzerare la conversazione.</span>
+            </div>
+            <div style="display:grid;grid-template-columns:minmax(0,1fr) minmax(0,2fr);gap:12px">
+                <div><div class="dash-h" style="margin-top:0">Chat</div><div id="waChats">${waChatsHtml()}</div></div>
+                <div id="waChat" style="min-width:0;max-height:520px;overflow-y:auto">${waChatHtml()}</div>
+            </div>`;
+    }
+
+    // Aggiorna solo stato e chat, così i campi che stai scrivendo non si cancellano
+    function waRefresh() {
+        const i = waState.info;
+        if (!i || typeof i !== 'object' || !i.available) return claudeRenderBody();
+        const set = (id, html) => { const el = document.getElementById(id); if (el) el.innerHTML = html; };
+        set('waStatus', waStatusHtml()); set('waChats', waChatsHtml()); set('waChat', waChatHtml());
+    }
+
+    async function waAction(path, ask) {
+        if (ask && !confirm(ask)) return;
+        try { waState.info = await ctxCall(path, {}); } catch (e) { toast('❌ ' + e.message, 'error'); }
+        waRefresh(); waLoad();
+    }
+
+    async function waSave() {
+        const body = { enabled: document.getElementById('waEnabled').checked, whitelist: document.getElementById('waWhitelist').value,
+            model: document.getElementById('waModel').value, prompt: document.getElementById('waPrompt').value.trim() };
+        try {
+            waState.info = await ctxCall('/whatsapp/config', body);
+            toast('✅ Salvato', 'success');
+            document.getElementById('waWhitelist').value = waState.info.config.whitelist.map(n => '+' + n).join('\n');
+        } catch (e) { toast('❌ ' + e.message, 'error'); }
+        waRefresh(); waLoad();
+    }
+
+    async function waOpen(num) {
+        waState.open = num; waState.chat = null; waRefresh();
+        try { waState.chat = await ctxCall('/whatsapp/chat?num=' + encodeURIComponent(num)); } catch (e) { toast('❌ ' + e.message, 'error'); }
+        waRefresh();
+        const el = document.getElementById('waChat'); if (el) el.scrollTop = el.scrollHeight;
+    }
+
+    // === NOVITÀ: repo GitHub più stellati del periodo (skill, plugin, MCP) + release di Claude Code ===
+    const newsState = { days: 30, kind: 'all', data: null, err: '', busy: false };
+
+    async function newsLoad(refresh) {
+        newsState.busy = true; newsState.err = ''; claudeRenderBody();
+        const r = await api('claude_news', { days: newsState.days, kind: newsState.kind, refresh: !!refresh });
+        newsState.busy = false;
+        if (r.success) newsState.data = r; else { newsState.data = null; newsState.err = r.error || 'Errore'; }
+        claudeRenderBody();
+    }
+
+    function newsSet(key, val) { newsState[key] = key === 'days' ? +val : val; newsLoad(); }
+
+    // comando d'installazione suggerito dai topic del repo; null se non si capisce cosa sia
+    function newsInstallCmd(r) {
+        const t = r.topics.join(' ');
+        if (/claude-code-plugin|claude-plugin|marketplace/.test(t)) return '/plugin marketplace add ' + r.name;
+        if (/skill/.test(t)) return 'git clone https://github.com/' + r.name + ' ~/.claude/skills/' + r.name.split('/')[1];
+        return null;
+    }
+
+    function newsCopy(btn, text) {
+        navigator.clipboard.writeText(text).then(() => toast('📋 Copiato', 'success'), () => toast('❌ Copia non riuscita', 'error'));
+    }
+
+    function newsHtml() {
+        const sel = (key, opts) => `<select onchange="newsSet('${key}', this.value)" style="width:auto;padding:2px 4px">${opts.map(([v, l]) => `<option value="${v}"${String(newsState[key]) === String(v) ? ' selected' : ''}>${l}</option>`).join('')}</select>`;
+        let html = `<div class="dash-row" style="flex-wrap:wrap;margin-bottom:10px">
+            ${sel('kind', [['all', 'Tutto Claude Code'], ['skills', 'Skill'], ['plugins', 'Plugin'], ['mcp', 'Server MCP']])}
+            ${sel('days', [[7, 'Ultimi 7 giorni'], [30, 'Ultimi 30 giorni'], [90, 'Ultimi 90 giorni']])}
+            <span style="flex:1"></span>
+            ${newsState.data ? `<span class="dash-sub">aggiornato ${new Date(newsState.data.fetched).toLocaleString('it-IT')}</span>` : ''}
+            <button class="btn" onclick="newsLoad(true)"${newsState.busy ? ' disabled' : ''}>↻ Ricarica da GitHub</button></div>`;
+        if (newsState.busy && !newsState.data) return html + '<div class="dash-empty">Carico da GitHub…</div>';
+        if (newsState.err) return html + `<div class="dash-empty">❌ ${escHtml(newsState.err)}</div>`;
+        if (!newsState.data) return html;
+        const d = newsState.data;
+        html += '<div class="dash-h">Più stellati creati dal ' + new Date(d.since).toLocaleDateString('it-IT') + '</div>';
+        html += d.repos.length ? d.repos.map(r => {
+            const cmd = newsInstallCmd(r);
+            return `<div class="dash-item" style="border-left-color:var(--accent)">
+                <div class="dash-row"><a href="${escHtml(r.url)}" target="_blank" rel="noopener"><b>${escHtml(r.name)}</b></a>
+                <span style="flex:1"></span><span style="white-space:nowrap">★ ${r.stars.toLocaleString('it-IT')}</span></div>
+                <div class="dash-sub">${escHtml(r.desc)}</div>
+                <div class="dash-sub">${escHtml(r.lang || '—')} · creato ${new Date(r.created).toLocaleDateString('it-IT')}${r.topics.slice(0, 5).map(t => ` <span class="git-tag">${escHtml(t)}</span>`).join('')}</div>
+                ${cmd ? `<div class="dash-row" style="margin-top:6px"><code style="font-size:11px;overflow-x:auto;white-space:nowrap;min-width:0;flex:1">${escHtml(cmd)}</code>
+                    <button class="btn" data-cmd="${escHtml(cmd)}" onclick="newsCopy(this, this.dataset.cmd)">Copia</button></div>` : ''}
+            </div>`;
+        }).join('') : '<div class="dash-empty">Nessun repo trovato nel periodo.</div>';
+        html += '<div class="dash-h">Release di Claude Code</div>';
+        html += d.releases.map(r => `<details class="dash-item" style="border-left-color:var(--text2)"><summary><a href="${escHtml(r.url)}" target="_blank" rel="noopener"><b>${escHtml(r.tag)}</b></a> <span class="dash-sub">${new Date(r.date).toLocaleDateString('it-IT')}</span></summary>
+            <div class="dash-sub" style="white-space:pre-wrap">${escHtml(r.body)}</div></details>`).join('') || '<div class="dash-empty">Nessuna release.</div>';
+        return html;
     }
 
     // === CONTEXT MANAGER: cosa entra in ogni sessione (plugin, skill, MCP, CLAUDE.md) e interruttori ===
@@ -8619,7 +9006,8 @@ $dataJson = json_encode(ykanPublicData($data));
             + projects.map(l => `<option value="${escHtml(l.id)}">${escHtml(l.name)}</option>`).join('');
         sel.value = prevVal && projects.some(l => l.id === prevVal) ? prevVal : '';
 
-        document.querySelectorAll('#claudeView .dash-tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === claudeTabName));
+        document.querySelectorAll('#claudeNav button').forEach(b => b.classList.toggle('active', b.dataset.tab === claudeTabName));
+        document.getElementById('claudeTitle').textContent = sideNavTitle('claudeNav', claudeTabName) || 'Claude';
         claudeRenderBody();
         await Promise.all([claudeFetchSkills(), claudeFetchMemory(), claudeFetchPlugins(), claudeTabName === 'context' ? ctxLoad() : null]);
     }
@@ -8686,6 +9074,10 @@ $dataJson = json_encode(ykanPublicData($data));
             routines: (boardData.routines || []).length || '' };
         if (claudeTabName === 'context') {
             body.innerHTML = ctxRender();
+        } else if (claudeTabName === 'news') {
+            body.innerHTML = newsHtml();
+        } else if (claudeTabName === 'wa') {
+            body.innerHTML = waHtml();
         } else if (claudeTabName === 'skills') {
             if (claudeSkills === null) body.innerHTML = '<div class="dash-empty"><i class="ib"></i> Bridge locale non raggiungibile: avvialo per vedere le skill installate.</div>';
             else if (!claudeSkills.length) body.innerHTML = '<div class="dash-empty">Nessuna skill trovata in ~/.claude/skills.</div>';
@@ -8718,7 +9110,7 @@ $dataJson = json_encode(ykanPublicData($data));
                 claudeExpanded.forEach(k => { if (k.startsWith('mem|' + laneId + '|')) memRenderFile(k); });
             }
         }
-        document.querySelectorAll('#claudeView .dash-tabs button').forEach(b => {
+        document.querySelectorAll('#claudeNav button').forEach(b => {
             if (b.dataset.tab === 'context') { b.querySelector('.dash-count').textContent = ctxState.inv ? '~' + ctxK(ctxState.inv.totalTokens) : ''; return; }
             const c = counts[b.dataset.tab] ?? '';
             b.querySelector('.dash-count').textContent = c === '' ? '' : c;
@@ -10816,6 +11208,19 @@ ${epicRows}</div>`);
     <!-- Contenuto della scheda "Changelog" del terminale (clonato da termInit) -->
     <template id="changelogTpl">
         <div class="changelog-content">
+
+            <div class="changelog-version">
+                <h3>v2.1.0 - October 2026</h3>
+                <ul>
+                    <li>💬 <strong>WhatsApp on your PC</strong> - the Bridge links as a WhatsApp device (QR code) and Claude Code answers the numbers in the whitelist with your instructions; new WhatsApp page in the Claude panel</li>
+                    <li>📲 <strong>Chat with Ykan from WhatsApp</strong> - in your own chat ("You") Claude reads the board, adds and moves cards, and with <code>#progetto</code> edits the project files; <code>#comandi</code> lists the commands; no shell, no .env</li>
+                    <li>🆕 <strong>Novità page</strong> - most-starred repos and Claude Code releases in the Claude panel</li>
+                    <li>👥 <strong>Bridge profiles</strong> - one Bridge, several Ykan accounts, each limited to the folders you choose on the PC</li>
+                    <li>⬆️ <strong>Bridge self-update</strong> - «Aggiorna» from the tray icon or the board downloads the new Bridge and restarts it</li>
+                    <li>🔑 <strong>MCP with the Bridge token</strong> - <code>mcp.php</code> accepts a linked PC token with board tools only</li>
+                    <li>🛠️ <strong>Fixes</strong> - tray icon starts <code>ykan-bridge.exe</code> again; WhatsApp reconnects after the QR scan and reads messages from the new @lid ids</li>
+                </ul>
+            </div>
 
             <div class="changelog-version">
                 <h3>v2.0.0 - October 2026</h3>

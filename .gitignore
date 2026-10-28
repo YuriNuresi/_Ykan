@@ -30,3 +30,7 @@ downloads/*.zip
 
 # Grafo di Graphify (si rigenera con /graphify)
 graphify-out/
+
+# Exe del Bridge e LEGGIMI copiati dalla build per provarli qui (si rigenerano con npm run build)
+bridge/ykan-bridge.exe
+bridge/LEGGIMI.txt
