@@ -4131,9 +4131,11 @@ $dataJson = json_encode(ykanPublicData($data));
             --header-bg: #1f1e1d; --header-text: #f5f4ee; --swimlane-bg: #2b2b29; --colhead-bg: #262624; --card-bg: #30302e;
         }
         body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; padding-left: var(--side-w); -webkit-font-smoothing: antialiased; }
+        /* Il terminale si apre solo a destra della sidebar: la sidebar resta fissa a tutta altezza */
+        .term-footer { left: var(--side-w); }
 
         /* Sidebar (ex header) */
-        .header { position: fixed; left: 0; top: 0; bottom: var(--term-h); width: var(--side-w); z-index: 400;
+        .header { position: fixed; left: 0; top: 0; bottom: 0; width: var(--side-w); z-index: 400;
             flex-direction: column; align-items: stretch; gap: 4px; padding: 14px 10px; border-bottom: 0; border-right: 1px solid color-mix(in srgb, var(--header-text) 10%, transparent); overflow-y: auto; }
         .header h1 { display: flex; align-items: center; gap: 9px; font-size: 15px; font-weight: 600; padding: 6px 8px 14px; letter-spacing: -.01em; }
         .header h1::before { content: ''; flex: none; width: 22px; height: 22px; border-radius: 6px; background: var(--accent);
