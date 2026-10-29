@@ -338,7 +338,8 @@ function linkInfo(profile) {
 // a Bridge chiuso, copia i file nuovi sopra questa cartella e lo riavvia. Solo per il pacchetto
 // con ykan-bridge.exe: chi lo usa dai sorgenti aggiorna con git.
 const INSTALL_DIR = path.dirname(process.execPath);
-const canSelfUpdate = () => isSea && process.platform === 'win32';
+// Mai nella cartella dei sorgenti (accanto a bridge-server.js): lo zip sovrascriverebbe package.json e gli script
+const canSelfUpdate = () => isSea && process.platform === 'win32' && !fs.existsSync(path.join(INSTALL_DIR, 'bridge-server.js'));
 const updateAvailable = () => !!latestVersion && compareVersions(latestVersion, BRIDGE_VERSION) > 0;
 let updating = false;
 
@@ -350,7 +351,7 @@ function updateInfo() {
 async function selfUpdate() {
     const link = readProfiles()[0];
     if (!link) throw new Error('Collega prima questo PC a Ykan (Settings → PC collegati): l\'aggiornamento si scarica dalla board.');
-    if (!canSelfUpdate()) throw new Error('Aggiornamento automatico solo per il Bridge installato con ykan-bridge.exe: dai sorgenti usa git pull e npm install.');
+    if (!canSelfUpdate()) throw new Error('Aggiornamento automatico solo per il Bridge installato dallo zip: nella cartella dei sorgenti usa npm run build e copia dist/ykan-bridge/ykan-bridge.exe.');
     if (updating) throw new Error('Aggiornamento gia\' in corso');
     updating = true;
     try {
@@ -384,8 +385,10 @@ async function selfUpdate() {
             'Start-Process wscript.exe -ArgumentList (\'"\' + (Join-Path $dest "autostart-hidden.vbs") + \'"\')',
         ].join('\r\n'));
         const { spawn } = require('child_process');
+        // Niente detached: su Windows con detached PowerShell non esegue lo script (provato). Lo script
+        // sopravvive lo stesso quando chiude questo processo: Windows non termina i figli insieme al padre.
         const child = spawn('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', script, zip, INSTALL_DIR],
-            { detached: true, stdio: 'ignore', windowsHide: true });
+            { stdio: 'ignore', windowsHide: true });
         child.unref();
         console.log('Aggiornamento a ' + (latestVersion || '?') + ' avviato: il Bridge si riavvia da solo.');
         return { ok: true, from: BRIDGE_VERSION, to: latestVersion || '' };
@@ -1443,12 +1446,14 @@ function transcriptForAI(fullPath) {
 function runClaudePrint(prompt, timeoutMs, opts = {}) {
     return new Promise((resolve, reject) => {
         const { spawn } = require('child_process');
-        const args = ['-p', '--output-format', 'json', '--model', opts.model || 'sonnet', '--tools', '', '--strict-mcp-config',
+        // opts.tools: strumenti ammessi (es. 'Read,Grep,Glob' per leggere il progetto), di default nessuno
+        const args = ['-p', '--output-format', 'json', '--model', opts.model || 'sonnet', '--tools', opts.tools || '', '--strict-mcp-config',
             '--no-session-persistence', '--disable-slash-commands'];
         if (opts.system) args.push('--system-prompt', opts.system);
         // Le analisi rispondono con JSON lunghi: limite di output alzato, se no la risposta arriva troncata
         const env = Object.assign({}, process.env, { CLAUDE_CODE_MAX_OUTPUT_TOKENS: process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS || '64000' });
-        const child = spawn(resolveClaudeBin(), args, { cwd: os.tmpdir(), windowsHide: true, env });
+        if (opts.tools) args.push('--allowedTools', opts.tools);
+        const child = spawn(resolveClaudeBin(), args, { cwd: opts.cwd || os.tmpdir(), windowsHide: true, env });
         let out = '', err = '';
         const timer = setTimeout(() => { child.kill(); reject(new Error('Timeout: l\'analisi AI ha impiegato troppo')); }, timeoutMs);
         child.stdout.on('data', d => out += d);
@@ -1850,6 +1855,9 @@ function handlePtyConnection(ws, opts) {
         // sessionId scelto dalla board: permette di sapere in anticipo a quale task appartiene la sessione
         if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(sessionId || '')) args.push('--session-id', sessionId);
         if (prompt) args.push(prompt);
+    } else if (launch === 'powershell') {
+        cmd = process.platform === 'win32' ? 'powershell.exe' : 'pwsh';
+        args = ['-NoLogo'];
     } else if (launch === 'resume' && /^[a-zA-Z0-9-]{1,64}$/.test(sessionId || '')) {
         cmd = resolveClaudeBin();
         args = ['--resume', sessionId];
@@ -1920,8 +1928,11 @@ function waConfig() {
     let c = {};
     try { c = JSON.parse(fs.readFileSync(path.join(WA_DIR, 'config.json'), 'utf8')); } catch (_) { /* primo avvio */ }
     return { enabled: !!c.enabled, whitelist: Array.isArray(c.whitelist) ? c.whitelist : [], prompt: c.prompt || '', model: c.model || 'sonnet',
-        admin: c.admin !== false };
+        prompts: c.prompts && typeof c.prompts === 'object' ? c.prompts : {}, admin: c.admin !== false };
 }
+
+// Istruzioni per un numero: le sue (prompts[num]) se ci sono, se no quelle generali, se no le predefinite
+const waPromptFor = (cfg, num) => cfg.prompts[num] || cfg.prompt || WA_DEFAULT_PROMPT;
 
 function waSaveConfig(b) {
     const c = {
@@ -1930,17 +1941,28 @@ function waSaveConfig(b) {
             .map(n => String(n).replace(/\D/g, '')).filter(n => n.length >= 6))],
         prompt: String(b.prompt || '').slice(0, 4000),
         model: ['haiku', 'sonnet', 'opus'].includes(b.model) ? b.model : 'sonnet',
+        prompts: {},
     };
+    // Istruzioni per numero (es. una demo per un cliente): chiave = numero solo cifre
+    for (const [n, t] of Object.entries(b.prompts && typeof b.prompts === 'object' ? b.prompts : {})) {
+        const num = String(n).replace(/\D/g, ''), text = String(t || '').trim().slice(0, 12000);
+        if (num.length >= 6 && text) c.prompts[num] = text;
+    }
+    // Chi ha istruzioni sue deve poter scrivere: entra in whitelist anche se lì manca
+    for (const num of Object.keys(c.prompts)) if (!c.whitelist.includes(num)) c.whitelist.push(num);
     const before = waConfig();
     c.admin = b.admin === undefined ? before.admin : !!b.admin; // la pagina non lo manda: si conserva
     fs.mkdirSync(WA_DIR, { recursive: true });
     fs.writeFileSync(path.join(WA_DIR, 'config.json'), JSON.stringify(c, null, 2));
-    // Istruzioni nuove: le chat ripartono da qui (come "reset"), se no Claude continua sul tono della conversazione vecchia
-    if (c.prompt !== before.prompt) {
+    // Istruzioni nuove: le chat ripartono da qui (come "reset"), se no Claude continua sul tono della conversazione vecchia.
+    // Solo le chat dei numeri le cui istruzioni sono davvero cambiate.
+    {
         let files = [];
         try { files = fs.readdirSync(WA_CHATS).filter(f => f.endsWith('.json')); } catch (_) { /* nessuna chat */ }
         for (const f of files) {
-            const chat = waReadChat(f.replace(/\.json$/, ''));
+            const n = f.replace(/\.json$/, '');
+            if (waPromptFor(c, n) === waPromptFor(before, n)) continue;
+            const chat = waReadChat(n);
             chat.messages.push({ role: 'note', text: 'Istruzioni cambiate', at: new Date().toISOString() });
             waWriteChat(chat);
         }
@@ -2001,7 +2023,7 @@ async function waReply(key, num, name, text) {
     await wa.sock.readMessages([key]).catch(() => {});
     await wa.sock.sendPresenceUpdate('composing', jid).catch(() => {});
     let reply;
-    try { reply = String(await runClaudePrint(prompt, 120000, { model: cfg.model, system: cfg.prompt || WA_DEFAULT_PROMPT })).trim(); }
+    try { reply = String(await runClaudePrint(prompt, 120000, { model: cfg.model, system: waPromptFor(cfg, num) })).trim(); }
     finally { await wa.sock.sendPresenceUpdate('paused', jid).catch(() => {}); }
     if (!reply) return;
     await wa.sock.sendMessage(jid, { text: reply });
@@ -2317,6 +2339,20 @@ function handleRequest(req, res, parsed) {
         return;
     }
 
+    // Apre la cartella del progetto nel file manager: Esplora risorse, Finder o xdg-open
+    if (req.method === 'POST' && parsed.pathname === '/open-folder') {
+        if (!isAllowedOrigin(origin)) return json(403, { error: 'origin non ammessa' });
+        if (!/^application\/json/.test(req.headers['content-type'] || '')) return json(415, { error: 'serve application/json' });
+        readBody(req, 10000).then(raw => {
+            const dir = String(JSON.parse(raw || '{}').dir || '');
+            if (!dir || !fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) return json(400, { error: 'cartella inesistente su questo PC: ' + (dir || '(nessuna)') });
+            const opener = process.platform === 'win32' ? 'explorer.exe' : process.platform === 'darwin' ? 'open' : 'xdg-open';
+            spawnProcess(opener, [path.resolve(dir)], { detached: true, stdio: 'ignore' }).unref();
+            json(200, { ok: true });
+        }).catch(e => json(500, { error: String((e && e.message) || e) }));
+        return;
+    }
+
     // Aggiornamento: stato (GET) e avvio (POST). Solo board ammessa (o l'icona nella tray, che si presenta come la board).
     if (req.method === 'GET' && parsed.pathname === '/update') {
         if (!isAllowedOrigin(origin)) return json(403, { error: 'origin non ammessa' });
@@ -2345,7 +2381,7 @@ function handleRequest(req, res, parsed) {
     if (req.method === 'POST' && ['/whatsapp/config', '/whatsapp/connect', '/whatsapp/disconnect', '/whatsapp/logout'].includes(parsed.pathname)) {
         if (!isAllowedOrigin(origin)) return json(403, { error: 'origin non ammessa' });
         if (!/^application\/json/.test(req.headers['content-type'] || '')) return json(415, { error: 'serve application/json' });
-        readBody(req, 20000).then(async raw => {
+        readBody(req, 200000).then(async raw => {
             const b = JSON.parse(raw || '{}');
             if (parsed.pathname === '/whatsapp/config') {
                 const c = waSaveConfig(b);
@@ -2530,6 +2566,25 @@ function handleRequest(req, res, parsed) {
             const started = Date.now();
             const j = extractJson(await runClaudePrint(prompt, 600000));
             json(200, { summary: String(j.summary || ''), proposals: Array.isArray(j.proposals) ? j.proposals : [], seconds: Math.round((Date.now() - started) / 1000) });
+        }).catch(e => json(500, { error: String((e && e.message) || e) }));
+        return;
+    }
+
+    // Pannello "Another AI" della board: una domanda a Claude Code sul progetto. Gira nella cartella
+    // del progetto con soli strumenti di lettura (Read, Grep, Glob): risponde, non tocca nessun file.
+    if (req.method === 'POST' && parsed.pathname === '/claude/ask') {
+        if (!isAllowedOrigin(origin)) return json(403, { error: 'origin non ammessa' });
+        if (!/^application\/json/.test(req.headers['content-type'] || '')) return json(415, { error: 'serve application/json' });
+        readBody(req, 1000000).then(async raw => {
+            const b = JSON.parse(raw || '{}');
+            const prompt = String(b.prompt || '');
+            if (!prompt.trim()) return json(400, { error: 'domanda vuota' });
+            const dir = b.dir ? path.resolve(String(b.dir)) : '';
+            if (dir && !fs.existsSync(dir)) return json(400, { error: 'cartella del progetto non trovata su questo PC: ' + dir });
+            const model = ['haiku', 'sonnet', 'opus'].includes(b.model) ? b.model : 'sonnet';
+            const started = Date.now();
+            const answer = await runClaudePrint(prompt, 300000, dir ? { cwd: dir, tools: 'Read,Grep,Glob', model } : { model });
+            json(200, { response: String(answer || ''), seconds: Math.round((Date.now() - started) / 1000) });
         }).catch(e => json(500, { error: String((e && e.message) || e) }));
         return;
     }

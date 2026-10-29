@@ -859,6 +859,108 @@ function ykanEnv(string $key): string {
     return (string)(ykanEnvAll()[$key] ?? '');
 }
 
+// === ANOTHER AI: connettori per le AI via API (Settings → Another AI) =========
+// config.ai = { provider, providers: { gemini|groq|openai|ollama: { api_key, model, url } } }.
+// Chiave vuota → .env (solo proprietario): GEMINI_API_KEY, GROQ_API_KEY/GROQ_API_URL,
+// OPENAI_API_KEY, OLLAMA_URL/OLLAMA_MODEL. Gemini legge anche la vecchia config.gemini_api_key.
+const YKAN_AI_PROVIDERS = [
+    'gemini' => ['name' => 'Gemini', 'model' => 'gemini-2.5-flash', 'url' => 'https://generativelanguage.googleapis.com/v1beta'],
+    'groq'   => ['name' => 'Groq', 'model' => 'openai/gpt-oss-120b', 'url' => 'https://api.groq.com/openai/v1'],
+    'openai' => ['name' => 'ChatGPT', 'model' => 'gpt-4o-mini', 'url' => 'https://api.openai.com/v1'],
+    'ollama' => ['name' => 'Ollama', 'model' => 'llama3.2', 'url' => 'http://localhost:11434'],
+];
+
+// Impostazioni effettive di un provider (config della board, poi .env, poi default) + da dove arriva la chiave
+function ykanAiSettings(array $config, string $provider): array {
+    $def = YKAN_AI_PROVIDERS[$provider];
+    $p = (array)($config['ai']['providers'][$provider] ?? []);
+    $env = strtoupper($provider);
+    $key = trim((string)($p['api_key'] ?? ''));
+    if ($key === '' && $provider === 'gemini') $key = trim((string)($config['gemini_api_key'] ?? ''));
+    $keySource = $key !== '' ? 'board' : '';
+    if ($key === '' && ($key = ykanEnv($env . '_API_KEY')) !== '') $keySource = 'env';
+    // Dal .env la chiave e l'URL (GROQ_API_URL = worker Cloudflare: Groq blocca gli IP di OVH),
+    // non il modello: GROQ_MODEL lo usano altri progetti e puo' essere dismesso. Ollama: OLLAMA_URL / OLLAMA_MODEL.
+    $ollama = $provider === 'ollama';
+    $url = trim((string)($p['url'] ?? '')) ?: ykanEnv($env . '_API_URL') ?: ($ollama ? ykanEnv('OLLAMA_URL') : '') ?: $def['url'];
+    $url = preg_replace('#/chat/completions/?$#', '', rtrim($url, '/'));
+    return [
+        'provider' => $provider, 'name' => $def['name'], 'api_key' => $key, 'key_source' => $keySource,
+        'model' => trim((string)($p['model'] ?? '')) ?: ($ollama ? ykanEnv('OLLAMA_MODEL') : '') ?: $def['model'], 'url' => $url,
+    ];
+}
+
+function ykanAiProvider(array $config, ?string $provider = null): string {
+    $provider = $provider ?: (string)($config['ai']['provider'] ?? 'gemini');
+    return isset(YKAN_AI_PROVIDERS[$provider]) ? $provider : 'gemini';
+}
+
+// Una domanda all'AI scelta. Ritorna ['success'=>true,'text'=>...] o ['success'=>false,'error'=>...]
+function ykanAiAsk(array $config, string $system, string $user, float $temperature = 0.7, int $maxTokens = 4096, int $timeout = 60, ?string $provider = null): array {
+    $s = ykanAiSettings($config, ykanAiProvider($config, $provider));
+    $name = $s['name'];
+    if ($s['provider'] === 'groq') { // piano gratuito: 8000 token al minuto tra domanda e risposta
+        $maxTokens = min($maxTokens, 3500);
+        if (mb_strlen($user) > 10000) $user = mb_substr($user, 0, 10000) . "\n[... troncato: troppo lungo per Groq ...]";
+    }
+    if ($s['provider'] !== 'ollama' && $s['api_key'] === '') return ['success' => false, 'error' => "{$name}: chiave API non configurata (Settings → Another AI)."];
+
+    $headers = ['Content-Type: application/json'];
+    if ($s['provider'] === 'gemini') {
+        $url = "{$s['url']}/models/" . rawurlencode($s['model']) . ':generateContent?key=' . rawurlencode($s['api_key']);
+        $payload = ['contents' => [['parts' => [['text' => $user]]]],
+            'generationConfig' => ['temperature' => $temperature, 'maxOutputTokens' => $maxTokens]];
+        if ($system !== '') $payload['systemInstruction'] = ['parts' => [['text' => $system]]];
+    } elseif ($s['provider'] === 'ollama') {
+        $url = "{$s['url']}/api/chat";
+        $payload = ['model' => $s['model'], 'stream' => false, 'options' => ['temperature' => $temperature, 'num_predict' => $maxTokens],
+            'messages' => array_values(array_filter([$system !== '' ? ['role' => 'system', 'content' => $system] : null, ['role' => 'user', 'content' => $user]]))];
+        if ($s['api_key'] !== '') $headers[] = 'Authorization: Bearer ' . $s['api_key'];
+    } else { // groq e openai: stessa API "chat completions"
+        $url = "{$s['url']}/chat/completions";
+        $payload = ['model' => $s['model'], 'temperature' => $temperature, 'max_tokens' => $maxTokens,
+            'messages' => array_values(array_filter([$system !== '' ? ['role' => 'system', 'content' => $system] : null, ['role' => 'user', 'content' => $user]]))];
+        $headers[] = 'Authorization: Bearer ' . $s['api_key'];
+        // gpt-oss ragiona prima di rispondere: con poco max_tokens la risposta resterebbe vuota
+        if (str_contains($s['model'], 'gpt-oss')) { $payload['reasoning_effort'] = 'low'; $payload['max_tokens'] = max($maxTokens, 1024); }
+    }
+
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_POST => true, CURLOPT_HTTPHEADER => $headers,
+        CURLOPT_POSTFIELDS => json_encode($payload), CURLOPT_TIMEOUT => $timeout, CURLOPT_CONNECTTIMEOUT => 10]);
+    $response = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $curlErr = curl_error($ch);
+    curl_close($ch);
+
+    if ($response === false) return ['success' => false, 'error' => "{$name} non raggiungibile: {$curlErr}"];
+    $result = json_decode((string)$response, true);
+    if ($httpCode !== 200) {
+        $detail = $result['error']['message'] ?? (is_string($result['error'] ?? null) ? $result['error'] : '');
+        $msg = match (true) {
+            $httpCode === 429 => 'limite di richieste raggiunto, riprova tra 1-2 minuti.',
+            in_array($httpCode, [401, 403], true) => 'chiave API non valida o senza permessi.',
+            $httpCode >= 500 => 'servizio temporaneamente non disponibile.',
+            default => 'errore ' . $httpCode . '.',
+        };
+        return ['success' => false, 'error' => "{$name}: {$msg}" . ($detail !== '' ? ' (' . mb_substr((string)$detail, 0, 200) . ')' : '')];
+    }
+    $text = match ($s['provider']) {
+        'gemini' => $result['candidates'][0]['content']['parts'][0]['text'] ?? '',
+        'ollama' => $result['message']['content'] ?? '',
+        default => $result['choices'][0]['message']['content'] ?? '',
+    };
+    return ['success' => true, 'text' => (string)$text, 'provider' => $s['provider'], 'model' => $s['model']];
+}
+
+// Estrae il primo oggetto JSON da una risposta (anche se l'AI lo avvolge in ```json ... ```)
+function ykanAiJson(string $text): ?array {
+    $text = trim(preg_replace('/^```(?:json)?\s*|\s*```$/i', '', trim($text)));
+    if (preg_match('/\{[\s\S]*\}/', $text, $m)) $text = $m[0];
+    $parsed = json_decode($text, true);
+    return is_array($parsed) ? $parsed : null;
+}
+
 // GitHub token: GITHUB_TOKEN in the server .env wins over the value saved in the board data,
 // so the secret can stay out of the data file (and out of the Settings screen).
 function ykanGithubToken(array $data): string {
@@ -1235,6 +1337,7 @@ try {
 function ykanDownloads(): array {
     $list = [
         'bridge' => 'ykan-bridge-windows.zip',
+        'bridge_mac' => 'ykan-bridge-macos-beta.zip', // bridge/build-mac.py
         'extension' => 'ykan-usage-extension.zip',
     ];
     $out = [];
@@ -2045,14 +2148,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['api'])) {
                 return ['success' => false, 'error' => "Task '{$title}' not found"];
             })(),
 
-            // Gemini
+            // Another AI (nome storico: gemini_analyze). provider facoltativo = prova di un connettore
             'gemini_analyze' => (function() use ($data, $input) {
-                $apiKey = $data['config']['gemini_api_key'] ?? '';
-                if (empty($apiKey)) {
-                    return ['success' => false, 'error' => 'Gemini API Key not configured'];
-                }
-
-                $activeCards = array_filter($data['cards'], fn($c) => !$c['archived']);
+                // lane_id (dal pannello) = solo le card di quel progetto: la board intera supera i limiti di Groq & co.
+                $laneId = (string)($input['lane_id'] ?? '');
+                // e solo i task aperti: quelli in colonne "Done/Fatto/Chiuso" non servono all'analisi e consumano token
+                $doneCols = array_column(array_filter($data['columns'], fn($c) => preg_match('/done|fatto|chius|completat/i', (string)$c['name'])), 'id');
+                $activeCards = array_filter($data['cards'], fn($c) => !$c['archived'] && !in_array($c['column_id'], $doneCols, true)
+                    && ($laneId === '' || $c['swimlane_id'] === $laneId));
                 $prompt = $input['prompt'] ?? 'analyze';
 
                 $boardSummary = "Kanban Board: " . ($data['config']['project_name'] ?? 'Project') . "\n\n";
@@ -2066,7 +2169,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['api'])) {
                     $boardSummary .= "- [{$card['priority']}] {$card['title']} (Column: {$col}, Swimlane: {$lane})";
                     if ($card['due_date']) $boardSummary .= " - Due: {$card['due_date']}";
                     $boardSummary .= "\n";
-                    if ($card['description']) $boardSummary .= "  Desc: {$card['description']}\n";
+                    if ($card['description']) $boardSummary .= "  Desc: " . mb_substr(preg_replace('/\s+/', ' ', (string)$card['description']), 0, 200) . "\n";
                 }
 
                 $lang = $data['config']['ai_language'] ?? 'en';
@@ -2076,55 +2179,30 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['api'])) {
 
                 $systemPrompt = match($prompt) {
                     'suggest_tasks' => "You are an expert Agile project manager. Analyze the Kanban board and suggest useful new tasks for the project. Be concise.{$langInstruction}",
-                    'analyze' => "You are an expert Agile project manager. Analyze the Kanban board and suggest which task to proceed with, any priorities to review, and estimated timelines. Be concise and practical.{$langInstruction}",
+                    'analyze' => "You are an expert Agile project manager. Analyze the Kanban board and suggest which task to proceed with, any priorities to review, and estimated timelines. Be concise and practical: do not list or restate all the tasks, give recommendations.{$langInstruction}",
                     'estimate' => "You are an expert Agile project manager. Analyze the tasks and provide realistic time estimates to complete them.{$langInstruction}",
                     default => "You are an assistant for Agile project management.{$langInstruction}"
                 };
 
-                $payload = [
-                    'contents' => [
-                        ['parts' => [['text' => $boardSummary . "\n\nRequest: " . ($input['custom_prompt'] ?? $prompt)]]]
-                    ],
-                    'systemInstruction' => ['parts' => [['text' => $systemPrompt]]],
-                    'generationConfig' => ['temperature' => 0.7, 'maxOutputTokens' => 8192]
-                ];
+                $r = ykanAiAsk($data['config'], $systemPrompt, $boardSummary . "\n\nRequest: " . ($input['custom_prompt'] ?? $prompt),
+                    0.7, 8192, 60, isset($input['provider']) ? (string)$input['provider'] : null);
+                if (!$r['success']) return $r;
+                return ['success' => true, 'response' => $r['text'] !== '' ? $r['text'] : 'No response', 'provider' => $r['provider'], 'model' => $r['model']];
+            })(),
 
-                $ch = curl_init("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={$apiKey}");
-                curl_setopt_array($ch, [
-                    CURLOPT_RETURNTRANSFER => true,
-                    CURLOPT_POST => true,
-                    CURLOPT_HTTPHEADER => ['Content-Type: application/json'],
-                    CURLOPT_POSTFIELDS => json_encode($payload),
-                    CURLOPT_TIMEOUT => 30
-                ]);
-
-                $response = curl_exec($ch);
-                $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-                curl_close($ch);
-
-                if ($httpCode !== 200) {
-                    $errorMsg = match($httpCode) {
-                        429 => 'Rate limit reached. Wait 1-2 minutes and try again.',
-                        401, 403 => 'API Key invalid or without permissions.',
-                        500, 502, 503 => 'Gemini service temporarily unavailable.',
-                        default => 'Gemini API error: ' . $httpCode
-                    };
-                    return ['success' => false, 'error' => $errorMsg];
+            // Stato dei connettori per Settings → Another AI (mai le chiavi del .env, solo se ci sono)
+            'ai_status' => (function() use ($data) {
+                $out = [];
+                foreach (array_keys(YKAN_AI_PROVIDERS) as $p) {
+                    $s = ykanAiSettings($data['config'], $p);
+                    $out[$p] = ['name' => $s['name'], 'key_source' => $s['key_source'], 'model' => $s['model'], 'url' => $s['url'],
+                        'default_model' => YKAN_AI_PROVIDERS[$p]['model'], 'default_url' => YKAN_AI_PROVIDERS[$p]['url']];
                 }
-
-                $result = json_decode($response, true);
-                $text = $result['candidates'][0]['content']['parts'][0]['text'] ?? 'No response';
-
-                return ['success' => true, 'response' => $text];
+                return ['success' => true, 'provider' => ykanAiProvider($data['config']), 'providers' => $out];
             })(),
 
             // Analyze Project
-            'analyze_project' => (function() use ($data) {
-                $apiKey = $data['config']['gemini_api_key'] ?? '';
-                if (empty($apiKey)) {
-                    return ['success' => false, 'error' => 'Gemini API Key not configured'];
-                }
-
+            'analyze_project' => (function() use ($data, $input) {
                 // Scan project
                 $projectData = scanProject(__DIR__);
 
@@ -2189,58 +2267,11 @@ PROMPT;
                     $systemPrompt .= "\n- Respond in {$langName}";
                 }
 
-                $payload = [
-                    'contents' => [['parts' => [['text' => $context]]]],
-                    'systemInstruction' => ['parts' => [['text' => $systemPrompt]]],
-                    'generationConfig' => ['temperature' => 0.3, 'maxOutputTokens' => 4096]
-                ];
-
-                $ch = curl_init("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={$apiKey}");
-                curl_setopt_array($ch, [
-                    CURLOPT_RETURNTRANSFER => true,
-                    CURLOPT_POST => true,
-                    CURLOPT_HTTPHEADER => ['Content-Type: application/json'],
-                    CURLOPT_POSTFIELDS => json_encode($payload),
-                    CURLOPT_TIMEOUT => 60
-                ]);
-
-                $response = curl_exec($ch);
-                $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-                curl_close($ch);
-
-                if ($httpCode !== 200) {
-                    $errorMsg = match($httpCode) {
-                        429 => 'Rate limit reached. Wait 1-2 minutes and try again.',
-                        401, 403 => 'API Key invalid or without permissions.',
-                        500, 502, 503 => 'Gemini service temporarily unavailable.',
-                        default => 'Gemini API error: ' . $httpCode
-                    };
-                    return ['success' => false, 'error' => $errorMsg];
-                }
-
-                $result = json_decode($response, true);
-                $text = $result['candidates'][0]['content']['parts'][0]['text'] ?? '';
-
-                // Clean JSON from markdown code blocks (more robust)
-                $text = trim($text);
-                $text = preg_replace('/^```json\s*/i', '', $text);
-                $text = preg_replace('/^```\s*/i', '', $text);
-                $text = preg_replace('/```\s*$/i', '', $text);
-                $text = trim($text);
-
-                // Try to extract JSON if there's extra text
-                if (preg_match('/\{[\s\S]*\}/m', $text, $matches)) {
-                    $text = $matches[0];
-                }
-
-                $parsed = json_decode($text, true);
-                if (!$parsed || json_last_error() !== JSON_ERROR_NONE) {
-                    // Return raw for debug
-                    return [
-                        'success' => false,
-                        'error' => 'Invalid response from Gemini. Try again.',
-                        'debug' => substr($result['candidates'][0]['content']['parts'][0]['text'] ?? 'empty', 0, 500)
-                    ];
+                $r = ykanAiAsk($data['config'], $systemPrompt, $context, 0.3, 4096, 60, isset($input['provider']) ? (string)$input['provider'] : null);
+                if (!$r['success']) return $r;
+                $parsed = ykanAiJson($r['text']);
+                if (!$parsed) {
+                    return ['success' => false, 'error' => 'Risposta non valida dall\'AI. Riprova.', 'debug' => substr($r['text'] ?: 'empty', 0, 500)];
                 }
 
                 return ['success' => true, 'result' => $parsed];
@@ -2248,11 +2279,6 @@ PROMPT;
 
             // Verify task with AI
             'verify_task' => (function() use ($data, $input) {
-                $apiKey = $data['config']['gemini_api_key'] ?? '';
-                if (empty($apiKey)) {
-                    return ['success' => false, 'error' => 'Gemini API Key not configured'];
-                }
-
                 $cardId = $input['card_id'] ?? '';
                 $card = null;
                 foreach ($data['cards'] as $c) {
@@ -2347,48 +2373,11 @@ PROMPT;
                     $systemPrompt .= "\n- Write analysis, evidence, and suggestion fields in {$langName}";
                 }
 
-                $payload = [
-                    'contents' => [['parts' => [['text' => $taskContext . "\n\nFILE ASSOCIATI:\n" . $filesContent]]]],
-                    'systemInstruction' => ['parts' => [['text' => $systemPrompt]]],
-                    'generationConfig' => ['temperature' => 0.2, 'maxOutputTokens' => 8192]
-                ];
-
-                $ch = curl_init("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={$apiKey}");
-                curl_setopt_array($ch, [
-                    CURLOPT_RETURNTRANSFER => true,
-                    CURLOPT_POST => true,
-                    CURLOPT_HTTPHEADER => ['Content-Type: application/json'],
-                    CURLOPT_POSTFIELDS => json_encode($payload),
-                    CURLOPT_TIMEOUT => 60
-                ]);
-
-                $response = curl_exec($ch);
-                $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-                curl_close($ch);
-
-                if ($httpCode !== 200) {
-                    $errorMsg = match($httpCode) {
-                        429 => 'Rate limit reached. Wait 1-2 minutes.',
-                        401, 403 => 'API Key invalid.',
-                        default => 'API error: ' . $httpCode
-                    };
-                    return ['success' => false, 'error' => $errorMsg];
-                }
-
-                $result = json_decode($response, true);
-                $text = $result['candidates'][0]['content']['parts'][0]['text'] ?? '';
-
-                // Clean and parse JSON
-                $text = trim($text);
-                $text = preg_replace('/^```json\s*/i', '', $text);
-                $text = preg_replace('/```\s*$/i', '', $text);
-                if (preg_match('/\{[\s\S]*\}/m', $text, $matches)) {
-                    $text = $matches[0];
-                }
-
-                $parsed = json_decode($text, true);
+                $r = ykanAiAsk($data['config'], $systemPrompt, $taskContext . "\n\nFILE ASSOCIATI:\n" . $filesContent, 0.2, 8192, 90);
+                if (!$r['success']) return $r;
+                $parsed = ykanAiJson($r['text']);
                 if (!$parsed) {
-                    return ['success' => true, 'result' => ['status' => 'error', 'analysis' => $text, 'can_close' => false]];
+                    return ['success' => true, 'result' => ['status' => 'error', 'analysis' => $r['text'], 'can_close' => false]];
                 }
 
                 return ['success' => true, 'result' => $parsed];
@@ -2396,9 +2385,6 @@ PROMPT;
 
             // AI Auto-categorize
             'ai_categorize' => (function() use ($data, $input) {
-                $apiKey = $data['config']['gemini_api_key'] ?? '';
-                if (empty($apiKey)) return ['success' => false, 'error' => 'API Key not configured'];
-
                 $title = $input['title'] ?? '';
                 $desc = $input['description'] ?? '';
                 $labels = array_map(fn($l) => $l['name'], $data['labels']);
@@ -2408,33 +2394,13 @@ PROMPT;
                 $langSuffix = $lang !== 'en' ? " Respond in " . match($lang) { 'it' => 'Italian', 'es' => 'Spanish', 'fr' => 'French', 'de' => 'German', 'pt' => 'Portuguese', default => 'English' } . "." : "";
                 $prompt = "Analyze this task and suggest categorization.\n\nTitle: {$title}\nDescription: {$desc}\n\nAvailable labels: " . implode(', ', $labels) . "\nAvailable swimlanes: " . implode(', ', $lanes) . "\n\nRespond ONLY with JSON (nothing else):\n{\"priority\":\"high|medium|low\",\"label\":\"label_name\",\"swimlane\":\"swimlane_name\",\"reason\":\"brief reason\"}{$langSuffix}";
 
-                $payload = [
-                    'contents' => [['parts' => [['text' => $prompt]]]],
-                    'generationConfig' => ['temperature' => 0.2, 'maxOutputTokens' => 256]
-                ];
-
-                $ch = curl_init("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={$apiKey}");
-                curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_POST => true, CURLOPT_HTTPHEADER => ['Content-Type: application/json'], CURLOPT_POSTFIELDS => json_encode($payload), CURLOPT_TIMEOUT => 30]);
-                $response = curl_exec($ch);
-                $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-                curl_close($ch);
-
-                if ($httpCode !== 200) return ['success' => false, 'error' => 'API error: ' . $httpCode];
-
-                $result = json_decode($response, true);
-                $text = $result['candidates'][0]['content']['parts'][0]['text'] ?? '';
-                $text = preg_replace('/^```json\s*|\s*```$/i', '', trim($text));
-                if (preg_match('/\{.*\}/s', $text, $m)) $text = $m[0];
-                $parsed = json_decode($text, true);
-
-                return ['success' => true, 'suggestion' => $parsed];
+                $r = ykanAiAsk($data['config'], '', $prompt, 0.2, 256, 30);
+                if (!$r['success']) return $r;
+                return ['success' => true, 'suggestion' => ykanAiJson($r['text'])];
             })(),
 
             // AI Estimate
             'ai_estimate' => (function() use ($data, $input) {
-                $apiKey = $data['config']['gemini_api_key'] ?? '';
-                if (empty($apiKey)) return ['success' => false, 'error' => 'API Key not configured'];
-
                 $title = $input['title'] ?? '';
                 $desc = $input['description'] ?? '';
 
@@ -2442,33 +2408,13 @@ PROMPT;
                 $langSuffix = $lang !== 'en' ? " Respond in " . match($lang) { 'it' => 'Italian', 'es' => 'Spanish', 'fr' => 'French', 'de' => 'German', 'pt' => 'Portuguese', default => 'English' } . "." : "";
                 $prompt = "Estimate the time needed to complete this software development task.\n\nTitle: {$title}\nDescription: {$desc}\n\nRespond ONLY with JSON:\n{\"estimate\":\"e.g.: 2h, 1 day, 3-5 days\",\"complexity\":\"low|medium|high\",\"breakdown\":[\"step1\",\"step2\"]}{$langSuffix}";
 
-                $payload = [
-                    'contents' => [['parts' => [['text' => $prompt]]]],
-                    'generationConfig' => ['temperature' => 0.3, 'maxOutputTokens' => 512]
-                ];
-
-                $ch = curl_init("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={$apiKey}");
-                curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_POST => true, CURLOPT_HTTPHEADER => ['Content-Type: application/json'], CURLOPT_POSTFIELDS => json_encode($payload), CURLOPT_TIMEOUT => 30]);
-                $response = curl_exec($ch);
-                $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-                curl_close($ch);
-
-                if ($httpCode !== 200) return ['success' => false, 'error' => 'API error: ' . $httpCode];
-
-                $result = json_decode($response, true);
-                $text = $result['candidates'][0]['content']['parts'][0]['text'] ?? '';
-                $text = preg_replace('/^```json\s*|\s*```$/i', '', trim($text));
-                if (preg_match('/\{.*\}/s', $text, $m)) $text = $m[0];
-                $parsed = json_decode($text, true);
-
-                return ['success' => true, 'estimate' => $parsed];
+                $r = ykanAiAsk($data['config'], '', $prompt, 0.3, 512, 30);
+                if (!$r['success']) return $r;
+                return ['success' => true, 'estimate' => ykanAiJson($r['text'])];
             })(),
 
             // Daily Standup AI
             'ai_standup' => (function() use ($data) {
-                $apiKey = $data['config']['gemini_api_key'] ?? '';
-                if (empty($apiKey)) return ['success' => false, 'error' => 'API Key not configured'];
-
                 $summary = "";
                 $cols = array_column($data['columns'], 'name', 'id');
                 $lanes = array_column($data['swimlanes'], 'name', 'id');
@@ -2483,23 +2429,9 @@ PROMPT;
                 $langSuffix = $lang !== 'en' ? " Respond in " . match($lang) { 'it' => 'Italian', 'es' => 'Spanish', 'fr' => 'French', 'de' => 'German', 'pt' => 'Portuguese', default => 'English' } . "." : "";
                 $prompt = "Generate an Agile Daily Standup report based on these tasks:\n\n{$summary}\n\nReport format:\n1. **Completed yesterday** (tasks in Done)\n2. **In progress today** (tasks In Progress)\n3. **Next up** (priority tasks in To Do)\n4. **Blockers/Risks**\n\nMax 200 words.{$langSuffix}";
 
-                $payload = [
-                    'contents' => [['parts' => [['text' => $prompt]]]],
-                    'generationConfig' => ['temperature' => 0.5, 'maxOutputTokens' => 1024]
-                ];
-
-                $ch = curl_init("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={$apiKey}");
-                curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_POST => true, CURLOPT_HTTPHEADER => ['Content-Type: application/json'], CURLOPT_POSTFIELDS => json_encode($payload), CURLOPT_TIMEOUT => 30]);
-                $response = curl_exec($ch);
-                $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-                curl_close($ch);
-
-                if ($httpCode !== 200) return ['success' => false, 'error' => 'API error: ' . $httpCode];
-
-                $result = json_decode($response, true);
-                $text = $result['candidates'][0]['content']['parts'][0]['text'] ?? '';
-
-                return ['success' => true, 'standup' => $text];
+                $r = ykanAiAsk($data['config'], '', $prompt, 0.5, 1024, 30);
+                if (!$r['success']) return $r;
+                return ['success' => true, 'standup' => $r['text']];
             })(),
 
             // Git TODO Scanner
@@ -3745,11 +3677,23 @@ $dataJson = json_encode(ykanPublicData($data));
         .github-stat-label { font-size: 10px; color: var(--text2); }
 
         /* Gemini Panel */
-        .gemini-panel { position: fixed; left: 0; top: 0; bottom: 0; width: 400px; background: var(--bg3); border-right: 1px solid var(--border); transform: translateX(-100%); transition: transform 0.3s; z-index: 500; display: flex; flex-direction: column; }
+        .gemini-panel { position: fixed; right: 0; top: 0; bottom: var(--term-h); width: 400px; max-width: 100%; background: var(--bg3); border-left: 1px solid var(--border); transform: translateX(100%); transition: transform 0.3s; z-index: 500; display: flex; flex-direction: column; }
         .gemini-panel.open { transform: translateX(0); }
         .gemini-header { padding: 16px; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; }
         .gemini-content { flex: 1; padding: 16px; overflow-y: auto; }
         .gemini-actions { padding: 12px 16px; border-top: 1px solid var(--border); display: flex; flex-direction: column; gap: 8px; }
+        .ai-pick { display: flex; gap: 6px; align-items: center; padding: 8px 16px; border-bottom: 1px solid var(--border); }
+        .ai-pick select { flex: 1; min-width: 0; padding: 4px 6px; font-size: 13px; }
+        .ai-pick a { text-decoration: none; }
+        .ai-md { white-space: normal !important; }
+        .ai-md h4 { margin: 12px 0 4px; font-size: 14px; }
+        .ai-md .ai-li { padding-left: 12px; text-indent: -10px; }
+        .ai-md .ai-gap { height: 8px; }
+        .ai-md code { background: var(--bg2); padding: 1px 4px; border-radius: 3px; font-size: 12px; }
+        .ai-table { overflow-x: auto; margin: 6px 0; }
+        .ai-table table { border-collapse: collapse; font-size: 12px; }
+        .ai-table th, .ai-table td { border: 1px solid var(--border); padding: 3px 6px; text-align: left; vertical-align: top; }
+        .ai-table th { background: var(--bg2); }
         .gemini-response { white-space: pre-wrap; font-size: 13px; line-height: 1.6; }
         .gemini-loading { text-align: center; padding: 20px; color: var(--text2); }
 
@@ -4076,7 +4020,12 @@ $dataJson = json_encode(ykanPublicData($data));
         .term-footer { position: fixed; left: 0; right: 0; bottom: 0; z-index: 500; background: #0b0b0b; border-top: 1px solid var(--border); box-shadow: 0 -4px 16px rgba(0,0,0,.25); }
         .term-tabbar { display: flex; align-items: center; gap: 4px; padding: 4px 6px; background: var(--bg2); border-bottom: 1px solid var(--border); }
         .term-footer.minimized .term-tabbar { cursor: pointer; border-bottom: 0; }
-        .term-lane-sel { width: auto; max-width: 160px; padding: 2px 4px; font-size: 12px; flex-shrink: 0; }
+        .term-launch { display: flex; align-items: center; flex-shrink: 0; border: 1px solid var(--border); border-radius: 8px; background: var(--bg3); overflow: hidden; height: 26px; }
+        .term-launch-ico { padding: 0 2px 0 8px; font-size: 12px; }
+        .term-launch .term-lane-sel { width: auto; max-width: 170px; border: none; background: transparent; color: var(--text); font-size: 12px; font-weight: 500; padding: 0 6px; height: 100%; cursor: pointer; outline: none; }
+        .term-launch .term-lane-sel option { background: var(--bg3); color: var(--text); }
+        .term-launch button { border: none; border-left: 1px solid var(--border); background: transparent; color: var(--text2); font-size: 12px; padding: 0 10px; height: 100%; cursor: pointer; white-space: nowrap; }
+        .term-launch button:hover { background: var(--bg2); color: var(--text); }
         .term-badge { background: #dc2626; color: #fff; border-radius: 9px; padding: 0 6px; font-size: 10px; line-height: 16px; }
         /* Schede non-terminale (Changelog, Console): stessi colori del tema, non il nero di xterm */
         .term-pane.doc { background: var(--bg); color: var(--text); overflow: auto; padding: 0; }
@@ -4161,7 +4110,46 @@ $dataJson = json_encode(ykanPublicData($data));
 
         /* Pagina: stessa geometria per tutte le viste */
         .page, .dash-view { padding: var(--page-pad); max-width: none; margin: 0; }
-        body[data-view="dashboard"] #kanbanView, body[data-view="settings"] #kanbanView, body[data-view="claude"] #kanbanView { display: none; }
+        body[data-view="dashboard"] #kanbanView, body[data-view="settings"] #kanbanView, body[data-view="claude"] #kanbanView, body[data-view="home"] #kanbanView { display: none; }
+        body[data-view="home"] #homeView { display: block; }
+
+        /* Home: numeri, fasce token della giornata, griglia 3x3 di widget che si caricano da soli */
+        .home-top { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+        .home-conn { display: flex; gap: 12px; font-size: 12px; color: var(--text2); }
+        .home-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 5px; background: var(--border); }
+        .home-dot.ok { background: #1D9E75; } .home-dot.warn { background: #EF9F27; } .home-dot.ko { background: #E24B4A; }
+        .home-kpis { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-bottom: 20px; }
+        .home-box { background: var(--bg3); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; font-size: 13px; line-height: 1.6; min-width: 0; }
+        .home-box .lbl { font-size: 11px; color: var(--text2); margin-bottom: 4px; display: flex; justify-content: space-between; }
+        .home-box .num { font-size: 24px; font-weight: 600; }
+        .home-box .row { display: flex; justify-content: space-between; gap: 8px; white-space: nowrap; overflow: hidden; }
+        .home-box .row > :first-child { overflow: hidden; text-overflow: ellipsis; }
+        .home-box .sub { color: var(--text2); }
+        .home-box a { color: inherit; cursor: pointer; text-decoration: none; } .home-box a:hover { text-decoration: underline; }
+        .home-day-title { font-weight: 600; font-size: 14px; margin-bottom: 8px; }
+        .home-day { position: relative; height: 42px; border-radius: 8px; overflow: hidden; background: var(--bg2); }
+        .home-band { position: absolute; top: 0; bottom: 0; border-right: 1px solid var(--border); background: var(--bg3); }
+        .home-band.cur { background: color-mix(in srgb, #378ADD 14%, var(--bg3)); }
+        .home-band i { position: absolute; left: 0; top: 0; bottom: 0; background: color-mix(in srgb, #378ADD 45%, transparent); }
+        .home-band span { position: relative; display: block; font-size: 12px; padding: 4px 8px; color: var(--text2); white-space: nowrap; overflow: hidden; }
+        .home-band.cur span { color: var(--text); }
+        .home-now { position: absolute; top: 0; bottom: 0; width: 2px; background: #E24B4A; }
+        .home-axis { position: relative; height: 16px; font-size: 11px; color: var(--text2); margin: 3px 0 18px; }
+        .home-axis span { position: absolute; transform: translateX(-50%); }
+        .home-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+        .home-grid .home-box { min-height: 110px; }
+        .home-sk { height: 8px; border-radius: 4px; background: var(--bg2); margin: 10px 0; animation: homeSk 1.2s ease-in-out infinite alternate; }
+        @keyframes homeSk { to { opacity: .4; } }
+        @media (max-width: 900px) { .home-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .home-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+        @media (max-width: 560px) { .home-grid { grid-template-columns: minmax(0, 1fr); } }
+
+        /* Another AI: linguetta sul bordo destro, in tutte le pagine */
+        .ai-edge { position: fixed; right: 0; top: 50%; transform: translateY(-50%); z-index: 501; writing-mode: vertical-rl; background: var(--bg3); border: 1px solid var(--border); border-right: none; border-radius: 8px 0 0 8px; padding: 12px 5px; font-size: 12px; font-weight: 500; color: var(--text2); cursor: pointer; transition: right 0.3s; }
+        .ai-edge:hover { color: var(--text); }
+        body.ai-open .ai-edge { right: min(400px, 100%); }
+        .ai-page-actions { display: flex; flex-direction: column; gap: 6px; }
+        .ai-page-actions:empty { display: none; }
+        body:not([data-view="kanban"]):not([data-view="home"]) .ai-board-only { display: none; }
         .dash-toolbar { min-height: 40px; margin-bottom: 0; padding-bottom: 14px; gap: 8px 10px; }
         .dash-toolbar h2 { font-size: 22px; font-weight: 600; letter-spacing: -.02em; margin-right: 6px; }
         .dash-tabs, .kanban-page .filters-bar { margin-bottom: 18px; min-height: 40px; }
@@ -4245,6 +4233,7 @@ $dataJson = json_encode(ykanPublicData($data));
     <header class="header">
         <h1 id="projectName" onclick="openConfigModal()"><?= htmlspecialchars($data['config']['project_name'] ?? 'My Project') ?></h1>
         <nav class="view-tabs">
+            <button id="tabHome" onclick="showView('home')">🏠 Home</button>
             <button id="tabKanban" class="active" onclick="showView('kanban')">🗂️ Kanban</button>
             <!-- Menu ad albero: ogni sezione ha le sue pagine, aperte solo quando la sezione è attiva -->
             <button id="tabDash" class="side-head" onclick="showView('dashboard')">📁 Progetti</button>
@@ -4274,6 +4263,7 @@ $dataJson = json_encode(ykanPublicData($data));
                 <button data-tab="account" onclick="settingsNav('account')">Account</button>
                 <button data-tab="bridge" onclick="settingsNav('bridge')">Bridge</button>
                 <button data-tab="claude-code" onclick="settingsNav('claude-code')">Claude Code</button>
+                <button data-tab="another-ai" onclick="settingsNav('another-ai')">Another AI</button>
                 <button data-tab="github" onclick="settingsNav('github')">GitHub</button>
                 <button data-tab="aspetto" onclick="settingsNav('aspetto')">Aspetto</button>
                 <button data-tab="strumenti" onclick="settingsNav('strumenti')">Strumenti</button>
@@ -4306,6 +4296,28 @@ $dataJson = json_encode(ykanPublicData($data));
         </div>
     </header>
 
+    <!-- Home: cruscotto. Ogni widget della griglia carica i suoi dati da solo (board o Bridge) -->
+    <section id="homeView" class="dash-view">
+        <div class="dash-toolbar">
+            <h2 id="homeHello">Home</h2>
+            <span style="flex:1"></span>
+            <div class="home-conn">
+                <span><i class="home-dot" id="homeDotBridge"></i>Bridge</span>
+                <span><i class="home-dot" id="homeDotWa"></i>WhatsApp</span>
+                <span><i class="home-dot" id="homeDotClaude"></i>Claude</span>
+            </div>
+            <button class="btn" onclick="loadHome()">↻ Aggiorna</button>
+        </div>
+        <div class="home-kpis" id="homeKpis"></div>
+        <div class="home-day-title" id="homeDayTitle">Oggi</div>
+        <div class="home-day" id="homeDay"></div>
+        <div class="home-axis" id="homeAxis"></div>
+        <div class="home-day-title" id="homeWeekTitle">Settimana</div>
+        <div class="home-day" id="homeWeek"></div>
+        <div class="home-axis" id="homeWeekAxis"></div>
+        <div class="home-grid" id="homeGrid"></div>
+    </section>
+
     <!-- Kanban: stessa testata/geometria della Dashboard -->
     <section id="kanbanView" class="page kanban-page">
         <div class="dash-toolbar">
@@ -4314,7 +4326,6 @@ $dataJson = json_encode(ykanPublicData($data));
             <button class="btn btn-primary" onclick="quickAddCard()" title="Aggiungi una card rapidamente">＋ Nuova card</button>
             <button class="btn" onclick="toggleArchive()" title="Card archiviate">📦 Archive</button>
             <button class="btn" onclick="toggleGithub()" title="Issues, PR e commit di GitHub">🐙 GitHub</button>
-            <button class="btn" onclick="toggleGemini()" title="Analisi del progetto con Gemini AI">🔷 Gemini</button>
             <button class="btn" onclick="togglePm()" title="PM — PRD / epic / breakdown">📋 PM</button>
             <button class="btn" onclick="exportJSON()" title="Export JSON">📥 JSON</button>
             <button class="btn" onclick="exportCSV()" title="Export CSV">📊 CSV</button>
@@ -4381,13 +4392,20 @@ $dataJson = json_encode(ykanPublicData($data));
     <!-- Gemini Panel -->
     <div id="geminiPanel" class="gemini-panel">
         <div class="gemini-header">
-            <h3>Gemini AI</h3>
+            <h3>Another AI</h3>
             <button class="btn btn-icon" onclick="toggleGemini()">&times;</button>
         </div>
+        <div class="ai-pick">
+            <select id="aiPanelProvider" onchange="aiPanelPick(this.value)" title="AI che risponde"></select>
+            <select id="aiPanelLane" title="Progetto di cui parlare"></select>
+            <a href="#" onclick="showView('settings');settingsTab('another-ai');return false" title="Configura le AI">⚙️</a>
+        </div>
         <div id="geminiContent" class="gemini-content">
-            <p style="color: var(--text2)">Use the buttons below to analyze the board with Gemini AI.</p>
+            <p style="color: var(--text2)">Scegli l'AI qui sopra e usa i pulsanti in basso. <b>Claude Code</b> legge i file del progetto scelto (senza modificarli) e risponde a qualsiasi domanda; le altre AI vedono le card della board.</p>
         </div>
         <div class="gemini-actions">
+            <div class="ai-page-actions" id="aiPageActions"></div>
+            <div class="ai-page-actions ai-board-only">
             <button class="btn btn-primary" onclick="analyzeProject()" style="background:linear-gradient(135deg,#667eea,#764ba2);border:none">
                 🔍 Analyze Project
             </button>
@@ -4395,12 +4413,15 @@ $dataJson = json_encode(ykanPublicData($data));
             <button class="btn" onclick="askGemini('analyze')">Analyze Board</button>
             <button class="btn" onclick="askGemini('suggest_tasks')">Suggest Tasks</button>
             <button class="btn" onclick="askGemini('estimate')">Estimate Time</button>
+            </div>
             <div class="form-group" style="margin:0">
-                <input type="text" id="geminiCustom" placeholder="Custom question...">
+                <input type="text" id="geminiCustom" placeholder="Fai una domanda sul progetto…">
             </div>
             <button class="btn btn-primary" onclick="askGeminiCustom()">Ask</button>
         </div>
     </div>
+
+    <button type="button" class="ai-edge" id="aiEdge" onclick="toggleGemini()" title="Another AI: apri o chiudi la barra">◂ ✨ Another AI</button>
 
     <!-- Archive Panel -->
     <div id="archivePanel" class="archive-panel">
@@ -4594,7 +4615,7 @@ $dataJson = json_encode(ykanPublicData($data));
         </div>
         <div class="dash-tabs">
             <button data-tab="generale" class="active" onclick="settingsTab('generale')">Generale</button>
-            <button data-tab="api-ai" onclick="settingsTab('api-ai')">API AI</button>
+            <button data-tab="another-ai" onclick="settingsTab('another-ai')">Another AI</button>
             <button data-tab="claude-code" onclick="settingsTab('claude-code')">Claude Code</button>
             <button data-tab="github" onclick="settingsTab('github')">GitHub</button>
             <button data-tab="progetti" onclick="settingsTab('progetti')">Progetti</button>
@@ -4624,11 +4645,6 @@ $dataJson = json_encode(ykanPublicData($data));
                     <div id="labelsManager"></div>
                     <button type="button" class="btn" onclick="addLabel()" style="margin-top:8px">+ Add Label</button>
                 </div>
-                <div class="form-group">
-                    <label>Gemini API Key</label>
-                    <input type="password" id="configGeminiKey" placeholder="Enter your API key...">
-                </div>
-                <button type="button" class="btn" onclick="testGeminiKey()">🧪 Verifica chiave</button>
                 <div class="form-group" id="storageGroup">
                     <label>Archivio dati</label>
                     <div id="storageStatus" style="font-size:13px;color:var(--text2);margin-bottom:8px">…</div>
@@ -4685,6 +4701,15 @@ $dataJson = json_encode(ykanPublicData($data));
                     </select>
                     <small style="color:var(--text2);font-size:11px">Vale per "▶️ Lavora ora", per le sessioni nuove e per "▶️ Riprendi" una sessione esistente. Con <b>Claude Desktop</b> il resume importa/riapre la sessione nell'app; con <b>Cloud</b> il resume resta nel terminale (claude.ai non può riagganciare una sessione locale).</small>
                 </div>
+            </div>
+
+            <div class="settings-panel" data-panel="another-ai" style="display:none">
+                <p style="font-size:13px;color:var(--text2);margin-top:0">Le AI collegate via API: le usano il pannello <b>✨ Another AI</b> della Kanban, l'analisi del progetto, la verifica dei task e le stime. Chiave vuota = quella del file <code>.env</code> del server, se c'è.</p>
+                <div class="form-group">
+                    <label>AI attiva</label>
+                    <select id="aiProvider"></select>
+                </div>
+                <div id="aiProviders"></div>
             </div>
 
             <div class="settings-panel" data-panel="github" style="display:none">
@@ -4806,6 +4831,31 @@ $dataJson = json_encode(ykanPublicData($data));
                 </ol>
                 <p class="tool-note">Non spostare <code>ykan-bridge.exe</code> fuori dalla sua cartella: la cartella <code>node_modules</code> deve stargli accanto. Il Bridge accetta connessioni solo da questo PC (<code>127.0.0.1:51820</code>).<br>
                     <b>Aggiornare:</b> chiudi la finestra del Bridge, scarica il nuovo zip ed estrailo sopra la vecchia cartella sostituendo i file, poi riavvialo.</p>
+            </div>
+
+            <div class="tool-card">
+                <div class="tool-head">
+                    <div>
+                        <h3><i class="ib"></i> Ykan Bridge per macOS <small>(beta)</small></h3>
+                        <small>Lo stesso Bridge, da avviare dal Terminale del Mac.</small>
+                    </div>
+                    <?php if ($ykanDl['bridge_mac']): ?>
+                        <a class="btn btn-primary" href="?download=bridge_mac">⬇ Scarica</a>
+                    <?php else: ?>
+                        <span class="tool-missing">Non ancora pubblicato</span>
+                    <?php endif; ?>
+                </div>
+                <?php if ($ykanDl['bridge_mac']): ?>
+                    <div class="tool-meta"><?= htmlspecialchars($ykanDl['bridge_mac']['name']) ?> · <?= $dlSize($ykanDl['bridge_mac']['size']) ?> · aggiornato il <?= $ykanDl['bridge_mac']['date'] ?></div>
+                <?php endif; ?>
+                <p class="tool-req">Richiede <a href="https://nodejs.org" target="_blank" rel="noopener">Node.js</a> 20 o superiore e <a href="https://docs.anthropic.com/it/docs/claude-code/overview" target="_blank" rel="noopener">Claude Code</a> installato (comando <code>claude</code>).</p>
+                <h4>Istruzioni d'uso</h4>
+                <ol>
+                    <li>Scarica lo zip, aprilo (si estrae da solo) e sposta la cartella <code>ykan-bridge-macos</code> in un posto che non cancellerai, ad esempio <code>Documenti</code>.</li>
+                    <li>Tasto destro su <code>Avvia Ykan Bridge.command</code> → <b>Apri</b> → <b>Apri</b>: serve solo la prima volta, perché il file non è firmato. La prima volta installa le dipendenze (un minuto).</li>
+                    <li>Lascia aperta la finestra del Terminale mentre usi Ykan, poi vai in <a href="#" onclick="settingsTab('bridge');return false">Bridge → PC collegati</a> e clicca <b>🖥 Collega questo PC</b>.</li>
+                </ol>
+                <p class="tool-note">Beta: niente icona nella barra dei menu, avvio automatico o aggiornamento automatico. Per aggiornare estrai il nuovo zip sopra la vecchia cartella.</p>
             </div>
 
             <div class="tool-card">
@@ -4977,8 +5027,15 @@ $dataJson = json_encode(ykanPublicData($data));
     <div id="termFooter" class="term-footer">
         <div class="term-tabbar" onclick="if (this.parentElement.classList.contains('minimized')) termSetMin(false)">
             <div id="termTabs" class="term-tabs"></div>
-            <select id="termLaneSel" class="term-lane-sel" title="Progetto in cui aprire una nuova shell" onmousedown="termRefreshLaneSelect()" onclick="event.stopPropagation()"></select>
-            <button type="button" class="btn btn-icon" onclick="event.stopPropagation();termNewShell()" title="Nuova shell nel progetto selezionato">＋</button>
+            <div class="term-launch" onclick="event.stopPropagation()">
+                <span class="term-launch-ico">📁</span>
+                <select id="termLaneSel" class="term-lane-sel" title="Progetto in cui aprire il terminale" onmousedown="termRefreshLaneSelect()"></select>
+                <button type="button" onclick="termNewShell()" title="Prompt dei comandi (cmd) nella cartella del progetto">⌨️ cmd</button>
+                <button type="button" onclick="termNewShell({ launch: 'powershell' })" title="PowerShell nella cartella del progetto">🟦 PowerShell</button>
+                <button type="button" onclick="termNewShell({ launch: 'claude' })" title="Claude Code nella cartella del progetto">🤖 Claude</button>
+                <button type="button" onclick="termOpenFolder()" title="Apre la cartella del progetto (Esplora risorse / Finder)">📂 Cartella</button>
+                <button type="button" onclick="termOpenSite()" title="Apre il sito online del progetto">🌐 Sito</button>
+            </div>
             <span style="flex:1"></span>
             <button type="button" class="btn btn-icon" onclick="event.stopPropagation();termSetMin(!document.getElementById('termFooter').classList.contains('minimized'))" id="termMinBtn" title="Abbassa il terminale (resta la barra per riaprirlo)">⌄</button>
         </div>
@@ -5067,7 +5124,7 @@ $dataJson = json_encode(ykanPublicData($data));
             add_label: 'crea una label', update_label: 'modifica una label', delete_label: 'elimina una label',
             github_repo_status: 'chiede a GitHub lo stato dei repository', github_repo_info: 'chiede a GitHub le info del repo',
             github_prs: 'chiede a GitHub le pull request', github_issues: 'chiede a GitHub le issue', github_commits: 'chiede a GitHub i commit',
-            gemini_analyze: 'fa analizzare il progetto a Gemini', analyze_project: "fa analizzare il progetto all'AI",
+            gemini_analyze: "fa analizzare il progetto all'AI", analyze_project: "fa analizzare il progetto all'AI",
             ai_standup: "chiede all'AI lo standup", ai_estimate: "chiede all'AI una stima", ai_categorize: "chiede all'AI una categoria",
             claude_execute: 'fa lavorare Claude (API) su una card', claude_status: 'controlla Claude', verify_task: 'fa verificare un task',
             burndown_data: 'dati per il burndown', scan_todos: 'cerca i TODO nei file', list_project_files: 'elenca i file del progetto',
@@ -5200,7 +5257,7 @@ $dataJson = json_encode(ykanPublicData($data));
             });
             if (res.status === 401 && YKAN_USER) { location.reload(); return { success: false }; } // sessione scaduta: torna alla pagina di accesso
             const result = await res.json();
-            const silentActions = ['get_data', 'gemini_analyze', 'claude_execute', 'claude_status', 'list_themes', 'burndown_data', 'loose_ends', 'link_session', 'session_state', 'github_repo_status', 'bridge_list', 'bridge_pair_code', 'memory_review_get', 'memory_snapshot_save', 'memory_proposal_state', 'memory_proposals_save', 'claude_news'];
+            const silentActions = ['get_data', 'gemini_analyze', 'ai_status', 'claude_execute', 'claude_status', 'list_themes', 'burndown_data', 'loose_ends', 'link_session', 'session_state', 'github_repo_status', 'bridge_list', 'bridge_pair_code', 'memory_review_get', 'memory_snapshot_save', 'memory_proposal_state', 'memory_proposals_save', 'claude_news'];
             if (result.success) {
                 if (!silentActions.includes(action)) {
                     toast('Salvato', 'success');
@@ -5728,8 +5785,9 @@ $dataJson = json_encode(ykanPublicData($data));
     }
 
     function showView(view) {
-        if (!['dashboard', 'settings', 'claude'].includes(view)) view = 'kanban';
+        if (!['home', 'dashboard', 'settings', 'claude'].includes(view)) view = 'kanban';
         document.body.dataset.view = view;
+        document.getElementById('tabHome').classList.toggle('active', view === 'home');
         document.getElementById('tabKanban').classList.toggle('active', view === 'kanban');
         document.getElementById('tabDash').classList.toggle('active', view === 'dashboard');
         document.getElementById('tabSettings').classList.toggle('active', view === 'settings');
@@ -5738,6 +5796,8 @@ $dataJson = json_encode(ykanPublicData($data));
         if (view === 'dashboard') { dashSetTitle(); loadDashboard(); }
         if (view === 'settings') loadSettingsView();
         if (view === 'claude') loadClaudeView();
+        if (view === 'home') loadHome();
+        aiEdgeContext();
     }
 
     const dashTs = v => { const t = new Date(String(v).replace(' ', 'T')).getTime(); return isNaN(t) ? 0 : t; };
@@ -6219,7 +6279,7 @@ $dataJson = json_encode(ykanPublicData($data));
                             ${v && v.verdict === 'split' ? `<div class="rv-tasks">${v.tasks.map(t => '➕ ' + escHtml(t.title)).join('<br>')}</div>` : ''}
                         </div>
                         <div class="rv-actions">
-                            <button class="btn" style="padding:2px 8px;font-size:11px" onclick="openSessionPanel('${escHtml(r.lane.id)}','${escHtml(r.s.id)}')">Vedi</button>${act}
+                            <button class="btn" style="padding:2px 8px;font-size:11px" onclick="openSessionPanel('${escHtml(r.lane.id)}','${escHtml(r.s.id)}')">Vedi</button><button class="btn" style="padding:2px 8px;font-size:11px" onclick="openInDesktop('${escHtml(r.lane.id)}','${escHtml(r.s.id)}')" title="Apre questa chat in Claude Desktop (scheda Code)">🖥️ Apri in Claude Desktop</button>${act}
                         </div>
                     </div>`;
                 }).join('')}
@@ -7447,6 +7507,16 @@ $dataJson = json_encode(ykanPublicData($data));
         openTerminalModal(lane.id, { launch: 'resume', sessionId });
     }
 
+    // Apre la chat in Claude Desktop (scheda Code) qualunque sia session_open_mode: se Desktop è
+    // già aperto passa direttamente a quella chat.
+    function openInDesktop(laneId, sessionId) {
+        const lane = boardData.swimlanes.find(l => l.id === laneId) || {};
+        if (bridgeIsRemote()) { remoteDesktop('/desktop/resume', { sessionId }); return; }
+        bridgeFetch('/desktop/resume', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sessionId, dir: lane.local_path || '' }) })
+            .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); toast('Apro la chat in Claude Desktop…'); })
+            .catch(() => { window.location.href = 'claude://resume?session=' + encodeURIComponent(sessionId); });
+    }
+
     // Apre sempre una scheda NUOVA (mai riusa/chiude quelle esistenti): lanciare più cose in
     // parallelo deve dare più terminali distinti, non sostituire quello che stava girando.
     function openTerminalModal(laneId, context) {
@@ -7460,7 +7530,8 @@ $dataJson = json_encode(ykanPublicData($data));
 
         const tabEl = document.createElement('div');
         tabEl.className = 'term-tab';
-        tabEl.innerHTML = `<span>🖥️ ${escHtml(lane.name)}</span><span class="term-tab-x" title="Chiudi (termina il processo)">&times;</span>`;
+        const tabIco = { powershell: '🟦', claude: '🤖', resume: '🤖' }[context.launch] || '🖥️';
+        tabEl.innerHTML = `<span>${tabIco} ${escHtml(lane.name)}</span><span class="term-tab-x" title="Chiudi (termina il processo)">&times;</span>`;
         tabEl.addEventListener('click', e => { if (!e.target.classList.contains('term-tab-x')) termSwitchTab(id); });
         tabEl.querySelector('.term-tab-x').addEventListener('click', e => { e.stopPropagation(); termCloseTab(id); });
         document.getElementById('termTabs').appendChild(tabEl);
@@ -7570,6 +7641,24 @@ $dataJson = json_encode(ykanPublicData($data));
         openTerminalModal(laneId, opts);
     }
 
+    function termSelLane() {
+        termRefreshLaneSelect();
+        return boardData.swimlanes.find(l => l.id === document.getElementById('termLaneSel').value);
+    }
+    function termOpenFolder() {
+        const lane = termSelLane();
+        if (!lane) return;
+        bridgeFetch('/open-folder', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ dir: lane.local_path }) })
+            .then(async r => { if (!r.ok) throw new Error(r.status === 404 ? 'aggiorna il Bridge alla 0.9.3' : ((await r.json().catch(() => ({}))).error || 'HTTP ' + r.status)); })
+            .catch(e => toast('Cartella non aperta: ' + e.message, 'error'));
+    }
+    function termOpenSite() {
+        const lane = termSelLane();
+        const url = lane && safeUrl(lane.url);
+        if (!url) { toast(`Nessun sito per ${lane ? lane.name : 'questo progetto'}: aggiungilo nelle impostazioni del progetto (URL)`, 'error'); return; }
+        window.open(url, '_blank', 'noopener');
+    }
+
     // Abbassa/riapre il pannello (lo stato si ricorda tra i ricarichi). Riaprendolo senza nessuna
     // shell parte una shell nel progetto selezionato, ma solo se il Bridge risponde: altrimenti
     // lo scrive nella Console invece di aprire una shell che non si connette. skipAuto: chi
@@ -7583,11 +7672,8 @@ $dataJson = json_encode(ykanPublicData($data));
         try { localStorage.setItem('ykan_term_min', min ? '1' : '0'); } catch (_) {}
         termSyncH();
         if (min) return;
-        if (termSessions.length) { termSwitchTab(termActiveId, false); return; } // torna visibile: rifai il fit
-        if (skipAuto) return;
-        fetch(BRIDGE_URL + '/reviews', { cache: 'no-store' })
-            .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); if (!termSessions.length) termNewShell({ noFocus: true }); })
-            .catch(() => console.warn("Bridge locale non raggiungibile: nessuna shell avviata. Avvialo (bridge/start-bridge.bat, o l'icona nella tray) e riapri il terminale con ＋."));
+        // torna visibile: rifai il fit. Nessuna shell parte da sola: si aprono con i pulsanti a fianco del progetto
+        if (termActiveId) termSwitchTab(termActiveId, false);
     }
 
     // Altezza attuale del pannello → --term-h (spazio riservato in fondo alla pagina)
@@ -8417,7 +8503,7 @@ $dataJson = json_encode(ykanPublicData($data));
     let settingsTabName = (() => { try { return localStorage.getItem('ykan_settings_tab') || 'generale'; } catch (_) { return 'generale'; } })();
 
     function settingsTab(name) {
-        if (name === 'api-ai') name = 'generale'; // la chiave Gemini ora sta in Generale
+        if (name === 'api-ai') name = 'another-ai'; // la vecchia scheda della chiave Gemini
         settingsTabName = name;
         document.querySelectorAll('#settingsNav button').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
         document.getElementById('settingsTitle').textContent = sideNavTitle('settingsNav', name) || 'Settings';
@@ -8428,6 +8514,60 @@ $dataJson = json_encode(ykanPublicData($data));
         document.querySelector('#configForm .modal-actions').style.display = document.querySelector(`#configForm [data-panel="${name}"]`) ? '' : 'none';
         if (name === 'progetti') renderProjectsManager();
         if (name === 'claude-code') claudeAuthCheck();
+        if (name === 'another-ai') aiSettingsLoad();
+    }
+
+    // === Settings → Another AI: connettori Gemini / Groq / ChatGPT / Ollama ===
+    const AI_PROVIDERS = {
+        gemini: { name: 'Gemini', key: 'https://aistudio.google.com/apikey' },
+        groq: { name: 'Groq', key: 'https://console.groq.com/keys' },
+        openai: { name: 'ChatGPT (OpenAI)', key: 'https://platform.openai.com/api-keys' },
+        ollama: { name: 'Ollama', key: '' }
+    };
+    let aiStatus = null;
+
+    async function aiSettingsLoad() {
+        const r = await api('ai_status');
+        if (r && r.success) aiStatus = r;
+        const cfg = boardData.config.ai || {}, saved = cfg.providers || {};
+        const sel = document.getElementById('aiProvider');
+        sel.innerHTML = Object.entries(AI_PROVIDERS).map(([id, p]) => `<option value="${id}">${escHtml(p.name)}</option>`).join('');
+        sel.value = cfg.provider || 'gemini';
+        document.getElementById('aiProviders').innerHTML = Object.entries(AI_PROVIDERS).map(([id, p]) => {
+            const st = (aiStatus && aiStatus.providers[id]) || {}, v = saved[id] || {};
+            const key = id === 'gemini' && !v.api_key ? (boardData.config.gemini_api_key || '') : (v.api_key || '');
+            const note = st.key_source === 'env' ? 'chiave presa dal file .env del server' : st.key_source === 'board' ? 'chiave salvata nella board' : (id === 'ollama' ? 'chiave non necessaria' : 'nessuna chiave');
+            return `<div class="tool-card" data-ai="${id}" style="margin-bottom:12px">
+                <div class="tool-head"><div><h3>${escHtml(p.name)}</h3><small>${escHtml(note)}</small></div>
+                    <button type="button" class="btn" onclick="aiTest('${id}')">🧪 Prova</button></div>
+                <div class="form-group"><label>Chiave API${p.key ? ` · <a href="${p.key}" target="_blank" rel="noopener">crea una chiave</a>` : ' (facoltativa)'}</label>
+                    <input type="password" data-f="api_key" value="${escHtml(key)}" placeholder="${st.key_source === 'env' ? 'dal .env' : ''}" autocomplete="off"></div>
+                <div style="display:flex;gap:8px">
+                    <div class="form-group" style="flex:1"><label>Modello</label><input type="text" data-f="model" value="${escHtml(v.model || '')}" placeholder="${escHtml(st.model || st.default_model || '')}"></div>
+                    <div class="form-group" style="flex:2"><label>URL</label><input type="text" data-f="url" value="${escHtml(v.url || '')}" placeholder="${escHtml(st.url || st.default_url || '')}"></div>
+                </div>
+                ${id === 'ollama' ? '<small style="color:var(--text2)">Ollama gira sul server che ospita Ykan: <code>localhost</code> funziona solo con Ykan in locale. Online serve un Ollama raggiungibile da internet.</small>' : ''}
+            </div>`;
+        }).join('');
+    }
+
+    function aiCollect() {
+        if (!document.getElementById('aiProvider').options.length) return boardData.config.ai; // pagina mai aperta
+        const providers = {};
+        document.querySelectorAll('#aiProviders [data-ai]').forEach(card => {
+            providers[card.dataset.ai] = {};
+            card.querySelectorAll('[data-f]').forEach(i => { providers[card.dataset.ai][i.dataset.f] = i.value.trim(); });
+        });
+        return { provider: document.getElementById('aiProvider').value, providers };
+    }
+
+    async function aiTest(provider) {
+        await saveConfigForm();
+        toast(`🔎 Provo ${AI_PROVIDERS[provider].name}...`, 'info');
+        const r = await api('gemini_analyze', { prompt: 'custom', custom_prompt: 'Rispondi solo con: OK', provider });
+        if (!r.success) { toast('❌ ' + r.error, 'error'); return; }
+        toast(`✅ ${AI_PROVIDERS[provider].name} risponde (${r.model}): ${r.response.slice(0, 60)}`, 'success');
+        aiSettingsLoad();
     }
 
     // Login della CLI claude sul PC (via Bridge): verde = ok, rosso = serve login (clic = apre il login).
@@ -8503,7 +8643,6 @@ $dataJson = json_encode(ykanPublicData($data));
     async function loadSettingsView() {
         document.getElementById('configProjectName').value = boardData.config.project_name || '';
         document.getElementById('configLanguage').value = boardData.config.ai_language || 'en';
-        document.getElementById('configGeminiKey').value = boardData.config.gemini_api_key || '';
         document.getElementById('configGithubToken').value = boardData.config.github_token || '';
         document.getElementById('configGithubEnvNote').style.display = ykanGithubEnvToken ? 'block' : 'none';
         document.getElementById('configGithubRepo').value = boardData.config.github_repo || '';
@@ -8544,7 +8683,8 @@ $dataJson = json_encode(ykanPublicData($data));
         return {
             project_name: document.getElementById('configProjectName').value,
             ai_language: document.getElementById('configLanguage').value,
-            gemini_api_key: document.getElementById('configGeminiKey').value,
+            gemini_api_key: boardData.config.gemini_api_key || '',
+            ai: aiCollect(),
             github_token: document.getElementById('configGithubToken').value,
             github_repo: document.getElementById('configGithubRepo').value,
             session_open_mode: document.getElementById('configSessionMode').value,
@@ -8610,6 +8750,7 @@ $dataJson = json_encode(ykanPublicData($data));
         if (name === 'context' && !ctxState.inv) ctxLoad();
         if (name === 'news' && !newsState.data && !newsState.busy) newsLoad();
         if (name === 'wa') waLoad(); else clearTimeout(waState.timer);
+        aiEdgeContext();
     }
 
     // === WHATSAPP: collegamento, whitelist e chat del bot che risponde con Claude (tutto via Bridge) ===
@@ -8679,6 +8820,9 @@ $dataJson = json_encode(ykanPublicData($data));
                     <select id="waModel" style="width:auto">${[['haiku', 'Haiku (veloce)'], ['sonnet', 'Sonnet'], ['opus', 'Opus (più bravo, più lento)']].map(([v, l]) => `<option value="${v}"${c.model === v ? ' selected' : ''}>${l}</option>`).join('')}</select></div>
                 <div class="form-group"><label style="font-size:12px">Istruzioni per Claude (vuoto = quelle predefinite)</label>
                     <textarea id="waPrompt" rows="5" placeholder="${escHtml(i.defaultPrompt)}">${escHtml(c.prompt)}</textarea></div>
+                <div class="form-group"><label style="font-size:12px">Istruzioni per un numero (prendono il posto di quelle generali solo per quel numero, es. una demo per un cliente)</label>
+                    <div id="waPrompts">${Object.entries(c.prompts || {}).map(([n, t]) => waPromptRow(n, t)).join('')}</div>
+                    <button type="button" class="btn" onclick="waAddPromptRow()" style="margin-top:6px">+ Istruzioni per un numero</button></div>
                 <button class="btn btn-primary" onclick="waSave()">Salva</button>
                 <span class="dash-sub">Chi è in whitelist può scrivere <b>reset</b> per azzerare la conversazione.</span>
             </div>
@@ -8702,9 +8846,22 @@ $dataJson = json_encode(ykanPublicData($data));
         waRefresh(); waLoad();
     }
 
+    function waPromptRow(num, text) {
+        return `<div class="wa-prow" style="border:1px solid var(--border);border-radius:6px;padding:8px;margin-bottom:6px">
+            <div style="display:flex;gap:6px;margin-bottom:6px"><input type="text" class="wa-pnum" value="${num ? '+' + escHtml(num) : ''}" placeholder="+39 333 1234567" style="flex:1">
+            <button type="button" class="btn" onclick="this.closest('.wa-prow').remove()" title="Togli">🗑</button></div>
+            <textarea class="wa-ptext" rows="8" placeholder="Istruzioni per Claude solo per questo numero">${escHtml(text || '')}</textarea></div>`;
+    }
+    function waAddPromptRow() { document.getElementById('waPrompts').insertAdjacentHTML('beforeend', waPromptRow('', '')); }
+
     async function waSave() {
+        const prompts = {};
+        document.querySelectorAll('#waPrompts .wa-prow').forEach(r => {
+            const n = r.querySelector('.wa-pnum').value.replace(/\D/g, ''), t = r.querySelector('.wa-ptext').value.trim();
+            if (n && t) prompts[n] = t;
+        });
         const body = { enabled: document.getElementById('waEnabled').checked, whitelist: document.getElementById('waWhitelist').value,
-            model: document.getElementById('waModel').value, prompt: document.getElementById('waPrompt').value.trim() };
+            model: document.getElementById('waModel').value, prompt: document.getElementById('waPrompt').value.trim(), prompts };
         try {
             waState.info = await ctxCall('/whatsapp/config', body);
             toast('✅ Salvato', 'success');
@@ -9865,10 +10022,235 @@ $dataJson = json_encode(ykanPublicData($data));
         };
         badge.style.display = '';
         badge.innerHTML = bar('5h', u.fiveHour?.utilization, left(u.fiveHour?.resets_at)) + bar('Sett', u.weekly?.utilization);
+        homeUsageSeen(u);
     });
 
     function claudeUsageRefresh() {
         window.postMessage({ source: 'ykan-usage-page', type: 'refresh' }, window.location.origin);
+    }
+
+    // === HOME: cruscotto ===
+    const HOUR = 3600000, FIVE_H = 5 * HOUR;
+    let homeUsage = null;
+    const homeDayKey = () => 'ykan_first_use_' + new Date().toISOString().slice(0, 10);
+    const homeHm = t => new Date(t).toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit' });
+
+    // La prima fascia parte dal primo uso del giorno: è l'inizio della finestra di 5 ore
+    // più vecchia vista oggi (reset - 5h), salvato nel browser.
+    function homeUsageSeen(u) {
+        homeUsage = u;
+        const reset = u && u.fiveHour && u.fiveHour.resets_at ? new Date(u.fiveHour.resets_at).getTime() : 0;
+        if (reset && (u.fiveHour.utilization || 0) > 0) {
+            const start = reset - FIVE_H;
+            const today0 = new Date(); today0.setHours(0, 0, 0, 0);
+            try {
+                const prev = +localStorage.getItem(homeDayKey()) || 0;
+                if (start >= today0.getTime() && (!prev || start < prev)) localStorage.setItem(homeDayKey(), String(start));
+            } catch (_) {}
+        }
+        if (document.body.dataset.view === 'home') homeRenderDay();
+    }
+
+    function homeRenderDay() {
+        const now = Date.now();
+        const d8 = new Date(); d8.setHours(8, 0, 0, 0);
+        const d17 = new Date(); d17.setHours(17, 0, 0, 0);
+        let first = 0;
+        try { first = +localStorage.getItem(homeDayKey()) || 0; } catch (_) {}
+        const fh = homeUsage && homeUsage.fiveHour;
+        const reset = fh && fh.resets_at ? new Date(fh.resets_at).getTime() : 0;
+        const curStart = reset && reset > now ? reset - FIVE_H : 0;
+        const b1 = first || curStart || d8.getTime();
+        // seconda fascia: la finestra attuale se è ripartita dopo una pausa, se no subito dopo la prima
+        const b2 = curStart && curStart > b1 + 60000 ? curStart : b1 + FIVE_H;
+        const bands = [[b1, b1 + FIVE_H], [b2, b2 + FIVE_H]];
+        const from = Math.min(b1, d8.getTime()), to = Math.max(bands[1][1], d17.getTime());
+        const x = t => ((t - from) / (to - from) * 100).toFixed(2) + '%';
+        const pct = Math.round(fh ? fh.utilization || 0 : 0);
+        const curIdx = bands.findIndex(([s, e]) => now >= s && now < e);
+
+        document.getElementById('homeDay').innerHTML = bands.map(([s, e], i) => {
+            const cur = i === curIdx;
+            const label = `Fascia ${i + 1} · ${homeHm(s)}–${homeHm(e)}` + (cur && homeUsage ? ` · ${pct}%` : now >= e ? ' · chiusa' : !first && !homeUsage ? '' : now < s ? ' · da iniziare' : '');
+            return `<div class="home-band${cur ? ' cur' : ''}" style="left:${x(s)};width:calc(${x(e)} - ${x(s)})">${cur && homeUsage ? `<i style="width:${Math.min(100, pct)}%"></i>` : ''}<span>${label}</span></div>`;
+        }).join('') + (now > from && now < to ? `<div class="home-now" style="left:${x(now)}" title="Adesso, ${homeHm(now)}"></div>` : '');
+
+        const ticks = [];
+        for (let h = new Date(from).getHours(); h <= new Date(to).getHours(); h += 2) { const t = new Date(); t.setHours(h, 0, 0, 0); ticks.push(t.getTime()); }
+        document.getElementById('homeAxis').innerHTML = ticks.map(t => `<span style="left:${x(t)}">${String(new Date(t).getHours()).padStart(2, '0')}</span>`).join('');
+
+        let title = 'Oggi';
+        if (!homeUsage) title += ' · consumo non disponibile (serve l\'estensione Ykan Usage Badge)';
+        else if (curIdx >= 0) {
+            const [s, e] = bands[curIdx];
+            const elapsed = Math.round((now - s) / (e - s) * 100);
+            title += ` · ${pct}% della fascia ${curIdx + 1}, riparte alle ${homeHm(reset || e)}`
+                + (pct > elapsed + 10 ? ' · stai consumando più veloce del tempo' : pct < elapsed - 10 ? ' · sei sotto il ritmo, hai margine' : ' · in linea col ritmo');
+        } else title += ` · nessuna fascia attiva adesso`;
+        document.getElementById('homeDayTitle').textContent = title;
+        homeRenderWeek();
+    }
+
+    // Settimana: il 90% del limite va nei giorni lavorativi (18% al giorno, distribuito tra le 8 e le 17),
+    // il 10% resta per il weekend (5% al giorno). La finestra è quella del limite settimanale (reset - 7 giorni).
+    function homeWeekBudget(day) { return day.getDay() % 6 === 0 ? 5 : 18; }
+    function homeRenderWeek() {
+        const box = document.getElementById('homeWeek');
+        const w = homeUsage && homeUsage.weekly;
+        const now = Date.now();
+        let end = w && w.resets_at ? new Date(w.resets_at).getTime() : 0;
+        if (!end) { const m = new Date(); m.setHours(0, 0, 0, 0); m.setDate(m.getDate() - (m.getDay() + 6) % 7 + 7); end = m.getTime(); }
+        const start = end - 7 * 86400000;
+        // La barra è in percentuale del limite: ogni giorno è largo quanto la sua quota, così la
+        // striscia blu (consumo reale) e il piano stanno sulla stessa scala. Il primo e l'ultimo giorno
+        // contano solo le ore 8-17 dentro la settimana; le quote vengono riportate a 100 in totale.
+        const days = [];
+        for (let d = new Date(new Date(start).setHours(0, 0, 0, 0)); d.getTime() < end; d.setDate(d.getDate() + 1)) {
+            const s8 = new Date(d).setHours(8, 0, 0, 0);
+            const ws = Math.max(s8, start), we = Math.min(s8 + 9 * HOUR, end);
+            if (we > ws) days.push({ d: new Date(d), ws, we, q: homeWeekBudget(d) * (we - ws) / (9 * HOUR) });
+        }
+        const tot = days.reduce((a, b) => a + b.q, 0) || 1;
+        let acc = 0;
+        days.forEach(g => { g.q = g.q / tot * 100; g.from = acc; acc += g.q; });
+        const expectedAt = t => days.reduce((a, g) => a + g.q * Math.max(0, Math.min(1, (t - g.ws) / (g.we - g.ws))), 0);
+        const pct = w ? Math.round(w.utilization || 0) : null;
+        const expRaw = expectedAt(now), exp = Math.round(expRaw);
+        box.innerHTML = days.map(g => {
+            const cur = now >= new Date(g.d).setHours(0, 0, 0, 0) && now < new Date(g.d).setHours(24, 0, 0, 0);
+            const lbl = g.d.toLocaleDateString('it-IT', { weekday: 'short' }) + ' · ' + Math.round(g.q) + '%';
+            return `<div class="home-band${cur ? ' cur' : ''}" style="left:${g.from.toFixed(2)}%;width:${g.q.toFixed(2)}%" title="${escHtml(g.d.toLocaleDateString('it-IT', { weekday: 'long', day: 'numeric' }))}: quota ${Math.round(g.q)}%"><span>${lbl}</span></div>`;
+        }).join('')
+            + (pct !== null ? `<div style="position:absolute;left:0;bottom:0;height:6px;width:${Math.min(100, pct)}%;background:${pct > exp + 5 ? '#D98639' : '#378ADD'}" title="Usato ${pct}%"></div>` : '')
+            + `<div class="home-now" style="left:${expRaw.toFixed(2)}%" title="Adesso il piano dice ${exp}%"></div>`;
+        document.getElementById('homeWeekAxis').innerHTML = [0, 25, 50, 75, 100].map(p => `<span style="left:${p}%${p === 0 ? ';transform:none' : p === 100 ? ';transform:translateX(-100%)' : ''}">${p}%</span>`).join('');
+        let title = 'Settimana';
+        if (pct === null) title += ' · consumo non disponibile';
+        else {
+            const proj = exp > 2 ? Math.round(pct / exp * 100) : null;
+            title += ` · ${pct}% usato, il piano dice ${exp}% a quest'ora`
+                + (pct > exp + 5 ? ' · sei avanti, rallenta' : pct < exp - 5 ? ' · hai margine' : ' · in linea')
+                + (proj !== null ? ` · a questo ritmo chiudi al ${proj}%` : '');
+        }
+        title += ` · reset ${new Date(end).toLocaleDateString('it-IT', { weekday: 'short', day: 'numeric' })} ${homeHm(end)}`;
+        document.getElementById('homeWeekTitle').textContent = title;
+    }
+
+    function homeCards() {
+        const colName = Object.fromEntries(boardData.columns.map(c => [c.id, c.name]));
+        const laneName = Object.fromEntries(boardData.swimlanes.map(l => [l.id, l.name]));
+        const today = new Date().toISOString().slice(0, 10);
+        const all = boardData.cards.map(c => ({ c, col: colName[c.column_id] || '', lane: laneName[c.swimlane_id] || '', done: dashCardDone(c) }));
+        const open = all.filter(x => !x.done && !x.c.archived);
+        const urgent = open.filter(x => x.c.priority === 'high' || (x.c.due_date && x.c.due_date < today));
+        return { all, open, urgent, today };
+    }
+    const homeCardLink = c => `<a onclick="openCardModal('${c.id}')" title="${escHtml(c.title)}">#${c.seq || ''} ${escHtml(c.title)}</a>`;
+    const homeAgo = iso => { const m = Math.floor((Date.now() - new Date(iso)) / 60000); return m < 60 ? m + ' min' : m < 1440 ? Math.floor(m / 60) + 'h' : dashAgo(new Date(iso).getTime()); };
+
+    // Sessioni Claude Code di tutti i progetti con cartella, lette una volta sola per i widget che le usano
+    let homeSessP = null;
+    function homeSessions() {
+        if (homeSessP) return homeSessP;
+        const lanes = boardData.swimlanes.filter(l => l.local_path);
+        homeSessP = Promise.all(lanes.map(l => bridgeFetch('/sessions?dir=' + encodeURIComponent(l.local_path))
+            .then(r => r.ok ? r.json() : { sessions: [] }).then(j => (j.sessions || []).map(s => ({ ...s, lane: l })))
+            .catch(() => null)))
+            .then(rs => { const ok = rs.some(Boolean); homeDot('homeDotBridge', ok ? 'ok' : 'ko'); return { ok, list: rs.filter(Boolean).flat().filter(s => !s.auto) }; });
+        return homeSessP;
+    }
+    function homeDot(id, cls) { const el = document.getElementById(id); if (el) el.className = 'home-dot ' + cls; }
+
+    const HOME_WIDGETS = [
+        ['Progetti', async () => {
+            const { open, urgent } = homeCards();
+            return boardData.swimlanes.map(l => ({ l, n: open.filter(x => x.c.swimlane_id === l.id).length, u: urgent.filter(x => x.c.swimlane_id === l.id).length }))
+                .filter(p => p.n).sort((a, b) => b.u - a.u || b.n - a.n).slice(0, 5)
+                .map(p => `<div class="row"><span>${escHtml(p.l.name)}</span><span class="sub">${p.n} aperti${p.u ? ` · <b style="color:var(--high)">${p.u} urg.</b>` : ''}</span></div>`).join('') || '<span class="sub">Nessuna card aperta</span>';
+        }],
+        ['Ultime chat Claude Code', async () => {
+            const s = await homeSessions();
+            if (!s.ok) return '<span class="sub">Bridge non raggiungibile</span>';
+            return s.list.sort((a, b) => new Date(b.modified) - new Date(a.modified)).slice(0, 4)
+                .map(x => `<div class="row"><a onclick="openInDesktop('${escHtml(x.lane.id)}', '${escHtml(x.id)}')" title="${escHtml(x.lane.name)}: apri in Claude Desktop">${escHtml(x.title || x.preview || '(senza titolo)')}</a><span class="sub">${homeAgo(x.modified)}</span></div>`).join('') || '<span class="sub">Nessuna sessione</span>';
+        }],
+        ['Da fare adesso', async () => {
+            const { open, today } = homeCards();
+            const score = x => (x.c.priority === 'high' ? 0 : 2) + (x.c.due_date && x.c.due_date <= today ? -1 : 0) + (DASH_DOING_RE.test(x.col) ? -0.5 : 0);
+            return open.filter(x => !/claude do/i.test(x.col)).sort((a, b) => score(a) - score(b)).slice(0, 4)
+                .map(x => `<div class="row">${homeCardLink(x.c)}<span class="sub">${escHtml(x.lane)}</span></div>`).join('') || '<span class="sub">Niente in sospeso</span>';
+        }],
+        ['Claude oggi', async () => {
+            const { open } = homeCards();
+            const queue = open.filter(x => /claude do/i.test(x.col)).length;
+            const s = await homeSessions();
+            const t0 = new Date(); t0.setHours(0, 0, 0, 0);
+            const today = s.ok ? s.list.filter(x => new Date(x.modified) >= t0) : [];
+            const ask = today.filter(x => x.endsWithQuestion).length;
+            return `<div class="row"><span>Sessioni di oggi</span><b>${s.ok ? today.length : '—'}</b></div>`
+                + `<div class="row"><span>In coda in Claude Do</span><b>${queue}</b></div>`
+                + (ask ? `<div class="row"><span style="color:var(--high)">Ti ha fatto domande</span><b>${ask}</b></div>` : '');
+        }],
+        ['Scadenze', async () => {
+            const { open, today } = homeCards();
+            return open.filter(x => x.c.due_date).sort((a, b) => a.c.due_date.localeCompare(b.c.due_date)).slice(0, 4)
+                .map(x => `<div class="row">${homeCardLink(x.c)}<span class="sub" style="${x.c.due_date < today ? 'color:var(--high)' : ''}">${x.c.due_date === today ? 'oggi' : new Date(x.c.due_date).toLocaleDateString('it-IT', { day: 'numeric', month: 'short' })}</span></div>`).join('') || '<span class="sub">Nessuna scadenza</span>';
+        }],
+        ['WhatsApp', async () => {
+            const [info, chats] = await Promise.all([ctxCall('/whatsapp').catch(() => null), ctxCall('/whatsapp/chats').catch(() => null)]);
+            homeDot('homeDotWa', info && info.status === 'open' ? 'ok' : info && info.status !== 'off' ? 'warn' : 'ko');
+            if (!info) return '<span class="sub">Bridge non raggiungibile</span>';
+            const list = (chats && chats.chats || []);
+            const day = list.filter(c => c.at && Date.now() - new Date(c.at) < 86400000);
+            return `<div class="row"><span>Stato</span><span>${(WA_STATES[info.status] || ['', info.status]).join(' ')}</span></div>`
+                + `<div class="row"><span>Chat attive nelle 24h</span><b>${day.length}</b></div>`
+                + (list[0] ? `<div class="row"><span class="sub">${escHtml(list[0].name || list[0].num)}</span><span class="sub">${homeAgo(list[0].at)}</span></div>` : '');
+        }],
+        ['Bloccati', async () => {
+            const { open } = homeCards();
+            const openSeq = new Set(open.map(x => String(x.c.seq)));
+            const waits = c => (c.depends_on || []).filter(d => openSeq.has(String(d)));
+            return open.filter(x => waits(x.c).length).slice(0, 4)
+                .map(x => `<div class="row">${homeCardLink(x.c)}<span class="sub">aspetta #${waits(x.c).join(' #')}</span></div>`).join('') || '<span class="sub">Niente di bloccato</span>';
+        }],
+        ['Terminali', async () => {
+            const n = termSessions.length;
+            return `<div class="row"><span>Aperti in questa pagina</span><b>${n}</b></div>`
+                + (n ? termSessions.slice(0, 3).map(t => `<div class="row sub"><span>${escHtml((boardData.swimlanes.find(l => l.id === t.laneId) || {}).name || 'shell')}</span></div>`).join('') : '<span class="sub">Nessun terminale aperto</span>');
+        }],
+        ['Settimana', async () => {
+            const { all } = homeCards();
+            const week = Date.now() - 7 * 86400000;
+            const done = all.filter(x => x.done && dashTs(x.c.moved_at || x.c.updated_at || '') >= week).length;
+            const created = all.filter(x => dashTs(x.c.created_at || '') >= week).length;
+            const p = created ? Math.min(100, Math.round(done / created * 100)) : 0;
+            return `<div class="row"><span>Card chiuse</span><b>${done}</b></div><div class="row"><span>Card nuove</span><b>${created}</b></div>`
+                + `<div class="usage-bar" style="width:100%;margin-top:6px"><i style="width:${p}%;background:#1D9E75"></i></div>`;
+        }]
+    ];
+
+    function loadHome() {
+        const h = new Date().getHours();
+        document.getElementById('homeHello').textContent = (h < 13 ? 'Buongiorno' : h < 18 ? 'Buon pomeriggio' : 'Buonasera') + ' · '
+            + new Date().toLocaleDateString('it-IT', { weekday: 'short', day: 'numeric', month: 'short' });
+        const { open, urgent, all, today } = homeCards();
+        const kpi = (lbl, n, color) => `<div class="home-box"><div class="lbl">${lbl}</div><div class="num"${color ? ` style="color:${color}"` : ''}>${n}</div></div>`;
+        document.getElementById('homeKpis').innerHTML = kpi('Urgenti', urgent.length, urgent.length ? 'var(--high)' : '')
+            + kpi('In corso', open.filter(x => DASH_DOING_RE.test(x.col)).length)
+            + kpi('Fatti oggi', all.filter(x => x.done && String(x.c.moved_at || '').startsWith(today)).length)
+            + kpi('Claude Do in coda', open.filter(x => /claude do/i.test(x.col)).length);
+        homeRenderDay();
+        claudeUsageRefresh();
+        homeSessP = null;
+        homeDot('homeDotBridge', ''); homeDot('homeDotWa', ''); homeDot('homeDotClaude', '');
+        bridgeFetch('/claude/auth').then(async r => homeDot('homeDotClaude', r.ok && (await r.json()).loggedIn ? 'ok' : 'warn')).catch(() => homeDot('homeDotClaude', 'ko'));
+        const grid = document.getElementById('homeGrid');
+        grid.innerHTML = HOME_WIDGETS.map(([title], i) => `<div class="home-box" id="homeW${i}"><div class="lbl">${escHtml(title)}</div><div class="home-sk"></div><div class="home-sk" style="width:65%"></div></div>`).join('');
+        // ogni widget per conto suo: il primo che risponde compare, gli altri non lo aspettano
+        HOME_WIDGETS.forEach(([title, load], i) => load().catch(e => `<span class="sub">Errore: ${escHtml(e.message)}</span>`).then(html => {
+            const el = document.getElementById('homeW' + i);
+            if (el) el.innerHTML = `<div class="lbl">${escHtml(title)}</div>${html}`;
+        }));
     }
 
     // === LABELS ===
@@ -10130,6 +10512,7 @@ Rules:
     function pmCloseOthers() {
         ['archivePanel', 'geminiPanel', 'githubPanel', 'pmPanel'].forEach(id =>
             document.getElementById(id).classList.remove('open'));
+        document.body.classList.remove('ai-open');
     }
 
     function toggleArchive() {
@@ -10144,7 +10527,132 @@ Rules:
         const open = !p.classList.contains('open');
         pmCloseOthers();
         p.classList.toggle('open', open);
+        document.body.classList.toggle('ai-open', open);
+        document.getElementById('aiEdge').textContent = open ? '▸ ✨ Another AI' : '◂ ✨ Another AI';
+        if (open) { aiPanelRefresh(); aiEdgeContext(); }
     }
+
+    // Tasti proposti dalla barra in base alla pagina: riempiono la domanda, tu la completi e premi Ask.
+    // La domanda parte con il nome della pagina, così l'AI sa di cosa stai parlando.
+    const AI_PAGE_ACTIONS = {
+        home: [['Cosa faccio adesso?', 'Guarda le card urgenti, in corso e in scadenza e dimmi le 3 cose da fare adesso, in ordine.']],
+        dashboard: [['Riassumi i progetti', 'Riassumi in poche righe lo stato di ogni progetto e cosa è fermo.']],
+        'claude:wa': [['Istruzione per un numero', 'Scrivimi un\'istruzione per il bot WhatsApp per il numero … : deve … . Dammi il testo pronto da incollare nel campo istruzioni.']],
+        'claude:skills': [['Cerca skill per…', 'Suggeriscimi skill di Claude Code (con il link alla pagina originale) per: '],
+            ['Origine di una skill', 'Trova la pagina originale (repository o autore) della skill installata chiamata: ']],
+        'claude:plugins': [['Cerca plugin per…', 'Suggeriscimi plugin di Claude Code utili per: ']],
+        claude: [['Cosa posso fare qui?', 'Spiegami in breve a cosa serve questa sezione di Ykan e cosa conviene configurare.']],
+        settings: [['Come configuro…', 'Spiegami passo passo come configurare in Ykan: ']]
+    };
+    function aiPageKey() {
+        const v = document.body.dataset.view || 'kanban';
+        return v === 'claude' && typeof claudeTabName !== 'undefined' && AI_PAGE_ACTIONS['claude:' + claudeTabName] ? 'claude:' + claudeTabName : v;
+    }
+    function aiEdgeContext() {
+        const box = document.getElementById('aiPageActions');
+        if (!box) return;
+        box.innerHTML = (AI_PAGE_ACTIONS[aiPageKey()] || []).map(([label, text]) =>
+            `<button class="btn" onclick="aiPagePrompt(${escHtml(JSON.stringify(text))})">${escHtml(label)}</button>`).join('');
+    }
+    function aiPagePrompt(text) {
+        const input = document.getElementById('geminiCustom');
+        input.value = text;
+        input.focus();
+        input.setSelectionRange(text.length, text.length);
+    }
+
+    // Selettore del pannello: Claude Code (via Bridge, legge il progetto) + i connettori di Settings → Another AI.
+    // Le voci senza chiave o con Claude non raggiungibile restano visibili ma non selezionabili.
+    let aiPanelChoice = (() => { try { return localStorage.getItem('ykan_ai_panel') || ''; } catch (_) { return ''; } })();
+
+    async function aiPanelRefresh() {
+        const sel = document.getElementById('aiPanelProvider');
+        sel.innerHTML = '<option>Controllo le AI…</option>';
+        const [st, claude] = await Promise.all([
+            api('ai_status').catch(() => null),
+            bridgeFetch('/claude/auth').then(async r => r.ok ? ((await r.json()).loggedIn ? 'ok' : 'login') : 'bridge').catch(() => 'bridge')
+        ]);
+        const opts = [{ id: 'claude', name: 'Claude Code', ok: claude === 'ok',
+            why: { ok: 'via Bridge', login: 'serve il login', bridge: 'Bridge non raggiungibile' }[claude] }];
+        for (const [id, p] of Object.entries(AI_PROVIDERS)) {
+            const s = st && st.success ? st.providers[id] : null;
+            const ok = !!s && (id === 'ollama' || !!s.key_source);
+            opts.push({ id, name: p.name, ok, why: !s ? 'stato sconosciuto' : ok ? s.model : 'nessuna chiave' });
+        }
+        const def = (boardData.config.ai || {}).provider || 'gemini';
+        const pick = [aiPanelChoice, def].find(id => (opts.find(o => o.id === id) || {}).ok) || (opts.find(o => o.ok) || {}).id || '';
+        sel.innerHTML = opts.map(o => `<option value="${o.id}" ${o.ok ? '' : 'disabled'}>${o.ok ? '🟢' : '⚪'} ${escHtml(o.name)} · ${escHtml(o.why || '')}</option>`).join('')
+            + (pick ? '' : '<option value="" selected disabled>Nessuna AI disponibile: configurale in ⚙️</option>');
+        if (pick) sel.value = pick;
+        aiPanelPick(pick, true);
+        const ls = document.getElementById('aiPanelLane');
+        const prev = ls.value;
+        ls.innerHTML = '<option value="">📋 Tutta la board</option>' + boardData.swimlanes.map(l => `<option value="${l.id}">📁 ${escHtml(l.name)}${l.local_path ? '' : ' (senza cartella)'}</option>`).join('');
+        if (prev && boardData.swimlanes.some(l => l.id === prev)) ls.value = prev;
+        aiPanelPick(aiPanelChoice, true);
+    }
+
+    function aiPanelPick(id, silent) {
+        aiPanelChoice = id;
+        if (!silent) try { localStorage.setItem('ykan_ai_panel', id); } catch (_) {}
+        const ls = document.getElementById('aiPanelLane');
+        const all = ls.querySelector('option[value=""]');
+        if (all) all.disabled = id === 'claude'; // Claude lavora in una cartella: serve un progetto
+        if (id === 'claude' && !ls.value && ls.options.length > 1) ls.selectedIndex = 1;
+    }
+
+    // Markdown delle risposte AI: titoli, grassetto, codice, elenchi e tabelle (tutto escapato prima)
+    function aiMarkdown(text) {
+        const inline = t => t.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>').replace(/`([^`]+)`/g, '<code>$1</code>');
+        const out = [];
+        const lines = escHtml(String(text || '')).split('\n');
+        for (let i = 0; i < lines.length; i++) {
+            const l = lines[i];
+            if (/^\s*\|.*\|\s*$/.test(l)) {
+                const rows = [];
+                while (i < lines.length && /^\s*\|.*\|\s*$/.test(lines[i])) rows.push(lines[i++]);
+                i--;
+                const cells = r => r.trim().replace(/^\||\|$/g, '').split('|').map(c => inline(c.trim()));
+                const body = rows.filter(r => !/^\s*\|[\s:|-]+\|\s*$/.test(r));
+                out.push('<div class="ai-table"><table>' + body.map((r, k) => '<tr>' + cells(r).map(c => k ? `<td>${c}</td>` : `<th>${c}</th>`).join('') + '</tr>').join('') + '</table></div>');
+            } else if (/^#{1,4}\s/.test(l)) out.push(`<h4>${inline(l.replace(/^#+\s*/, ''))}</h4>`);
+            else if (/^\s*[-*]\s/.test(l)) out.push(`<div class="ai-li">• ${inline(l.replace(/^\s*[-*]\s/, ''))}</div>`);
+            else out.push(l.trim() ? `<div>${inline(l)}</div>` : '<div class="ai-gap"></div>');
+        }
+        return out.join('');
+    }
+
+    function aiPanelShow(html) { document.getElementById('geminiContent').innerHTML = html; }
+    function aiPanelResult(r) {
+        aiPanelShow(r.success ? `<div class="gemini-response ai-md">${aiMarkdown(r.response)}</div>`
+            : `<div class="gemini-response" style="color:var(--high)">${escHtml(r.error)}</div>`);
+    }
+
+    // Claude Code sul PC: lavora nella cartella del progetto scelto con soli strumenti di lettura
+    async function aiClaudeAsk(question) {
+        const lane = boardData.swimlanes.find(l => l.id === document.getElementById('aiPanelLane').value);
+        if (!lane || !lane.local_path) return { success: false, error: 'Per Claude Code scegli un progetto con una cartella locale (Settings → Progetti).' };
+        const cols = Object.fromEntries(boardData.columns.map(c => [c.id, c.name]));
+        const cards = boardData.cards.filter(c => c.swimlane_id === lane.id && !c.archived)
+            .map(c => `- [${cols[c.column_id] || '?'}] ${c.title} (${c.priority})`).slice(0, 150).join('\n');
+        const lang = { en: 'inglese', es: 'spagnolo', fr: 'francese', de: 'tedesco', pt: 'portoghese' }[boardData.config.ai_language] || 'italiano';
+        const prompt = `Sei nel progetto "${lane.name}" (cartella corrente). Puoi leggere i file ma non modificarli.\n`
+            + `Task sulla board Kanban:\n${cards || '(nessuno)'}\n\nRispondi in ${lang}, in modo pratico e conciso.\n\nDomanda: ${question}`;
+        try {
+            const r = await bridgeFetch('/claude/ask', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ dir: lane.local_path, prompt }) });
+            if (r.status === 404) return { success: false, error: 'Il Bridge va aggiornato per usare Claude Code qui.' };
+            const j = await r.json();
+            if (!r.ok) return { success: false, error: j.error || 'HTTP ' + r.status };
+            return { success: true, response: j.response + `\n\n— Claude Code · ${j.seconds}s` };
+        } catch (e) { return { success: false, error: 'Bridge non raggiungibile: ' + e.message }; }
+    }
+
+    const AI_CLAUDE_PROMPTS = {
+        analyze: 'Guarda i task della board e il codice: con quale task conviene proseguire, quali priorità rivedere, tempi stimati.',
+        suggest_tasks: 'Leggendo il codice, suggerisci nuovi task utili per il progetto (bug, migliorie, mancanze).',
+        estimate: 'Stima in modo realistico il tempo per completare i task aperti della board.',
+        project: 'Analizza il progetto: panoramica in 2 frasi, stack, architettura, punti di forza, problemi, e massimo 5 task suggeriti con priorità.'
+    };
 
     function toggleGithub() {
         const panel = document.getElementById('githubPanel');
@@ -10631,59 +11139,34 @@ ${epicRows}</div>`);
     }
 
     // === GEMINI ===
+    function aiPanelWait() {
+        aiPanelShow(`<div class="gemini-loading">${aiPanelChoice === 'claude' ? 'Claude Code sta leggendo il progetto… (10-120 s)' : 'Analisi in corso…'}</div>`);
+    }
+
     async function askGemini(prompt) {
-        if (!boardData.config.gemini_api_key) {
-            toast('Configure Gemini API Key first', 'error');
-            openConfigModal();
-            return;
-        }
-
-        const content = document.getElementById('geminiContent');
-        content.innerHTML = '<div class="gemini-loading">Analysis in progress...</div>';
-
-        const result = await api('gemini_analyze', { prompt });
-        if (result.success) {
-            content.innerHTML = `<div class="gemini-response">${escHtml(result.response)}</div>`;
-        } else {
-            content.innerHTML = `<div class="gemini-response" style="color:var(--high)">${escHtml(result.error)}</div>`;
-        }
+        if (!aiPanelChoice) return aiPanelShow('<div class="gemini-response">Nessuna AI disponibile: configurale in Settings → Another AI.</div>');
+        aiPanelWait();
+        aiPanelResult(aiPanelChoice === 'claude' ? await aiClaudeAsk(AI_CLAUDE_PROMPTS[prompt]) : await api('gemini_analyze', { prompt, provider: aiPanelChoice, lane_id: document.getElementById('aiPanelLane').value }));
     }
 
     async function askGeminiCustom() {
         const input = document.getElementById('geminiCustom');
-        const question = input.value.trim();
-        if (!question) return;
-
-        if (!boardData.config.gemini_api_key) {
-            toast('Configure Gemini API Key first', 'error');
-            openConfigModal();
-            return;
-        }
-
-        const content = document.getElementById('geminiContent');
-        content.innerHTML = '<div class="gemini-loading">Analysis in progress...</div>';
+        let question = input.value.trim();
+        if (!question || !aiPanelChoice) return;
+        const page = aiPageKey();
+        if (page !== 'kanban') question = `[Sono nella pagina "${page}" di Ykan] ` + question;
         input.value = '';
-
-        const result = await api('gemini_analyze', { prompt: 'custom', custom_prompt: question });
-        if (result.success) {
-            content.innerHTML = `<div class="gemini-response">${escHtml(result.response)}</div>`;
-        } else {
-            content.innerHTML = `<div class="gemini-response" style="color:var(--high)">${escHtml(result.error)}</div>`;
-        }
+        aiPanelWait();
+        aiPanelResult(aiPanelChoice === 'claude' ? await aiClaudeAsk(question) : await api('gemini_analyze', { prompt: 'custom', custom_prompt: question, provider: aiPanelChoice, lane_id: document.getElementById('aiPanelLane').value }));
     }
 
     // === PROJECT ANALYSIS ===
     async function analyzeProject() {
-        if (!boardData.config.gemini_api_key) {
-            toast('Configure Gemini API Key first', 'error');
-            openConfigModal();
-            return;
-        }
-
+        if (aiPanelChoice === 'claude') return askGemini('project');
         const content = document.getElementById('geminiContent');
         content.innerHTML = '<div class="gemini-loading">🔍 Scanning project...<br><small>Analyzing structure, key files and entry points</small></div>';
 
-        const result = await api('analyze_project');
+        const result = await api('analyze_project', { provider: aiPanelChoice });
         if (!result.success) {
             let errorHtml = `<div class="gemini-response" style="color:var(--high)">${escHtml(result.error)}</div>`;
             if (result.debug) {
@@ -10821,8 +11304,8 @@ ${epicRows}</div>`);
     render();
     loadThemes(); // populate the theme switcher (built-ins + custom files)
     setTimeout(() => {
-        let v = 'kanban';
-        try { v = localStorage.getItem('ykan_view') || 'kanban'; } catch (_) {}
+        let v = 'home';
+        try { v = localStorage.getItem('ykan_view') || 'home'; } catch (_) {}
         showView(v);
         statInit();
     }, 0);
@@ -10841,7 +11324,7 @@ ${epicRows}</div>`);
     });
 
     // Check if first run
-    if (!boardData.config.gemini_api_key && boardData.cards.length === 0) {
+    if (boardData.cards.length === 0) {
         setTimeout(openConfigModal, 500);
     }
 
@@ -11210,6 +11693,18 @@ ${epicRows}</div>`);
     <!-- Contenuto della scheda "Changelog" del terminale (clonato da termInit) -->
     <template id="changelogTpl">
         <div class="changelog-content">
+
+            <div class="changelog-version">
+                <h3>v2.2.0 - October 2026</h3>
+                <ul>
+                    <li>🏠 <strong>Home</strong> - new start page: urgent / in progress / done today / Claude Do, today's two 5-hour token windows from your first use, the week's usage against a Mon-Fri plan (90%, weekend 10%), and a 3x3 grid of widgets that load on their own</li>
+                    <li>✨ <strong>Another AI everywhere</strong> - side tab on the right edge of every page, closed by default, with suggested prompts for the page you're on (WhatsApp, Skills, Plugin, Settings…)</li>
+                    <li>🖥️ <strong>Open in Claude Desktop</strong> - from the Home's latest chats and from Progetti → Revisione</li>
+                    <li>⌨️ <strong>Terminal bar</strong> - no shell opens on its own (only Changelog and Console); per project: cmd, PowerShell, Claude Code, folder (Explorer / Finder) and the project's website</li>
+                    <li>💬 <strong>WhatsApp per-number instructions</strong> - each number can have its own prompt (e.g. a demo for a client)</li>
+                    <li>🍎 <strong>Bridge 0.9.4</strong> - PowerShell and open-folder endpoints, Claude Code answers in the Another AI panel reading the project, macOS beta zip; self-update fixes</li>
+                </ul>
+            </div>
 
             <div class="changelog-version">
                 <h3>v2.1.0 - October 2026</h3>
