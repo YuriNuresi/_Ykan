@@ -1578,6 +1578,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['api'])) {
                         // Claude Code Project collegato (1 swimlane = 1 Project): solo link claude.ai
                         if (array_key_exists('claude_project_url', $input) && preg_match('~^(https://claude\.ai/[\w\-./?=&%#]+)?$~', (string)$input['claude_project_url'])) $lane['claude_project_url'] = $input['claude_project_url'];
                         if (array_key_exists('github_repo', $input) && preg_match('/^([\w.-]+\/[\w.-]+)?$/', (string)$input['github_repo'])) $lane['github_repo'] = $input['github_repo'];
+                        // Colore dell'header del progetto scelto con la matita (vuoto = automatico dal nome)
+                        if (array_key_exists('color', $input) && preg_match('/^(#[0-9a-fA-F]{6})?$/', (string)$input['color'])) $lane['color'] = $input['color'];
                         // Doc/structure files the AI should study before working
                         if (array_key_exists('doc_files', $input)) $lane['doc_files'] = array_values($input['doc_files'] ?? []);
                         break;
@@ -4155,6 +4157,39 @@ $dataJson = json_encode(ykanPublicData($data));
         @media (max-width: 900px) { .home-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .home-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
         @media (max-width: 560px) { .home-grid { grid-template-columns: minmax(0, 1fr); } }
 
+        /* Kanban in stile bento: header del progetto col suo colore (--lane), card tinte per urgenza */
+        .board .swimlane { border-color: rgba(var(--lane), .28); }
+        .board .swimlane-header { background: linear-gradient(90deg, rgba(var(--lane), .2), rgba(var(--lane), .04) 60%), var(--swimlane-bg); border-left: 3px solid rgb(var(--lane)); }
+        .board .swimlane-name { font-weight: 600; }
+        .lane-color { position: relative; display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 6px; color: rgb(var(--lane)); cursor: pointer; opacity: .55; transition: opacity .15s, background .15s; }
+        .swimlane-header:hover .lane-color { opacity: 1; } .lane-color:hover { background: rgba(var(--lane), .15); }
+        .lane-color input { position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%; border: none; padding: 0; }
+        .board .card[data-pri] { --tone: 140,140,140; background: linear-gradient(160deg, rgba(var(--tone), .13), rgba(var(--tone), .02) 75%), var(--card-bg); border-color: rgba(var(--tone), .25); }
+        .board .card[data-pri="high"] { --tone: 216,90,80; } .board .card[data-pri="medium"] { --tone: 217,134,57; } .board .card[data-pri="low"] { --tone: 29,158,117; }
+        .board .card[data-pri]:hover { border-color: rgba(var(--tone), .6); }
+
+        /* Popup del task: largo, due colonne di riquadri bento (contenuto a sinistra, dettagli a destra) */
+        #cardModal .modal { max-width: 1060px; width: 94%; padding: 0; }
+        .cm-head { padding: 16px 20px 12px; border-bottom: 1px solid var(--border); background: linear-gradient(120deg, rgba(var(--tone), .16), transparent 70%); --tone: 217,134,57; }
+        #cardModal[data-pri="high"] .cm-head { --tone: 216,90,80; } #cardModal[data-pri="low"] .cm-head { --tone: 29,158,117; }
+        .cm-head h2 { margin: 0 0 8px; font-size: 13px; font-weight: 500; color: var(--text2); }
+        .cm-head #cardTitleInput { font-size: 19px; font-weight: 600; border: none; background: transparent; padding: 2px 0; width: 100%; }
+        .cm-head #cardTitleInput:focus { outline: none; box-shadow: inset 0 -2px 0 rgba(var(--tone), .6); }
+        .cm-body { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr); gap: 14px; padding: 16px 20px; }
+        .cm-col { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+        .cm-box { --tone: 140,140,140; background: linear-gradient(160deg, rgba(var(--tone), .1), rgba(var(--tone), .02) 70%), var(--bg3); border: 1px solid rgba(var(--tone), .2); border-radius: 12px; padding: 12px 14px; }
+        .cm-box[data-tone="ok"] { --tone: 29,158,117; } .cm-box[data-tone="warn"] { --tone: 217,134,57; } .cm-box[data-tone="bad"] { --tone: 216,90,80; }
+        .cm-box[data-tone="info"] { --tone: 55,138,221; } .cm-box[data-tone="vi"] { --tone: 127,119,221; }
+        .cm-box > h4 { margin: 0 0 10px; font-size: 12px; font-weight: 600; color: var(--text2); display: flex; align-items: center; gap: 6px; }
+        .cm-box > h4 i { color: rgb(var(--tone)); font-size: 15px; }
+        .cm-box .form-group { margin-bottom: 10px; } .cm-box .form-group:last-child { margin-bottom: 0; }
+        .cm-box label { font-size: 11px; color: var(--text2); }
+        .cm-box #cardDescInput { display: block; width: 100%; box-sizing: border-box; min-height: 220px; resize: vertical; font: inherit; font-size: 13px; line-height: 1.55; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); }
+        .cm-grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+        .cm-foot { display: flex; align-items: center; gap: 8px; padding: 12px 20px; border-top: 1px solid var(--border); position: sticky; bottom: 0; background: var(--bg3); }
+        #cardModal #cardClaudeActions { border: none; padding: 0; margin: 0; }
+        @media (max-width: 820px) { .cm-body { grid-template-columns: minmax(0, 1fr); } }
+
         /* Another AI: linguetta sul bordo destro, in tutte le pagine */
         .ai-edge { position: fixed; right: 0; top: 50%; transform: translateY(-50%); z-index: 501; writing-mode: vertical-rl; background: var(--bg3); border: 1px solid var(--border); border-right: none; border-radius: 8px 0 0 8px; padding: 12px 5px; font-size: 12px; font-weight: 500; color: var(--text2); cursor: pointer; transition: right 0.3s; }
         .ai-edge:hover { color: var(--text); }
@@ -4480,143 +4515,159 @@ $dataJson = json_encode(ykanPublicData($data));
     <!-- Card Modal -->
     <div id="cardModal" class="modal-overlay">
         <div class="modal">
-            <h2 id="cardModalTitle">New Card</h2>
             <form id="cardForm">
                 <input type="hidden" id="cardId">
                 <input type="hidden" id="cardColumnId">
                 <input type="hidden" id="cardSwimlaneId">
-                <div class="form-group" id="templateGroup" style="display:none">
-                    <label>📋 Template</label>
-                    <select id="cardTemplate" onchange="applyTemplate()">
-                        <option value="">Select template...</option>
-                        <option value="bug">🐛 Bug Report</option>
-                        <option value="feature">✨ Feature Request</option>
-                        <option value="task">📌 Generic Task</option>
-                        <option value="docs">📚 Documentation</option>
-                        <option value="refactor">🔧 Refactoring</option>
-                    </select>
+                <!-- Testata: tinta dell'urgenza, titolo grande -->
+                <div class="cm-head">
+                    <h2 id="cardModalTitle">New Card</h2>
+                    <input type="text" id="cardTitleInput" required placeholder="Titolo del task">
                 </div>
-                <div class="form-group">
-                    <label>Title</label>
-                    <input type="text" id="cardTitleInput" required>
-                </div>
-                <div class="form-group">
-                    <label>Description</label>
-                    <textarea id="cardDescInput"></textarea>
-                </div>
-                <div class="form-group">
-                    <label>Priority</label>
-                    <div style="display:flex;gap:8px">
-                        <select id="cardPriorityInput" style="flex:1">
-                            <option value="low">Low</option>
-                            <option value="medium" selected>Medium</option>
-                            <option value="high">High</option>
-                        </select>
-                        <button type="button" class="btn" onclick="aiSuggestCategory()" title="AI suggests label and priority">🤖 Auto</button>
-                        <button type="button" class="btn" onclick="aiEstimate()" title="AI estimates time">⏱️</button>
-                    </div>
-                </div>
-                <div class="form-group">
-                    <label>Label</label>
-                    <select id="cardLabelInput">
-                        <option value="">None</option>
-                    </select>
-                </div>
-                <div class="form-group">
-                    <label>Due Date</label>
-                    <input type="date" id="cardDueInput">
-                </div>
-                <div class="form-group">
-                    <label>Next Check Date</label>
-                    <input type="date" id="cardNextCheckInput">
-                </div>
-                <div class="form-group" style="background:var(--bg2);padding:12px;border-radius:8px;margin-top:16px">
-                    <label style="font-weight:500;margin-bottom:8px;display:block">📁 Associated Files</label>
-                    <div id="cardFilesList" style="margin-bottom:8px"></div>
-                    <div style="display:flex;gap:8px">
-                        <input type="text" id="cardFileInput" placeholder="path/file.php (relative)" style="flex:1;padding:6px 8px;font-size:12px">
-                        <button type="button" class="btn" onclick="addFileToCard()">+ Add</button>
-                    </div>
-                    <p style="font-size:10px;color:var(--text2);margin-top:4px">Relative paths to project folder</p>
-                </div>
-
-                <!-- PM / Spec: epic, dependencies, estimate, acceptance criteria -->
-                <div class="form-group pm-box">
-                    <label>🎯 PM / Spec</label>
-                    <div class="pm-row" style="margin-bottom:8px">
-                        <div style="flex:1;min-width:150px">
-                            <label style="font-size:11px;color:var(--text2)">Epic</label>
-                            <input type="text" id="cardEpicInput" list="pmEpicList" placeholder="es. sistema-achievement" style="width:100%;padding:6px 8px;font-size:12px">
-                            <datalist id="pmEpicList"></datalist>
-                        </div>
-                        <div>
-                            <label style="font-size:11px;color:var(--text2)">Stima</label>
-                            <select id="cardEstimateInput" style="padding:6px 8px;font-size:12px">
-                                <option value="">—</option>
-                                <option value="S">S</option>
-                                <option value="M">M</option>
-                                <option value="L">L</option>
+                <div class="cm-body">
+                    <!-- Colonna principale: cosa c'è da fare e come farlo fare a Claude -->
+                    <div class="cm-col">
+                        <div class="cm-box" id="templateGroup" style="display:none">
+                            <h4><i class="ti ti-template" aria-hidden="true"></i>Template</h4>
+                            <select id="cardTemplate" onchange="applyTemplate()">
+                                <option value="">Select template...</option>
+                                <option value="bug">🐛 Bug Report</option>
+                                <option value="feature">✨ Feature Request</option>
+                                <option value="task">📌 Generic Task</option>
+                                <option value="docs">📚 Documentation</option>
+                                <option value="refactor">🔧 Refactoring</option>
                             </select>
                         </div>
-                        <label style="display:flex;align-items:center;gap:6px;font-size:12px;margin-top:14px;cursor:pointer">
-                            <input type="checkbox" id="cardParallel" style="width:15px;height:15px"> ‖ parallelo
-                        </label>
+                        <div class="cm-box">
+                            <h4><i class="ti ti-align-left" aria-hidden="true"></i>Descrizione</h4>
+                            <textarea id="cardDescInput" placeholder="Cosa c'è da fare, contesto, link…"></textarea>
+                        </div>
+                        <div class="cm-box" data-tone="ok">
+                            <h4><i class="ti ti-checklist" aria-hidden="true"></i>Criteri di accettazione</h4>
+                            <div id="cardAccList"></div>
+                            <div style="display:flex;gap:8px;margin-top:4px">
+                                <input type="text" id="cardAccInput" placeholder="criterio verificabile…" style="flex:1;padding:6px 8px;font-size:12px"
+                                    onkeydown="if(event.key==='Enter'){event.preventDefault();addCardAcc();}">
+                                <button type="button" class="btn" onclick="addCardAcc()">+ Add</button>
+                            </div>
+                        </div>
+                        <!-- Riga Claude: i modi di far lavorare Claude sul task (solo su una card esistente) -->
+                        <div class="cm-box" data-tone="warn" id="cardClaudeBox">
+                            <h4><i class="ti ti-sparkles" aria-hidden="true"></i>Fai lavorare Claude</h4>
+                            <div class="modal-actions" id="cardClaudeActions" style="display:none;justify-content:flex-start;flex-wrap:wrap">
+                                <button type="button" class="btn" id="executeClaudeBtn" onclick="executeWithClaude()" style="display:none;background:linear-gradient(135deg,#d97706,#ea580c);color:white;border:none" title="Esegue il task con l'Agent API di Claude direttamente sul server">🏖️ Claude Agent API</button>
+                                <button type="button" class="btn" id="openClaudeAppBtn" onclick="openInClaudeApp()" style="display:none;background:linear-gradient(135deg,#7c3aed,#6d28d9);color:white;border:none" title="Copia il prompt del task e apre claude.ai">🌐 Claude Web</button>
+                                <button type="button" class="btn" id="playLocalBtn" onclick="playCardInTerminal()" style="display:none;background:linear-gradient(135deg,#059669,#10b981);color:white;border:none" title="Avvia Claude Code nel terminale interno di Ykan, sul contesto di questo task">⌨️ Claude Terminale</button>
+                                <button type="button" class="btn" id="openClaudeDesktopBtn" onclick="openCardInClaudeDesktop()" style="display:none;background:linear-gradient(135deg,#c2410c,#9a3412);color:white;border:none" title="Avvia il task in Claude Desktop, nella cartella del progetto">🖥️ Claude Desktop</button>
+                                <button type="button" class="btn" id="verifyCardBtn" onclick="verifyTaskWithAI()" style="display:none;background:linear-gradient(135deg,#667eea,#764ba2);color:white;border:none">🤖 AI Verify</button>
+                            </div>
+                            <div id="verifyResult" style="display:none;margin-top:12px;padding:12px;border-radius:8px;font-size:12px"></div>
+                            <div id="claudeRunsPanel" style="display:none;margin-top:12px;border:1px solid var(--border);border-radius:8px;overflow:hidden">
+                                <div onclick="this.nextElementSibling.style.display=this.nextElementSibling.style.display==='none'?'block':'none'" style="padding:10px 12px;background:var(--bg2);cursor:pointer;display:flex;align-items:center;gap:8px;font-size:13px;font-weight:500">
+                                    <span>🤖 Storico esecuzioni Claude</span>
+                                    <span id="claudeRunsCount" style="font-size:11px;padding:1px 6px;border-radius:8px;background:var(--accent);color:white"></span>
+                                    <span style="margin-left:auto;font-size:11px;color:var(--text2)">▼</span>
+                                </div>
+                                <div id="claudeRunsList" style="display:none;max-height:300px;overflow-y:auto"></div>
+                            </div>
+                        </div>
+                        <div class="cm-box" data-tone="vi" id="cardThreads" style="display:none"></div>
+                        <div class="cm-box" data-tone="vi" id="cardSessions" style="display:none"></div>
                     </div>
-                    <div style="margin-bottom:8px">
-                        <label style="font-size:11px;color:var(--text2);display:block;margin-bottom:4px">Dipende da (task sbloccanti)</label>
-                        <div id="cardDependsList" class="pm-row" style="margin-bottom:4px"></div>
-                        <select id="cardDependsPick" style="width:100%;padding:6px 8px;font-size:12px" onchange="addCardDep(this.value); this.value='';">
-                            <option value="">+ aggiungi dipendenza…</option>
-                        </select>
-                    </div>
-                    <div>
-                        <label style="font-size:11px;color:var(--text2);display:block;margin-bottom:4px">Acceptance criteria</label>
-                        <div id="cardAccList"></div>
-                        <div style="display:flex;gap:8px;margin-top:4px">
-                            <input type="text" id="cardAccInput" placeholder="criterio verificabile…" style="flex:1;padding:6px 8px;font-size:12px"
-                                onkeydown="if(event.key==='Enter'){event.preventDefault();addCardAcc();}">
-                            <button type="button" class="btn" onclick="addCardAcc()">+ Add</button>
+
+                    <!-- Colonna laterale: dettagli, pianificazione, file, ricorrenza -->
+                    <div class="cm-col">
+                        <div class="cm-box" data-tone="bad">
+                            <h4><i class="ti ti-flag" aria-hidden="true"></i>Dettagli</h4>
+                            <div class="form-group">
+                                <label>Priorità</label>
+                                <div style="display:flex;gap:8px">
+                                    <select id="cardPriorityInput" style="flex:1" onchange="document.getElementById('cardModal').dataset.pri=this.value">
+                                        <option value="low">Low</option>
+                                        <option value="medium" selected>Medium</option>
+                                        <option value="high">High</option>
+                                    </select>
+                                    <button type="button" class="btn" onclick="aiSuggestCategory()" title="AI suggests label and priority">🤖 Auto</button>
+                                    <button type="button" class="btn" onclick="aiEstimate()" title="AI estimates time">⏱️</button>
+                                </div>
+                            </div>
+                            <div class="form-group">
+                                <label>Etichetta</label>
+                                <select id="cardLabelInput">
+                                    <option value="">None</option>
+                                </select>
+                            </div>
+                            <div class="cm-grid2">
+                                <div class="form-group">
+                                    <label>Scadenza</label>
+                                    <input type="date" id="cardDueInput">
+                                </div>
+                                <div class="form-group">
+                                    <label>Prossimo controllo</label>
+                                    <input type="date" id="cardNextCheckInput">
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- PM / Spec: epic, dipendenze, stima -->
+                        <div class="cm-box pm-box" data-tone="info">
+                            <h4><i class="ti ti-target-arrow" aria-hidden="true"></i>Pianificazione</h4>
+                            <div class="cm-grid2" style="margin-bottom:8px">
+                                <div>
+                                    <label>Epic</label>
+                                    <input type="text" id="cardEpicInput" list="pmEpicList" placeholder="es. sistema-achievement" style="width:100%;padding:6px 8px;font-size:12px">
+                                    <datalist id="pmEpicList"></datalist>
+                                </div>
+                                <div>
+                                    <label>Stima</label>
+                                    <select id="cardEstimateInput" style="width:100%;padding:6px 8px;font-size:12px">
+                                        <option value="">—</option>
+                                        <option value="S">S</option>
+                                        <option value="M">M</option>
+                                        <option value="L">L</option>
+                                    </select>
+                                </div>
+                            </div>
+                            <label style="display:flex;align-items:center;gap:6px;font-size:12px;margin-bottom:8px;cursor:pointer">
+                                <input type="checkbox" id="cardParallel" style="width:15px;height:15px"> ‖ eseguibile in parallelo
+                            </label>
+                            <label style="display:block;margin-bottom:4px">Dipende da (task sbloccanti)</label>
+                            <div id="cardDependsList" class="pm-row" style="margin-bottom:4px"></div>
+                            <select id="cardDependsPick" style="width:100%;padding:6px 8px;font-size:12px" onchange="addCardDep(this.value); this.value='';">
+                                <option value="">+ aggiungi dipendenza…</option>
+                            </select>
+                        </div>
+
+                        <div class="cm-box">
+                            <h4><i class="ti ti-folder" aria-hidden="true"></i>File associati</h4>
+                            <div id="cardFilesList" style="margin-bottom:8px"></div>
+                            <div style="display:flex;gap:8px">
+                                <input type="text" id="cardFileInput" placeholder="path/file.php (relative)" style="flex:1;padding:6px 8px;font-size:12px">
+                                <button type="button" class="btn" onclick="addFileToCard()">+ Add</button>
+                            </div>
+                            <p style="font-size:10px;color:var(--text2);margin:4px 0 0">Percorsi relativi alla cartella del progetto</p>
+                        </div>
+
+                        <div class="cm-box">
+                            <h4><i class="ti ti-repeat" aria-hidden="true"></i>Ricorrenza</h4>
+                            <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:12px;color:var(--text)">
+                                <input type="checkbox" id="cardAutoRegenerate" style="width:16px;height:16px">
+                                Task che si ricrea quando lo archivi
+                            </label>
+                            <div id="regenerateOptions" style="display:none;margin-top:8px">
+                                <label>Dopo quanti giorni</label>
+                                <input type="number" id="cardRegenerateDelay" min="0" value="0" style="width:80px;padding:4px 8px">
+                                <span style="font-size:11px;color:var(--text2);margin-left:8px">0 = subito</span>
+                            </div>
                         </div>
                     </div>
                 </div>
-
-                <div class="form-group" style="background:var(--bg2);padding:12px;border-radius:8px;margin-top:12px">
-                    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-bottom:8px">
-                        <input type="checkbox" id="cardAutoRegenerate" style="width:16px;height:16px">
-                        <span style="font-weight:500">Auto-regenerating Task</span>
-                        <span style="font-size:11px;color:var(--text2)">(recreates when archived)</span>
-                    </label>
-                    <div id="regenerateOptions" style="display:none;margin-top:8px">
-                        <label style="font-size:11px;color:var(--text2)">Regeneration delay (days)</label>
-                        <input type="number" id="cardRegenerateDelay" min="0" value="0" style="width:80px;padding:4px 8px">
-                        <span style="font-size:11px;color:var(--text2);margin-left:8px">0 = immediate</span>
-                    </div>
-                </div>
-                <!-- Riga Claude: i modi di far lavorare Claude sul task (solo su una card esistente) -->
-                <div class="modal-actions" id="cardClaudeActions" style="display:none;justify-content:flex-start;flex-wrap:wrap;padding-bottom:12px;border-bottom:1px solid var(--border)">
-                    <button type="button" class="btn" id="executeClaudeBtn" onclick="executeWithClaude()" style="display:none;background:linear-gradient(135deg,#d97706,#ea580c);color:white;border:none" title="Esegue il task con l'Agent API di Claude direttamente sul server">🏖️ Claude Agent API</button>
-                    <button type="button" class="btn" id="openClaudeAppBtn" onclick="openInClaudeApp()" style="display:none;background:linear-gradient(135deg,#7c3aed,#6d28d9);color:white;border:none" title="Copia il prompt del task e apre claude.ai">🌐 Claude Web</button>
-                    <button type="button" class="btn" id="playLocalBtn" onclick="playCardInTerminal()" style="display:none;background:linear-gradient(135deg,#059669,#10b981);color:white;border:none" title="Avvia Claude Code nel terminale interno di Ykan, sul contesto di questo task">⌨️ Claude Terminale</button>
-                    <button type="button" class="btn" id="openClaudeDesktopBtn" onclick="openCardInClaudeDesktop()" style="display:none;background:linear-gradient(135deg,#c2410c,#9a3412);color:white;border:none" title="Avvia il task in Claude Desktop, nella cartella del progetto">🖥️ Claude Desktop</button>
-                    <button type="button" class="btn" id="verifyCardBtn" onclick="verifyTaskWithAI()" style="display:none;background:linear-gradient(135deg,#667eea,#764ba2);color:white;border:none">🤖 AI Verify</button>
-                </div>
-                <div class="modal-actions" style="margin-top:12px">
+                <div class="cm-foot">
                     <button type="button" class="btn btn-warning" id="deleteCardBtn" onclick="deleteCard()" style="display:none">📦 Archive</button>
                     <span style="flex:1"></span>
                     <button type="button" class="btn" onclick="closeCardModal()">Cancel</button>
                     <button type="submit" class="btn btn-primary">Save</button>
                 </div>
-                <div id="verifyResult" style="display:none;margin-top:12px;padding:12px;border-radius:8px;font-size:12px"></div>
-                <div id="claudeRunsPanel" style="display:none;margin-top:12px;border:1px solid var(--border);border-radius:8px;overflow:hidden">
-                    <div onclick="this.nextElementSibling.style.display=this.nextElementSibling.style.display==='none'?'block':'none'" style="padding:10px 12px;background:var(--bg2);cursor:pointer;display:flex;align-items:center;gap:8px;font-size:13px;font-weight:500">
-                        <span>🤖 Storico esecuzioni Claude</span>
-                        <span id="claudeRunsCount" style="font-size:11px;padding:1px 6px;border-radius:8px;background:var(--accent);color:white"></span>
-                        <span style="margin-left:auto;font-size:11px;color:var(--text2)">▼</span>
-                    </div>
-                    <div id="claudeRunsList" style="display:none;max-height:300px;overflow-y:auto"></div>
-                </div>
-                <div id="cardThreads" style="display:none;margin-top:12px;border:1px solid var(--border);border-radius:8px;padding:10px 12px"></div>
-                <div id="cardSessions" style="display:none;margin-top:12px;border:1px solid var(--border);border-radius:8px;padding:10px 12px"></div>
             </form>
         </div>
     </div>
@@ -5303,10 +5354,14 @@ $dataJson = json_encode(ykanPublicData($data));
         board.innerHTML = boardData.swimlanes
             .sort((a, b) => a.position - b.position)
             .map((lane, index) => `
-                <div class="swimlane${collapsedLanes.has(lane.id) ? ' collapsed' : ''}" data-lane-id="${lane.id}">
+                <div class="swimlane${collapsedLanes.has(lane.id) ? ' collapsed' : ''}" data-lane-id="${lane.id}" style="--lane:${laneRgb(lane)}">
                     <div class="swimlane-header" onclick="toggleSwimlane('${lane.id}', event)">
                         <span class="swimlane-toggle">▼</span>
                         <span class="swimlane-name">${escHtml(lane.name)}</span>
+                        <label class="lane-color" title="Colore del progetto" onclick="event.stopPropagation()">
+                            <i class="ti ti-pencil" aria-hidden="true"></i>
+                            <input type="color" value="${laneHex(lane)}" onchange="setLaneColor('${lane.id}', this.value)">
+                        </label>
                         ${safeUrl(lane.url) ? `<a class="swimlane-url" href="${escHtml(safeUrl(lane.url))}" target="_blank" rel="noopener noreferrer" title="Open project: ${escHtml(safeUrl(lane.url))}" onclick="event.stopPropagation()" style="text-decoration:none;font-size:13px">🌐</a>` : ''}
                         ${lane.path ? `<span class="swimlane-link" title="Linked to folder: ${escHtml(lane.path)}" onclick="event.stopPropagation();openProjectsModal('${lane.id}')" style="cursor:pointer;font-size:13px">🔗</span>` : ''}
                         ${lane.local_path ? `<span title="Sessioni Claude Code locali" onclick="event.stopPropagation();openSessionsModal('${lane.id}')" style="cursor:pointer;font-size:13px">🕒</span>` : ''}
@@ -5397,7 +5452,7 @@ $dataJson = json_encode(ykanPublicData($data));
             ? `<div class="pm-acc-wrap" title="Acceptance ${pmAccDone}/${pmAcc.length}"><div class="pm-acc-bar"><i style="width:${Math.round(pmAccDone / pmAcc.length * 100)}%"></i></div></div>`
             : '';
         return `
-            <div class="card${pmBlockedBy.length ? ' pm-blocked' : ''}" draggable="true" data-card-id="${card.id}"
+            <div class="card${pmBlockedBy.length ? ' pm-blocked' : ''}" draggable="true" data-card-id="${card.id}" data-pri="${isOverdue ? 'high' : escHtml(card.priority || 'medium')}"
                 ondragstart="onDragStart(event)" ondragend="onDragEnd(event)"
                 onclick="openCardModal('${card.id}')">
                 <div class="card-header">
@@ -5524,6 +5579,23 @@ $dataJson = json_encode(ykanPublicData($data));
     }
 
     // === SWIMLANES ===
+    // Colore del progetto: quello scelto con la matita, se no uno della palette bento scelto dal nome
+    const LANE_PALETTE = ['#378ADD', '#1D9E75', '#7F77DD', '#D98639', '#D4537E', '#5DCAA5', '#D85A30', '#639922'];
+    function laneHex(lane) {
+        if (/^#[0-9a-f]{6}$/i.test(lane.color || '')) return lane.color;
+        let h = 0; for (const ch of String(lane.name)) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
+        return LANE_PALETTE[h % LANE_PALETTE.length];
+    }
+    function laneRgb(lane) { const x = laneHex(lane); return [1, 3, 5].map(i => parseInt(x.slice(i, i + 2), 16)).join(','); }
+    async function setLaneColor(laneId, color) {
+        const lane = boardData.swimlanes.find(l => l.id === laneId);
+        if (!lane) return;
+        lane.color = color;
+        const el = document.querySelector(`.swimlane[data-lane-id="${laneId}"]`);
+        if (el) el.style.setProperty('--lane', laneRgb(lane));
+        await api('update_swimlane', { id: laneId, color });
+    }
+
     function toggleSwimlane(laneId, event) {
         if (event.target.tagName === 'INPUT') return;
         const swimlane = document.querySelector(`.swimlane[data-lane-id="${laneId}"]`);
@@ -8078,6 +8150,9 @@ $dataJson = json_encode(ykanPublicData($data));
             document.getElementById('templateGroup').style.display = 'block';
             document.getElementById('cardTemplate').value = '';
         }
+        // riquadro Claude solo su un task già salvato; la testata prende la tinta dell'urgenza
+        document.getElementById('cardClaudeBox').style.display = cardId ? '' : 'none';
+        modal.dataset.pri = document.getElementById('cardPriorityInput').value || 'medium';
 
         modal.classList.add('active');
     }
