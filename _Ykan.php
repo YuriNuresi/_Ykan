@@ -4190,6 +4190,28 @@ $dataJson = json_encode(ykanPublicData($data));
         #cardModal #cardClaudeActions { border: none; padding: 0; margin: 0; }
         @media (max-width: 820px) { .cm-body { grid-template-columns: minmax(0, 1fr); } }
 
+        /* Stile bento nelle altre pagine: stessi riquadri sfumati della Home. --tone dà la tinta:
+           Progetti col colore del progetto, Claude lilla, Settings neutro, avvisi per gravità */
+        #dashboardView { --tone: 55,138,221; } #claudeView { --tone: 127,119,221; } #settingsView { --tone: 140,140,140; }
+        .dash-view .dash-projcard { background: linear-gradient(160deg, rgba(var(--tone), .1), rgba(var(--tone), .02) 70%), var(--bg3); border: 1px solid rgba(var(--tone), .2); border-radius: 12px; padding: 12px 14px; }
+        .dash-view .dash-projcard.skill-off { background: var(--bg3); border-color: var(--border); }
+        .dash-view .dash-projhead b { font-weight: 600; }
+        .dash-view .dash-item { --tone: 217,134,57; background: linear-gradient(160deg, rgba(var(--tone), .1), rgba(var(--tone), .02) 75%), var(--bg3); border: 1px solid rgba(var(--tone), .22); border-radius: 10px; transition: border-color .15s; }
+        .dash-view .dash-item.high { --tone: 216,90,80; }
+        /* link dentro i riquadri (es. Novità): niente blu/viola del browser, che sul fondo tinto non si legge */
+        .dash-view .dash-item a, .dash-view .dash-projcard a { color: var(--text); font-weight: 600; text-decoration: none; }
+        .dash-view .dash-item a:hover, .dash-view .dash-projcard a:hover { color: rgb(var(--tone)); text-decoration: underline; }
+        .dash-view .dash-item.clickable:hover { border-color: rgba(var(--tone), .55); }
+        .dash-view .dash-h { display: flex; align-items: center; gap: 6px; text-transform: none; letter-spacing: 0; font-size: 13px; font-weight: 600; color: var(--text); }
+        .dash-view .dash-h::before { content: ''; width: 4px; height: 14px; border-radius: 2px; background: rgb(var(--tone)); }
+        #settingsView .settings-panel > .form-group, #settingsView .settings-panel > div:not(.tool-card):not(.form-group) > .form-group, #settingsView .tool-card {
+            background: linear-gradient(160deg, rgba(var(--tone), .1), rgba(var(--tone), .02) 70%), var(--bg3); border: 1px solid rgba(var(--tone), .2); border-radius: 12px; padding: 12px 14px; margin-bottom: 12px; }
+        #settingsView .settings-panel .form-group > label:first-child { font-size: 13px; font-weight: 600; margin-bottom: 8px; display: block; }
+        #settingsView .settings-panel[data-panel="bridge"], #settingsView .settings-panel[data-panel="claude-code"] { --tone: 217,134,57; }
+        #settingsView .settings-panel[data-panel="another-ai"] { --tone: 127,119,221; } #settingsView .settings-panel[data-panel="github"] { --tone: 55,138,221; }
+        #settingsView .settings-panel[data-panel="account"], #settingsView .settings-panel[data-panel="progetti"] { --tone: 29,158,117; }
+        #settingsView .settings-panel[data-panel="aspetto"] { --tone: 212,83,126; }
+
         /* Another AI: linguetta sul bordo destro, in tutte le pagine */
         .ai-edge { position: fixed; right: 0; top: 50%; transform: translateY(-50%); z-index: 501; writing-mode: vertical-rl; background: var(--bg3); border: 1px solid var(--border); border-right: none; border-radius: 8px 0 0 8px; padding: 12px 5px; font-size: 12px; font-weight: 500; color: var(--text2); cursor: pointer; transition: right 0.3s; }
         .ai-edge:hover { color: var(--text); }
@@ -5890,7 +5912,8 @@ $dataJson = json_encode(ykanPublicData($data));
         const d = Math.floor((Date.now() - ts) / 86400000);
         return d <= 0 ? 'oggi' : d === 1 ? 'ieri' : d + ' giorni fa';
     }
-    function dashColor(name) { let h = 0; for (const ch of String(name)) h = (h * 31 + ch.charCodeAt(0)) % 360; return `hsl(${h} 55% 48%)`; }
+    // Il colore di un progetto è lo stesso della Kanban (matita o palette); i nomi senza progetto restano col calcolo vecchio
+    function dashColor(name) { const lane = boardData.swimlanes.find(l => l.name === name); if (lane) return laneHex(lane); let h = 0; for (const ch of String(name)) h = (h * 31 + ch.charCodeAt(0)) % 360; return `hsl(${h} 55% 48%)`; }
     function dashCardDone(c) {
         const col = boardData.columns.find(x => x.id === c.column_id);
         return !!c.archived || DASH_DONE_RE.test(col ? col.name : '');
@@ -6182,7 +6205,7 @@ $dataJson = json_encode(ykanPublicData($data));
             const shown = open ? list : list.slice(0, 6);
             const more = list.length > 6
                 ? `<button class="btn" style="font-size:12px;margin-top:2px" onclick="dashToggleExpand('p|${escHtml(p.lane.name).replace(/'/g, '&#39;')}')">${open ? 'Mostra meno' : 'Mostra altre ' + (list.length - 6)}</button>` : '';
-            return `<div class="dash-projcard">
+            return `<div class="dash-projcard" style="--tone:${laneRgb(p.lane)}">
                 <div class="dash-projhead">
                     <span class="wk-dot" style="background:${dashColor(p.lane.name)}"></span>
                     <b>${escHtml(p.lane.name)}</b>
