@@ -4119,18 +4119,30 @@ $dataJson = json_encode(ykanPublicData($data));
         .home-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 5px; background: var(--border); }
         .home-dot.ok { background: #1D9E75; } .home-dot.warn { background: #EF9F27; } .home-dot.ko { background: #E24B4A; }
         .home-kpis { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-bottom: 20px; }
-        .home-box { background: var(--bg3); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; font-size: 13px; line-height: 1.6; min-width: 0; }
-        .home-box .lbl { font-size: 11px; color: var(--text2); margin-bottom: 4px; display: flex; justify-content: space-between; }
-        .home-box .num { font-size: 24px; font-weight: 600; }
-        .home-box .row { display: flex; justify-content: space-between; gap: 8px; white-space: nowrap; overflow: hidden; }
+        /* Stile bento: ogni riquadro ha una tinta leggera del suo tono (data-tone), sfumata verso il fondo */
+        .home-box { --tone: 140,140,140; background: linear-gradient(160deg, rgba(var(--tone), .11), rgba(var(--tone), .02) 70%), var(--bg3); border: 1px solid rgba(var(--tone), .2); border-radius: 12px; padding: 12px 14px; font-size: 13px; line-height: 1.6; min-width: 0; opacity: 0; transform: translateY(8px); animation: homeIn .4s ease forwards; }
+        .home-box[data-tone="ok"] { --tone: 29,158,117; } .home-box[data-tone="warn"] { --tone: 217,134,57; }
+        .home-box[data-tone="bad"] { --tone: 216,90,80; } .home-box[data-tone="info"] { --tone: 55,138,221; } .home-box[data-tone="vi"] { --tone: 127,119,221; }
+        .home-box .ico { color: rgb(var(--tone)); font-size: 15px; }
+        @keyframes homeIn { to { opacity: 1; transform: none; } }
+        @media (prefers-reduced-motion: reduce) { .home-box { animation: none; opacity: 1; transform: none; } }
+        .home-box .lbl { font-size: 11px; color: var(--text2); margin-bottom: 6px; display: flex; align-items: center; gap: 6px; }
+        .home-box .num { font-size: 28px; font-weight: 600; line-height: 1.1; }
+        .home-kpi { cursor: pointer; transition: border-color .15s; } .home-kpi:hover { border-color: rgba(var(--tone), .45); }
+        .home-kpi .kv { display: flex; justify-content: space-between; align-items: flex-end; gap: 8px; }
+        .home-kpi svg { flex-shrink: 0; }
+        .home-box .row { display: flex; justify-content: space-between; gap: 8px; white-space: nowrap; overflow: hidden; padding: 2px 6px; margin: 0 -6px; border-radius: 6px; }
         .home-box .row > :first-child { overflow: hidden; text-overflow: ellipsis; }
+        .home-box .row.go { cursor: pointer; transition: background .15s; } .home-box .row.go:hover { background: rgba(var(--tone), .12); }
         .home-box .sub { color: var(--text2); }
-        .home-box a { color: inherit; cursor: pointer; text-decoration: none; } .home-box a:hover { text-decoration: underline; }
+        .home-box a { color: inherit; cursor: pointer; text-decoration: none; }
+        .swimlane.home-flash { outline: 2px solid var(--accent); outline-offset: 2px; transition: outline-color 1.5s; }
         .home-day-title { font-weight: 600; font-size: 14px; margin-bottom: 8px; }
         .home-day { position: relative; height: 42px; border-radius: 8px; overflow: hidden; background: var(--bg2); }
         .home-band { position: absolute; top: 0; bottom: 0; border-right: 1px solid var(--border); background: var(--bg3); }
-        .home-band.cur { background: color-mix(in srgb, #378ADD 14%, var(--bg3)); }
-        .home-band i { position: absolute; left: 0; top: 0; bottom: 0; background: color-mix(in srgb, #378ADD 45%, transparent); }
+        .home-band.cur { background: color-mix(in srgb, #1D9E75 8%, var(--bg3)); }
+        .home-band i { position: absolute; left: 0; top: 0; bottom: 0; background: linear-gradient(90deg, rgba(29,158,117,.04), rgba(29,158,117,.28)); }
+        .home-band i.warn { background: linear-gradient(90deg, rgba(217,134,57,.04), rgba(217,134,57,.3)); }
         .home-band span { position: relative; display: block; font-size: 12px; padding: 4px 8px; color: var(--text2); white-space: nowrap; overflow: hidden; }
         .home-band.cur span { color: var(--text); }
         .home-now { position: absolute; top: 0; bottom: 0; width: 2px; background: #E24B4A; }
@@ -4218,6 +4230,7 @@ $dataJson = json_encode(ykanPublicData($data));
     <style id="customThemeStyle"><?= !empty($data['config']['theme_file']) ? ykanThemeCss($data['config']['theme_file']) : '' ?></style>
     <!-- Terminale live (pannello Sessioni/Bridge): xterm.js da CDN -->
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@3.31.0/dist/tabler-icons.min.css">
     <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.js"></script>
 </head>
@@ -10072,7 +10085,7 @@ $dataJson = json_encode(ykanPublicData($data));
         document.getElementById('homeDay').innerHTML = bands.map(([s, e], i) => {
             const cur = i === curIdx;
             const label = `Fascia ${i + 1} · ${homeHm(s)}–${homeHm(e)}` + (cur && homeUsage ? ` · ${pct}%` : now >= e ? ' · chiusa' : !first && !homeUsage ? '' : now < s ? ' · da iniziare' : '');
-            return `<div class="home-band${cur ? ' cur' : ''}" style="left:${x(s)};width:calc(${x(e)} - ${x(s)})">${cur && homeUsage ? `<i style="width:${Math.min(100, pct)}%"></i>` : ''}<span>${label}</span></div>`;
+            return `<div class="home-band${cur ? ' cur' : ''}" style="left:${x(s)};width:calc(${x(e)} - ${x(s)})">${cur && homeUsage ? `<i class="${pct > (now - s) / (e - s) * 100 + 10 ? 'warn' : ''}" style="width:${Math.min(100, pct)}%"></i>` : ''}<span>${label}</span></div>`;
         }).join('') + (now > from && now < to ? `<div class="home-now" style="left:${x(now)}" title="Adesso, ${homeHm(now)}"></div>` : '');
 
         const ticks = [];
@@ -10121,7 +10134,7 @@ $dataJson = json_encode(ykanPublicData($data));
             const lbl = g.d.toLocaleDateString('it-IT', { weekday: 'short' }) + ' · ' + Math.round(g.q) + '%';
             return `<div class="home-band${cur ? ' cur' : ''}" style="left:${g.from.toFixed(2)}%;width:${g.q.toFixed(2)}%" title="${escHtml(g.d.toLocaleDateString('it-IT', { weekday: 'long', day: 'numeric' }))}: quota ${Math.round(g.q)}%"><span>${lbl}</span></div>`;
         }).join('')
-            + (pct !== null ? `<div style="position:absolute;left:0;bottom:0;height:6px;width:${Math.min(100, pct)}%;background:${pct > exp + 5 ? '#D98639' : '#378ADD'}" title="Usato ${pct}%"></div>` : '')
+            + (pct !== null ? `<div style="position:absolute;left:0;top:0;bottom:0;pointer-events:none;width:${Math.min(100, pct)}%;background:linear-gradient(90deg, rgba(${pct > exp + 5 ? '217,134,57' : '29,158,117'},.03), rgba(${pct > exp + 5 ? '217,134,57' : '29,158,117'},.3))" title="Usato ${pct}%"></div>` : '')
             + `<div class="home-now" style="left:${expRaw.toFixed(2)}%" title="Adesso il piano dice ${exp}%"></div>`;
         document.getElementById('homeWeekAxis').innerHTML = [0, 25, 50, 75, 100].map(p => `<span style="left:${p}%${p === 0 ? ';transform:none' : p === 100 ? ';transform:translateX(-100%)' : ''}">${p}%</span>`).join('');
         let title = 'Settimana';
@@ -10145,7 +10158,36 @@ $dataJson = json_encode(ykanPublicData($data));
         const urgent = open.filter(x => x.c.priority === 'high' || (x.c.due_date && x.c.due_date < today));
         return { all, open, urgent, today };
     }
-    const homeCardLink = c => `<a onclick="openCardModal('${c.id}')" title="${escHtml(c.title)}">#${c.seq || ''} ${escHtml(c.title)}</a>`;
+    // Riga cliccabile dei widget: tutta la riga porta da qualche parte
+    const homeRow = (go, left, right) => `<div class="row go" onclick="${go}">${left}<span class="sub">${right || ''}</span></div>`;
+    const homeCardRow = (c, right) => homeRow(`openCardModal('${c.id}')`, `<span title="${escHtml(c.title)}">#${c.seq || ''} ${escHtml(c.title)}</span>`, right);
+    // Dalla Home alla Kanban su un progetto: lo apre (se chiuso), ci scorre e lo evidenzia un attimo
+    function homeGoLane(laneId) {
+        showView('kanban');
+        collapsedLanes.delete(laneId);
+        const el = document.querySelector(`.swimlane[data-lane-id="${laneId}"]`);
+        if (!el) return;
+        el.classList.remove('collapsed');
+        el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        el.classList.add('home-flash');
+        setTimeout(() => el.classList.remove('home-flash'), 1600);
+    }
+    // Numeri in alto: portano alla Kanban, "Urgenti" con il filtro priorità alta
+    function homeGoKpi(kind) {
+        showView('kanban');
+        clearFilters();
+        if (kind === 'urgent') { document.getElementById('filterPriority').value = 'high'; applyFilters(); }
+    }
+    // Andamento degli ultimi 7 giorni: conta per giorno le card scelte da pick(card) → data
+    function homeTrend(cards, pick) {
+        const out = [0, 0, 0, 0, 0, 0, 0], t0 = new Date(); t0.setHours(0, 0, 0, 0);
+        cards.forEach(c => { const t = dashTs(pick(c) || ''); if (!t) return; const d = Math.floor((t0.getTime() + 86400000 - t) / 86400000); if (d >= 0 && d < 7) out[6 - d]++; });
+        return out;
+    }
+    function homeSpark(d) {
+        const m = Math.max(...d) || 1;
+        return `<svg width="70" height="22" viewBox="0 0 70 22" aria-hidden="true"><polyline fill="none" stroke="rgb(var(--tone))" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" points="${d.map((v, i) => `${(i * 11.5).toFixed(1)},${(20 - v / m * 17).toFixed(1)}`).join(' ')}"/></svg>`;
+    }
     const homeAgo = iso => { const m = Math.floor((Date.now() - new Date(iso)) / 60000); return m < 60 ? m + ' min' : m < 1440 ? Math.floor(m / 60) + 'h' : dashAgo(new Date(iso).getTime()); };
 
     // Sessioni Claude Code di tutti i progetti con cartella, lette una volta sola per i widget che le usano
@@ -10161,71 +10203,74 @@ $dataJson = json_encode(ykanPublicData($data));
     }
     function homeDot(id, cls) { const el = document.getElementById(id); if (el) el.className = 'home-dot ' + cls; }
 
+    // [tono, icona Tabler, titolo, caricamento]: il tono dà la tinta del riquadro (stile bento)
     const HOME_WIDGETS = [
-        ['Progetti', async () => {
+        ['info', 'ti-folders', 'Progetti', async () => {
             const { open, urgent } = homeCards();
             return boardData.swimlanes.map(l => ({ l, n: open.filter(x => x.c.swimlane_id === l.id).length, u: urgent.filter(x => x.c.swimlane_id === l.id).length }))
-                .filter(p => p.n).sort((a, b) => b.u - a.u || b.n - a.n).slice(0, 5)
-                .map(p => `<div class="row"><span>${escHtml(p.l.name)}</span><span class="sub">${p.n} aperti${p.u ? ` · <b style="color:var(--high)">${p.u} urg.</b>` : ''}</span></div>`).join('') || '<span class="sub">Nessuna card aperta</span>';
+                .filter(p => p.n).sort((a, b) => b.u - a.u || b.n - a.n).slice(0, 4)
+                .map(p => homeRow(`homeGoLane('${p.l.id}')`, `<span>${escHtml(p.l.name)}</span>`, `${p.n} aperti${p.u ? ` · <b style="color:var(--high)">${p.u} urg.</b>` : ''}`)).join('') || '<span class="sub">Nessuna card aperta: la board è pulita</span>';
         }],
-        ['Ultime chat Claude Code', async () => {
+        ['vi', 'ti-messages', 'Ultime chat Claude Code', async () => {
             const s = await homeSessions();
             if (!s.ok) return '<span class="sub">Bridge non raggiungibile</span>';
             return s.list.sort((a, b) => new Date(b.modified) - new Date(a.modified)).slice(0, 4)
-                .map(x => `<div class="row"><a onclick="openInDesktop('${escHtml(x.lane.id)}', '${escHtml(x.id)}')" title="${escHtml(x.lane.name)}: apri in Claude Desktop">${escHtml(x.title || x.preview || '(senza titolo)')}</a><span class="sub">${homeAgo(x.modified)}</span></div>`).join('') || '<span class="sub">Nessuna sessione</span>';
+                .map(x => homeRow(`openInDesktop('${escHtml(x.lane.id)}', '${escHtml(x.id)}')`, `<span title="${escHtml(x.lane.name)}: apri in Claude Desktop">${escHtml(x.title || x.preview || '(senza titolo)')}</span>`, homeAgo(x.modified))).join('') || '<span class="sub">Nessuna sessione ancora</span>';
         }],
-        ['Da fare adesso', async () => {
+        ['bad', 'ti-target-arrow', 'Da fare adesso', async () => {
             const { open, today } = homeCards();
             const score = x => (x.c.priority === 'high' ? 0 : 2) + (x.c.due_date && x.c.due_date <= today ? -1 : 0) + (DASH_DOING_RE.test(x.col) ? -0.5 : 0);
             return open.filter(x => !/claude do/i.test(x.col)).sort((a, b) => score(a) - score(b)).slice(0, 4)
-                .map(x => `<div class="row">${homeCardLink(x.c)}<span class="sub">${escHtml(x.lane)}</span></div>`).join('') || '<span class="sub">Niente in sospeso</span>';
+                .map(x => homeCardRow(x.c, escHtml(x.lane))).join('') || '<span class="sub">Niente in sospeso, goditi il momento</span>';
         }],
-        ['Claude oggi', async () => {
+        ['warn', 'ti-sparkles', 'Claude oggi', async () => {
             const { open } = homeCards();
             const queue = open.filter(x => /claude do/i.test(x.col)).length;
             const s = await homeSessions();
             const t0 = new Date(); t0.setHours(0, 0, 0, 0);
             const today = s.ok ? s.list.filter(x => new Date(x.modified) >= t0) : [];
-            const ask = today.filter(x => x.endsWithQuestion).length;
-            return `<div class="row"><span>Sessioni di oggi</span><b>${s.ok ? today.length : '—'}</b></div>`
-                + `<div class="row"><span>In coda in Claude Do</span><b>${queue}</b></div>`
-                + (ask ? `<div class="row"><span style="color:var(--high)">Ti ha fatto domande</span><b>${ask}</b></div>` : '');
+            const ask = today.filter(x => x.endsWithQuestion);
+            return homeRow("showView('dashboard')", '<span>Sessioni di oggi</span>', `<b>${s.ok ? today.length : '—'}</b>`)
+                + homeRow("showView('kanban')", '<span>In coda in Claude Do</span>', `<b>${queue}</b>`)
+                + (ask.length ? homeRow(`openInDesktop('${escHtml(ask[0].lane.id)}', '${escHtml(ask[0].id)}')`, '<span style="color:var(--high)">Ti ha fatto domande</span>', `<b>${ask.length}</b>`) : '');
         }],
-        ['Scadenze', async () => {
+        ['bad', 'ti-calendar-due', 'Scadenze', async () => {
             const { open, today } = homeCards();
             return open.filter(x => x.c.due_date).sort((a, b) => a.c.due_date.localeCompare(b.c.due_date)).slice(0, 4)
-                .map(x => `<div class="row">${homeCardLink(x.c)}<span class="sub" style="${x.c.due_date < today ? 'color:var(--high)' : ''}">${x.c.due_date === today ? 'oggi' : new Date(x.c.due_date).toLocaleDateString('it-IT', { day: 'numeric', month: 'short' })}</span></div>`).join('') || '<span class="sub">Nessuna scadenza</span>';
+                .map(x => homeCardRow(x.c, `<span style="${x.c.due_date < today ? 'color:var(--high)' : ''}">${x.c.due_date === today ? 'oggi' : new Date(x.c.due_date).toLocaleDateString('it-IT', { day: 'numeric', month: 'short' })}</span>`)).join('') || '<span class="sub">Nessuna scadenza in vista</span>';
         }],
-        ['WhatsApp', async () => {
+        ['ok', 'ti-brand-whatsapp', 'WhatsApp', async () => {
             const [info, chats] = await Promise.all([ctxCall('/whatsapp').catch(() => null), ctxCall('/whatsapp/chats').catch(() => null)]);
             homeDot('homeDotWa', info && info.status === 'open' ? 'ok' : info && info.status !== 'off' ? 'warn' : 'ko');
             if (!info) return '<span class="sub">Bridge non raggiungibile</span>';
             const list = (chats && chats.chats || []);
             const day = list.filter(c => c.at && Date.now() - new Date(c.at) < 86400000);
-            return `<div class="row"><span>Stato</span><span>${(WA_STATES[info.status] || ['', info.status]).join(' ')}</span></div>`
-                + `<div class="row"><span>Chat attive nelle 24h</span><b>${day.length}</b></div>`
-                + (list[0] ? `<div class="row"><span class="sub">${escHtml(list[0].name || list[0].num)}</span><span class="sub">${homeAgo(list[0].at)}</span></div>` : '');
+            const go = "showView('claude');claudeTab('wa')";
+            return homeRow(go, '<span>Stato</span>', (WA_STATES[info.status] || ['', info.status]).join(' '))
+                + homeRow(go, '<span>Chat nelle 24h</span>', `<b>${day.length}</b>`)
+                + (list[0] ? homeRow(`waState.open='${escHtml(String(list[0].num).replace(/\D/g, ''))}';${go}`, `<span>${escHtml(list[0].name || list[0].num)}</span>`, homeAgo(list[0].at)) : '');
         }],
-        ['Bloccati', async () => {
+        ['warn', 'ti-lock', 'Bloccati', async () => {
             const { open } = homeCards();
             const openSeq = new Set(open.map(x => String(x.c.seq)));
             const waits = c => (c.depends_on || []).filter(d => openSeq.has(String(d)));
             return open.filter(x => waits(x.c).length).slice(0, 4)
-                .map(x => `<div class="row">${homeCardLink(x.c)}<span class="sub">aspetta #${waits(x.c).join(' #')}</span></div>`).join('') || '<span class="sub">Niente di bloccato</span>';
+                .map(x => homeCardRow(x.c, `aspetta #${waits(x.c).join(' #')}`)).join('') || '<span class="sub">Niente di bloccato</span>';
         }],
-        ['Terminali', async () => {
+        ['info', 'ti-terminal-2', 'Terminali', async () => {
             const n = termSessions.length;
-            return `<div class="row"><span>Aperti in questa pagina</span><b>${n}</b></div>`
-                + (n ? termSessions.slice(0, 3).map(t => `<div class="row sub"><span>${escHtml((boardData.swimlanes.find(l => l.id === t.laneId) || {}).name || 'shell')}</span></div>`).join('') : '<span class="sub">Nessun terminale aperto</span>');
+            return homeRow('termSetMin(false)', '<span>Aperti</span>', `<b>${n}</b>`)
+                + (n ? termSessions.slice(0, 3).map(t => homeRow(`termSetMin(false);termSwitchTab('${t.id}')`, `<span>${escHtml((boardData.swimlanes.find(l => l.id === t.laneId) || {}).name || 'shell')}</span>`, '')).join('')
+                    : '<span class="sub">Aprine uno dalla barra in basso</span>');
         }],
-        ['Settimana', async () => {
+        ['ok', 'ti-chart-line', 'Settimana', async () => {
             const { all } = homeCards();
             const week = Date.now() - 7 * 86400000;
-            const done = all.filter(x => x.done && dashTs(x.c.moved_at || x.c.updated_at || '') >= week).length;
+            const done = all.filter(x => x.done && dashTs(x.c.moved_at || x.c.updated_at || '') >= week);
             const created = all.filter(x => dashTs(x.c.created_at || '') >= week).length;
-            const p = created ? Math.min(100, Math.round(done / created * 100)) : 0;
-            return `<div class="row"><span>Card chiuse</span><b>${done}</b></div><div class="row"><span>Card nuove</span><b>${created}</b></div>`
-                + `<div class="usage-bar" style="width:100%;margin-top:6px"><i style="width:${p}%;background:#1D9E75"></i></div>`;
+            return homeRow("showView('dashboard');dashTab('week')", '<span>Card chiuse</span>', `<b>${done.length}</b>`)
+                + homeRow("showView('dashboard');dashTab('week')", '<span>Card nuove</span>', `<b>${created}</b>`)
+                + `<div style="margin-top:4px">${homeSpark(homeTrend(done.map(x => x.c), c => c.moved_at || c.updated_at))}</div>`;
         }]
     ];
 
@@ -10234,22 +10279,26 @@ $dataJson = json_encode(ykanPublicData($data));
         document.getElementById('homeHello').textContent = (h < 13 ? 'Buongiorno' : h < 18 ? 'Buon pomeriggio' : 'Buonasera') + ' · '
             + new Date().toLocaleDateString('it-IT', { weekday: 'short', day: 'numeric', month: 'short' });
         const { open, urgent, all, today } = homeCards();
-        const kpi = (lbl, n, color) => `<div class="home-box"><div class="lbl">${lbl}</div><div class="num"${color ? ` style="color:${color}"` : ''}>${n}</div></div>`;
-        document.getElementById('homeKpis').innerHTML = kpi('Urgenti', urgent.length, urgent.length ? 'var(--high)' : '')
-            + kpi('In corso', open.filter(x => DASH_DOING_RE.test(x.col)).length)
-            + kpi('Fatti oggi', all.filter(x => x.done && String(x.c.moved_at || '').startsWith(today)).length)
-            + kpi('Claude Do in coda', open.filter(x => /claude do/i.test(x.col)).length);
+        const doing = open.filter(x => DASH_DOING_RE.test(x.col)), queue = open.filter(x => /claude do/i.test(x.col));
+        const kpi = (tone, icon, lbl, n, trend, kind, tip, i) => `<div class="home-box home-kpi" data-tone="${tone}" style="animation-delay:${i * 50}ms" onclick="homeGoKpi('${kind}')" title="${tip}">
+            <div class="lbl"><i class="ti ${icon} ico" aria-hidden="true"></i>${lbl}</div><div class="kv"><span class="num">${n}</span>${homeSpark(trend)}</div></div>`;
+        document.getElementById('homeKpis').innerHTML =
+            kpi('bad', 'ti-alert-triangle', 'Urgenti', urgent.length, homeTrend(urgent.map(x => x.c), c => c.created_at), 'urgent', 'Apri la Kanban con le card a priorità alta · linea: urgenti create negli ultimi 7 giorni', 0)
+            + kpi('info', 'ti-loader-2', 'In corso', doing.length, homeTrend(doing.map(x => x.c), c => c.moved_at), 'doing', 'Linea: card entrate in corso negli ultimi 7 giorni', 1)
+            + kpi('ok', 'ti-circle-check', 'Fatti oggi', all.filter(x => x.done && String(x.c.moved_at || '').startsWith(today)).length, homeTrend(all.filter(x => x.done).map(x => x.c), c => c.moved_at || c.updated_at), 'done', 'Linea: card chiuse negli ultimi 7 giorni', 2)
+            + kpi('warn', 'ti-robot', 'Claude Do in coda', queue.length, homeTrend(queue.map(x => x.c), c => c.moved_at), 'claude', 'Linea: card mandate a Claude negli ultimi 7 giorni', 3);
         homeRenderDay();
         claudeUsageRefresh();
         homeSessP = null;
         homeDot('homeDotBridge', ''); homeDot('homeDotWa', ''); homeDot('homeDotClaude', '');
         bridgeFetch('/claude/auth').then(async r => homeDot('homeDotClaude', r.ok && (await r.json()).loggedIn ? 'ok' : 'warn')).catch(() => homeDot('homeDotClaude', 'ko'));
-        const grid = document.getElementById('homeGrid');
-        grid.innerHTML = HOME_WIDGETS.map(([title], i) => `<div class="home-box" id="homeW${i}"><div class="lbl">${escHtml(title)}</div><div class="home-sk"></div><div class="home-sk" style="width:65%"></div></div>`).join('');
+        const head = w => `<div class="lbl"><i class="ti ${w[1]} ico" aria-hidden="true"></i>${escHtml(w[2])}</div>`;
+        document.getElementById('homeGrid').innerHTML = HOME_WIDGETS.map((w, i) =>
+            `<div class="home-box" data-tone="${w[0]}" id="homeW${i}" style="animation-delay:${200 + i * 60}ms">${head(w)}<div class="home-sk"></div><div class="home-sk" style="width:65%"></div></div>`).join('');
         // ogni widget per conto suo: il primo che risponde compare, gli altri non lo aspettano
-        HOME_WIDGETS.forEach(([title, load], i) => load().catch(e => `<span class="sub">Errore: ${escHtml(e.message)}</span>`).then(html => {
+        HOME_WIDGETS.forEach((w, i) => w[3]().catch(e => `<span class="sub">Errore: ${escHtml(e.message)}</span>`).then(html => {
             const el = document.getElementById('homeW' + i);
-            if (el) el.innerHTML = `<div class="lbl">${escHtml(title)}</div>${html}`;
+            if (el) el.innerHTML = head(w) + html;
         }));
     }
 
