@@ -226,7 +226,7 @@ const RELAY_PATHS = new Set(['/sessions', '/session', '/reviews', '/git', '/clau
     '/claude/memory', '/claude/memory/file', '/claude/memory/write', '/claude/memory/delete',
     '/claude/skill/write', '/claude/skill/override', '/claude/skill/copy', '/claude/plugins', '/claude/plugins/toggle',
     '/rc', '/rc/start', '/rc/stop', '/rc/answer', '/rc/autostart',
-    '/claude/context', '/claude/context/project', '/claude/mode', '/claude/mode/apply', '/claude/mode/clear', '/claude/mode/suggest', '/git/changes', '/git/diff', '/git/commit', '/git/test', '/git/ai', '/claude/scheduled', '/claude/scheduled/write', '/lanes/paths',
+    '/claude/context', '/claude/context/project', '/claude/mode', '/claude/mode/apply', '/claude/mode/clear', '/claude/mode/suggest', '/git/changes', '/git/diff', '/git/commit', '/git/test', '/git/ai', '/claude/scheduled', '/claude/scheduled/write', '/lanes/paths', '/docs/status', '/claude/providers', '/claude/providers/delete', '/claude/providers/apply', '/claude/providers/test', '/ollama/models',
     '/desktop-archive', '/desktop/new', '/desktop/resume']);
 
 function selfRequest(method, p, body, origin, bridgeId) {
@@ -1952,6 +1952,138 @@ function writeLanePath(laneId, dir) {
     return { ok: true, paths: all };
 }
 
+// === DOCUMENTI DEL PROGETTO (bottoni 📚 del Kanban, skill ykan-docs) ===
+const PROJECT_DOCS = ['DOCUMENTAZIONE.md', 'STRUTTURA.md', 'CHANGELOG.md', 'README.md'];
+async function docsStatus(dir) {
+    if (!dir || !fs.existsSync(dir)) throw new Error('Cartella non trovata');
+    const files = {};
+    for (const f of PROJECT_DOCS) {
+        // anche con un'altra combinazione di maiuscole (readme.md, Changelog.md)
+        const hit = fs.readdirSync(dir).find(x => x.toLowerCase() === f.toLowerCase());
+        if (!hit) { files[f] = { exists: false }; continue; }
+        const st = fs.statSync(path.join(dir, hit));
+        // commit fatti dopo l'ultima modifica del file (esclusi quelli che toccano solo i documenti): dice se è indietro
+        const after = await git(['rev-list', '--count', '--since=' + st.mtime.toISOString(), 'HEAD', '--', '.', ...PROJECT_DOCS.map(d => ':!' + d), ':!docs'], dir);
+        files[f] = { exists: true, name: hit, modified: st.mtime.toISOString(), lines: fs.readFileSync(path.join(dir, hit), 'utf8').split('\n').length,
+            commitsAfter: after.ok ? parseInt(after.out, 10) || 0 : null };
+    }
+    const design = path.join(dir, 'docs', 'design');
+    const notes = fs.existsSync(design) ? fs.readdirSync(design).filter(f => f.endsWith('.md')).length : 0;
+    const last = await git(['log', '-1', '--format=%aI'], dir);
+    return { files, designNotes: notes, lastCommit: last.ok ? last.out : '' };
+}
+
+// === PROVIDER DI CLAUDE CODE (Anthropic, Ollama, OpenRouter…) ===
+// I profili (con le chiavi) restano sul PC in ~/.ykan-providers.json; applicare un profilo scrive solo
+// le variabili ANTHROPIC_* nel blocco env di ~/.claude/settings.json (globale) o .claude/settings.local.json (progetto).
+const PROVIDERS_FILE = path.join(os.homedir(), '.ykan-providers.json');
+const PROVIDER_ENV = ['ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_MODEL', 'ANTHROPIC_SMALL_FAST_MODEL',
+    'ANTHROPIC_DEFAULT_OPUS_MODEL', 'ANTHROPIC_DEFAULT_SONNET_MODEL', 'ANTHROPIC_DEFAULT_HAIKU_MODEL', 'CLAUDE_CODE_SUBAGENT_MODEL'];
+const PROVIDER_PRESETS = {
+    ollama: { base_url: 'http://localhost:11434', token: 'ollama' },
+    'ollama-cloud': { base_url: 'https://ollama.com', token: '' },
+    openrouter: { base_url: 'https://openrouter.ai/api', token: '' },
+    custom: { base_url: '', token: '' },
+};
+function readProviders() {
+    try { const j = JSON.parse(fs.readFileSync(PROVIDERS_FILE, 'utf8')); return Array.isArray(j.profiles) ? j.profiles : []; } catch (_) { return []; }
+}
+function writeProviders(list) { fs.writeFileSync(PROVIDERS_FILE, JSON.stringify({ profiles: list }, null, 2)); }
+const maskKey = k => !k ? '' : k.length <= 8 ? '••••' : k.slice(0, 4) + '…' + k.slice(-4);
+function providerSettingsFile(dir) {
+    return dir ? path.join(dir, '.claude', 'settings.local.json') : path.join(os.homedir(), '.claude', 'settings.json');
+}
+function readSettingsEnv(file) {
+    try { return (JSON.parse(fs.readFileSync(file, 'utf8')).env) || {}; } catch (_) { return {}; }
+}
+// Quale provider è attivo in un file: confronta ANTHROPIC_BASE_URL e modello con i profili salvati
+function providerActive(file, profiles) {
+    const env = readSettingsEnv(file);
+    if (!env.ANTHROPIC_BASE_URL && !env.ANTHROPIC_AUTH_TOKEN && !env.ANTHROPIC_MODEL) return { id: 'anthropic', base_url: '', model: env.ANTHROPIC_MODEL || '' };
+    const hit = profiles.find(p => (p.base_url || '') === (env.ANTHROPIC_BASE_URL || '') && (p.model || '') === (env.ANTHROPIC_MODEL || ''));
+    return { id: hit ? hit.id : 'custom-env', base_url: env.ANTHROPIC_BASE_URL || '', model: env.ANTHROPIC_MODEL || '' };
+}
+function providersStatus(dir) {
+    const profiles = readProviders();
+    const out = { profiles: profiles.map(p => ({ ...p, token: undefined, token_masked: maskKey(p.token), has_token: !!p.token })),
+        global: providerActive(providerSettingsFile(''), profiles), project: null, presets: PROVIDER_PRESETS };
+    if (dir && fs.existsSync(dir)) out.project = providerActive(providerSettingsFile(dir), profiles);
+    return out;
+}
+function providerSave(p) {
+    const list = readProviders();
+    const id = String(p.id || '').replace(/[^a-z0-9_-]/gi, '') || ('p' + Date.now().toString(36));
+    const old = list.find(x => x.id === id) || {};
+    const rec = { id, name: String(p.name || id).slice(0, 60), type: PROVIDER_PRESETS[p.type] ? p.type : 'custom',
+        base_url: String(p.base_url || '').trim().replace(/\/+$/, ''), model: String(p.model || '').trim(), small_model: String(p.small_model || '').trim(),
+        token: p.token === undefined || p.token === null ? (old.token || '') : String(p.token).trim() };
+    if (!/^https?:\/\//.test(rec.base_url)) throw new Error('URL del server non valido');
+    writeProviders(list.filter(x => x.id !== id).concat(rec));
+    return { ok: true, id };
+}
+function providerDelete(id) { writeProviders(readProviders().filter(x => x.id !== id)); return { ok: true }; }
+// Applica un profilo ('anthropic' = togli tutte le variabili) al file globale o del progetto
+function providerApply(id, dir) {
+    if (dir && !fs.existsSync(dir)) throw new Error('Cartella non trovata');
+    const file = providerSettingsFile(dir);
+    let j = {};
+    if (fs.existsSync(file)) {
+        j = JSON.parse(fs.readFileSync(file, 'utf8'));
+        fs.copyFileSync(file, file + '.ykan-bak');
+    } else fs.mkdirSync(path.dirname(file), { recursive: true });
+    const env = { ...(j.env || {}) };
+    PROVIDER_ENV.forEach(k => delete env[k]);
+    if (id !== 'anthropic') {
+        const p = readProviders().find(x => x.id === id);
+        if (!p) throw new Error('Profilo non trovato');
+        env.ANTHROPIC_BASE_URL = p.base_url;
+        env.ANTHROPIC_AUTH_TOKEN = p.token || 'none';
+        env.ANTHROPIC_API_KEY = ''; // altrimenti vince la chiave Anthropic
+        if (p.model) { env.ANTHROPIC_MODEL = p.model; env.ANTHROPIC_DEFAULT_OPUS_MODEL = p.model; env.ANTHROPIC_DEFAULT_SONNET_MODEL = p.model; }
+        const small = p.small_model || p.model;
+        if (small) { env.ANTHROPIC_SMALL_FAST_MODEL = small; env.ANTHROPIC_DEFAULT_HAIKU_MODEL = small; env.CLAUDE_CODE_SUBAGENT_MODEL = p.model || small; }
+    }
+    if (Object.keys(env).length) j.env = env; else delete j.env;
+    fs.writeFileSync(file, JSON.stringify(j, null, 2));
+    return { ok: true, file };
+}
+// Prova: una richiesta minima a /v1/messages nel formato Anthropic
+async function providerTest(id) {
+    const p = readProviders().find(x => x.id === id);
+    if (!p) throw new Error('Profilo non trovato');
+    const t0 = Date.now();
+    const ctl = new AbortController(); const tm = setTimeout(() => ctl.abort(), 30000);
+    try {
+        const r = await fetch(p.base_url + '/v1/messages', { method: 'POST', signal: ctl.signal,
+            headers: { 'content-type': 'application/json', 'anthropic-version': '2023-06-01', 'x-api-key': p.token || 'none', authorization: 'Bearer ' + (p.token || 'none') },
+            body: JSON.stringify({ model: p.model || 'test', max_tokens: 16, messages: [{ role: 'user', content: 'Rispondi solo: ok' }] }) });
+        const txt = await r.text();
+        let j = null; try { j = JSON.parse(txt); } catch (_) {}
+        if (!r.ok) return { ok: false, status: r.status, error: (j && j.error && (j.error.message || j.error)) || txt.slice(0, 300), ms: Date.now() - t0 };
+        const reply = j && Array.isArray(j.content) ? j.content.map(c => c.text || '').join('').trim() : '';
+        return { ok: true, model: (j && j.model) || p.model, reply: reply.slice(0, 120), ms: Date.now() - t0 };
+    } catch (e) { return { ok: false, error: e.name === 'AbortError' ? 'nessuna risposta in 30 s' : String(e.message || e), ms: Date.now() - t0 }; }
+    finally { clearTimeout(tm); }
+}
+function ollamaBin() {
+    const c = process.platform === 'win32'
+        ? [path.join(process.env.LOCALAPPDATA || '', 'Programs', 'Ollama', 'ollama.exe')]
+        : ['/usr/local/bin/ollama', '/opt/homebrew/bin/ollama', '/usr/bin/ollama', '/Applications/Ollama.app/Contents/Resources/ollama'];
+    return c.find(f => f && fs.existsSync(f)) || '';
+}
+// Modelli installati in Ollama (locale o all'URL dato)
+async function ollamaModels(base) {
+    const url = (base || 'http://localhost:11434').replace(/\/+$/, '');
+    try {
+        const r = await fetch(url + '/api/tags', { signal: AbortSignal.timeout(5000) });
+        if (!r.ok) return { ok: false, error: 'HTTP ' + r.status };
+        const j = await r.json();
+        let version = '';
+        try { version = (await (await fetch(url + '/api/version', { signal: AbortSignal.timeout(3000) })).json()).version || ''; } catch (_) {}
+        return { ok: true, version, models: (j.models || []).map(m => ({ name: m.name, size: m.size, modified: m.modified_at })) };
+    } catch (e) { return { ok: false, installed: !!ollamaBin(), error: 'Ollama non risponde su ' + url }; }
+}
+
 const VENDOR_FILES = {
     '/vendor/xterm.js': ['@xterm/xterm/lib/xterm.js', 'application/javascript'],
     '/vendor/xterm.css': ['@xterm/xterm/css/xterm.css', 'text/css'],
@@ -2265,6 +2397,10 @@ function handlePtyConnection(ws, opts) {
         // sessionId scelto dalla board: permette di sapere in anticipo a quale task appartiene la sessione
         if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(sessionId || '')) args.push('--session-id', sessionId);
         if (prompt) args.push(prompt);
+    } else if (launch === 'ollama') {
+        // server Ollama nel terminale della board: chiudendo la scheda si ferma
+        cmd = ollamaBin() || 'ollama';
+        args = ['serve'];
     } else if (launch === 'powershell') {
         cmd = process.platform === 'win32' ? 'powershell.exe' : 'pwsh';
         args = ['-NoLogo'];
@@ -2858,12 +2994,36 @@ function handleRequest(req, res, parsed) {
         } catch (e) { return json(404, { error: 'file non presente: ' + mod }); }
     }
 
+    if (req.method === 'GET' && parsed.pathname === '/docs/status') {
+        docsStatus(String(parsed.query.dir || '')).then(r => json(200, r)).catch(e => json(500, { error: String((e && e.message) || e) }));
+        return;
+    }
     if (req.method === 'GET' && parsed.pathname === '/lanes/paths') return json(200, { paths: readLanePaths() });
     if (req.method === 'POST' && parsed.pathname === '/lanes/paths') {
         if (!isAllowedOrigin(origin)) return json(403, { error: 'origin non ammessa' });
         if (!/^application\/json/.test(req.headers['content-type'] || '')) return json(415, { error: 'serve application/json' });
         readBody(req, 20000).then(raw => { const b = JSON.parse(raw || '{}'); json(200, writeLanePath(String(b.lane_id || ''), String(b.dir || '').trim())); })
             .catch(e => json(500, { error: String((e && e.message) || e) }));
+        return;
+    }
+    if (req.method === 'GET' && parsed.pathname === '/claude/providers') {
+        try { return json(200, providersStatus(String(parsed.query.dir || ''))); } catch (e) { return json(500, { error: String((e && e.message) || e) }); }
+    }
+    if (req.method === 'GET' && parsed.pathname === '/ollama/models') {
+        ollamaModels(String(parsed.query.base || '')).then(r => json(200, r));
+        return;
+    }
+    const provM = req.method === 'POST' && parsed.pathname.match(/^\/claude\/providers\/(save|delete|apply|test)$/);
+    if (provM) {
+        if (!isAllowedOrigin(origin)) return json(403, { error: 'origin non ammessa' });
+        if (!/^application\/json/.test(req.headers['content-type'] || '')) return json(415, { error: 'serve application/json' });
+        readBody(req, 20000).then(async raw => {
+            const b = JSON.parse(raw || '{}');
+            if (provM[1] === 'save') return json(200, providerSave(b.profile || {}));
+            if (provM[1] === 'delete') return json(200, providerDelete(String(b.id || '')));
+            if (provM[1] === 'apply') return json(200, providerApply(String(b.id || ''), String(b.dir || '').trim()));
+            return json(200, await providerTest(String(b.id || '')));
+        }).catch(e => json(500, { error: String((e && e.message) || e) }));
         return;
     }
     if (req.method === 'GET' && parsed.pathname === '/claude/scheduled') {

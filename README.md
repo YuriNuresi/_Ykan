@@ -4,19 +4,27 @@
 
 A lightweight, self-contained Kanban board that runs from a single PHP file. Perfect for developers who want a simple, fast, and AI-enhanced project management tool without complex setups.
 
-![Version](https://img.shields.io/badge/version-2.1.0-blue)
+![Version](https://img.shields.io/badge/version-2.2.0-blue)
 ![PHP](https://img.shields.io/badge/PHP-8.2+-purple)
 ![License](https://img.shields.io/badge/license-MIT-green)
 [![Demo](https://img.shields.io/badge/demo-live-brightgreen)](https://portale3d.it/projects/_Ykan/demo.php)
+
+> Last updated: 2026-10-30 · board 2.2.x · Bridge 0.9.5
+
+**Documentation** (Italian): [DOCUMENTAZIONE.md](DOCUMENTAZIONE.md) (what it does) · [STRUTTURA.md](STRUTTURA.md) (where the code is) · [CHANGELOG.md](CHANGELOG.md) (what changed) · [MCP_SETUP.md](MCP_SETUP.md) (MCP server setup)
 
 ---
 
 ## Features
 
 ### Core
-- **Single-file deployment** - Just one PHP file, no database required
+- **Single-file deployment** - Just one PHP file; no database needed locally (online with Google login, each user's board lives in MySQL)
 - **Drag & Drop** - Move cards between columns and swimlanes
-- **Swimlanes** - Organize tasks by category (collapsible accordions)
+- **Swimlanes** - Organize tasks by project (each with its own color and links: OVH folder, URL, local folder, GitHub repo, claude.ai Project)
+- **Version rows** - Each project has several version rows (the first is the current one); add, rename, reorder, promote tasks; every card keeps its version history
+- **Right-click menu** - On cards, cells, version rows and projects (🔧 on mobile)
+- **Archive page** - Grouped by project, with search and filters (project, version, label, period)
+- **Task category** - A work mode per card, shown as an icon, with "✨ Suggerisci" (Claude via Bridge, then the board AI)
 - **Labels & Priorities** - Color-coded organization
 - **Due dates** - Track deadlines with overdue alerts
 - **Dark/Light theme** - Easy on the eyes
@@ -28,13 +36,18 @@ A lightweight, self-contained Kanban board that runs from a single PHP file. Per
 - **Full control** - Override colors, layout (density/shape) and surfaces (gradients, glass)
 - **Documented template** - `themes/_TEMPLATE.jsonc` explains every field for humans & AIs
 
-### Dashboard - cross-project view
-A second tab next to Kanban, sharing one project + period filter across four views:
+### Home & Projects - cross-project view
+- **Home** - KPI tiles with 7-day trend, today's token usage, weekly consumption plan, and a 3×3 widget grid whose rows open the project, card, Claude Desktop chat or WhatsApp
+- **Commit from the board** - Changed files with diff, secrets blocked (`.env`, keys, `_Ykan_data.json`, files over 5 MB), message and review written by Claude, tests (Pest, PHPUnit, `npm test`) before committing, push never `--force`
+- **📚 Documentation menu** - Creates or updates DOCUMENTAZIONE.md, STRUTTURA.md, CHANGELOG.md and README.md of a project via Claude Code and the `ykan-docs` skill, showing which ones are missing or stale
+- **Work modes** - Plugin and skill sets per type of work (global or per project), applied by the Bridge in `.claude/settings.local.json`
+
+The Projects page groups these views (Focus, PM, Da riprendere, Ultimi 7 giorni, Revisione sessioni, Git, Graphify):
 - **Da riprendere** - loose ends across every linked project, ordered by last activity
 - **Attività** - a per-day timeline of task moves and session activity
 - **Revisione sessioni** - review of Claude Code sessions, grouped by project, with a suggested verdict (resume, conclude, or split into tasks)
 - **Git** - repository status per project (local changes, commits to push) plus GitHub last push / open issues
-- **Local Bridge** (`bridge/`, Node, optional) - runs only on `127.0.0.1`, feeds the Dashboard real Claude Code session history and a live terminal; the board degrades gracefully when it isn't running. Started via `bridge/autostart-hidden.vbs` it shows a tray icon (green/red) with Restart / Quit / Open log
+- **Local Bridge** (`bridge/`, Node, optional) - runs only on `127.0.0.1:51820`, feeds the board real Claude Code session history, git, skills, plugins and live terminals (cmd, PowerShell, Claude Code; xterm.js served by the Bridge itself); the board degrades gracefully when it isn't running. Ships as `ykan-bridge.exe` with a tray icon (Restart / Update / Log) and self-update; from sources run `bridge/start-bridge.bat`
 
 ### MCP Server & Automation
 Beyond remote board/file control from the Claude mobile app, `mcp.php` turns _Ykan into a
@@ -51,7 +64,8 @@ coordination hub for every project linked to it:
 - **`.env` config** - Secrets (`MCP_SECRET`, `MCP_ROOT`, optional `ANTHROPIC_KEY`) loaded from `.env`, never hardcoded
 - See [MCP_SETUP.md](MCP_SETUP.md) for the full setup guide
 
-### AI Integration (Gemini)
+### AI Integration (Another AI: Gemini, Groq, ChatGPT, Ollama)
+- **Another AI** - Side tab on every page, with suggested actions per page; some features try every provider that has a key, in order
 - **Project Analysis** - Scan your codebase and get task suggestions
 - **Task Verification** - AI checks if tasks are completed by reading associated files
 - **Auto-categorization** - AI suggests labels and priority
@@ -115,12 +129,14 @@ Click on **Settings** (gear icon) to configure:
 - PHP 8.2+
 - cURL extension (for AI and GitHub features)
 - Write permissions (for `_Ykan_data.json`)
+- Optional: MySQL (PDO) + Google OAuth for online per-user boards
+- Optional: Node.js for the local Bridge (`cd bridge && npm install`, then `start-bridge.bat`), or the prebuilt `ykan-bridge.exe`
 
 ---
 
 ## Data Storage
 
-All data is stored in `_Ykan_data.json` in the same directory. This file contains:
+Locally (no login) all data is stored in `_Ykan_data.json` in the same directory. Online with Google login, each user's board is one JSON row in the MySQL table `ykan_boards`, same format. The board data contains:
 - Board configuration
 - Columns and swimlanes
 - All cards (active and archived)
@@ -136,7 +152,8 @@ All data is stored in `_Ykan_data.json` in the same directory. This file contain
 |-----|--------|
 | `Click + Drag` | Move cards |
 | `Click on card` | Edit card |
-| `Click on swimlane header` | Toggle collapse |
+| `Click on version row header` | Toggle collapse |
+| `Right click` (🔧 on mobile) | Context menu on cards, cells, rows and projects |
 
 ---
 
@@ -156,6 +173,20 @@ POST ?api=github_commits     # Get GitHub commits
 ---
 
 ## Changelog
+
+Full, up-to-date history (in Italian) in [CHANGELOG.md](CHANGELOG.md). Summary:
+
+### Unreleased (October 2026)
+- Commit and push from the board with Claude-written message and review, secret blocking and tests
+- Version rows in the Kanban, right-click menu, task categories and work modes
+- Archive and PM become pages; local Claude Desktop routines in the Routine tab
+- 📚 Documentation menu per project (`ykan-docs` skill); Bridge 0.9.5 serves xterm.js and stores each PC's project folders
+
+### v2.2.0 (October 2026)
+- Home with KPI, token usage and clickable widget rows; "bento" style across Kanban, Projects, Claude and Settings
+- Another AI tab on every page; "Open in Claude Desktop" from Home and Projects
+- Terminal picker (cmd, PowerShell, Claude Code, project folder, live site); full-height sidebar
+- Bridge 0.9.4: PowerShell, `/open-folder`, `/claude/ask`, per-number WhatsApp instructions, macOS zip (beta)
 
 ### v2.1.0 (October 2026)
 - WhatsApp on the PC: the Bridge links as a WhatsApp device (QR code) and Claude Code answers whitelisted numbers; WhatsApp page in the Claude panel

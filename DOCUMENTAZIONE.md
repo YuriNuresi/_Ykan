@@ -32,6 +32,8 @@ _Ykan è un **Kanban single-file in PHP** che fa anche da centro di controllo pe
 - **Righe versione** dentro ogni progetto: la prima è sempre "attuale", le altre partono chiuse. Trascinare una card tra righe ne cambia la versione; ogni card ha lo storico delle versioni con le date. Da riga 2 in giù: "promuovi task a". Eliminando una riga si sceglie dove spostare i task aperti; quelli in Done vanno in archivio. Le versioni eliminate restano come archiviate.
 - **Card**: priorità, etichetta, scadenza, file, descrizione, ID breve (`#25`), task autorigeneranti, **categoria di lavoro** (icona sulla card).
 - **Menu del tasto destro** su card, celle, righe versione e intestazioni dei progetti; su mobile lo stesso menu si apre col 🔧.
+- **📚 Documentazione** (menu del progetto con cartella locale): crea o aggiorna DOCUMENTAZIONE.md, STRUTTURA.md, CHANGELOG.md e README.md aprendo Claude Code nel terminale con la skill `ykan-docs`. Ogni voce dice se il file manca, è aggiornato o è più vecchio dell'ultimo commit (stato letto dal Bridge con `/docs/status`; dal relay solo a richiesta). «Note di progettazione della sessione» riprende una sessione scelta e salva decisioni e prossimi passi in `docs/design/`.
+- **Documentazione per l'AI**: file del progetto scelti a mano (`doc_files`) che le funzioni AI della board citano nei prompt.
 - **Archivio** come pagina dentro il kanban, raggruppato per progetto, con ricerca e filtri (progetto, versione, etichetta, periodo).
 - Export JSON/CSV, temi chiaro/scuro e temi custom (`themes/`).
 
@@ -51,6 +53,7 @@ Pannello con schede: Skill · Plugin · Memoria · Contesto · **Modalità** · 
 - **Contesto**: cosa entra in ogni sessione (plugin, skill, MCP, CLAUDE.md) con interruttori per progetto.
 - **Modalità di lavoro**: insiemi di plugin e skill per tipo di lavoro (Manutenzione, Feature, UI, Prototipo, Dati, Analisi, Videogiochi, Commerciale…). Una per progetto alla volta; il Bridge la applica in `.claude/settings.local.json` e un hook SessionStart inietta il contesto generato da Claude. **Fissi** globali e per progetto restano sempre accesi. "✨ Modalità suggerite" crea le predefinite; "Proponi con Claude" sceglie le skill.
 - **Categoria del task** = una modalità: se diversa da quella del progetto, al lancio Ykan chiede quale usare. "✨ Suggerisci categoria": prima Claude dal Bridge (legge il progetto), poi l'AI della board.
+- **Provider AI**: profili Anthropic ufficiale / Ollama (locale o cloud) / OpenRouter / altro compatibile, salvati sul PC in `~/.ykan-providers.json` (chiavi mai sul server). Applicare un profilo scrive solo le variabili `ANTHROPIC_*` nel blocco `env` di `~/.claude/settings.json` (globale) o `.claude/settings.local.json` (progetto), con backup. «Prova» chiama `/v1/messages`; «▶ Avvia Ollama» apre `ollama serve` nel terminale della board.
 - **Routine**: quelle cloud di claude.ai (con «Esegui ora» via trigger API) e quelle **locali di Claude Desktop** (`~/.claude/scheduled-tasks`, prompt leggibile e modificabile; orario e pausa restano in Desktop).
 
 ### Lavorare con Claude su un task

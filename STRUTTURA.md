@@ -30,6 +30,14 @@ bridge/
   wa-loader.cjs        bot WhatsApp (Baileys)
 extension/             estensione Chrome
 downloads/             zip del Bridge e dell'estensione serviti dalla board
+graphify-out/          grafo del progetto (Graphify), rigenerabile
+
+CLAUDE.md              istruzioni per Claude: leggere prima i documenti
+DOCUMENTAZIONE.md      cosa fa · STRUTTURA.md dove sta il codice
+CHANGELOG.md           cosa è cambiato · README.md presentazione (in inglese)
+MCP_SETUP.md           configurazione del server MCP
+PIANO_vacanze.md       piano della routine notturna «Sistema Vacanze»
+myskills.md            appunti sulle skill
 ```
 
 ## Anatomia di `_Ykan.php`
@@ -57,8 +65,10 @@ downloads/             zip del Bridge e dell'estensione serviti dalla board
 | `RIGHE VERSIONE` | `laneVersions`, `renderVersionRow`, `promoteVersion`, `deleteVersionRow` |
 | `MODALITÀ DI LAVORO` | `workModes`, `MODE_PRESETS`, `modesHtml`, `setLaneMode`, `suggestModeFor`, `cardSuggestMode` |
 | `MENU DEL TASTO DESTRO` | `ctxMenu`, `cardContextItems`, `versionContextItems`, `laneContextItems` |
+| `Documenti del progetto` (subito dopo `laneContextItems`) | menu 📚: `DOC_KINDS`, `docsStat`, `docsStatusLoad`, `docsMenuItems`, `docsRun` (Claude Code nel terminale con la skill `ykan-docs`), `docsSessionNote` |
 | `ARCHIVIO` | pagina archivio |
-| `PROJECTS` | collegamenti del progetto, `saveProjectLink`, cartelle per PC (`lanePaths`) |
+| `PROJECTS` | collegamenti del progetto, `saveProjectLink`, cartelle per PC (`lanePaths`, `lanePathsLoad` che legge anche lo stato dei documenti) |
+| `openDocsModal` | «Documentazione per l'AI»: file scelti del progetto (`lane.doc_files`) citati nei prompt delle funzioni AI |
 | `DASHBOARD` | schede Progetti; Git (`dashGitLoad`, `dashGitHtml`) e finestra commit (`gitCommitOpen`) |
 | `PC COLLEGATI` | `bridgeFetch` (diretto o relay), `bridgeTarget`, `ctxCall` |
 | `TERMINAL` | `xtermLoad`, `openTerminalModal` |
@@ -79,7 +89,7 @@ downloads/             zip del Bridge e dell'estensione serviti dalla board
     "id": "lane_…", "name": "_Ykan", "position": 0, "color": "#…",
     "path": "ykan", "url": "https://…", "local_path": "C:\\…", "github_repo": "owner/repo",
     "versions": [{ "id": "ver_…", "name": "V2.0" }], "archived_versions": [],
-    "mode_id": "p-feature", "mode_pinned": {}, "mode_contexts": {}
+    "mode_id": "p-feature", "mode_pinned": {}, "mode_contexts": {}, "doc_files": []
   }],
   "cards": [{
     "id": "card_…", "seq": 25, "title": "…", "description": "…",
@@ -103,6 +113,7 @@ downloads/             zip del Bridge e dell'estensione serviti dalla board
 | Sessioni e analisi (~1330–1800) | trascrizioni, analisi con `runClaudePrint`, archiviazione in Desktop |
 | Git (~1802, ~1961) | `gitInfo`, `gitInit`, `gitChanges`, `gitDiff`, `gitCommit`, `gitPush`, `gitRunTests`, `gitAi` |
 | Routine locali, cartelle per PC, vendor (~1912) | `listScheduled`, `writeScheduled`, `readLanePaths`, `writeLanePath`, `VENDOR_FILES` (xterm) |
+| `DOCUMENTI DEL PROGETTO` (~1955) | `PROJECT_DOCS`, `docsStatus`: esistenza, data, righe dei 4 documenti, note in `docs/design/`, data dell'ultimo commit (rotta `GET /docs/status`, anche via relay) |
 | PTY, Desktop, Remote Control (~2109) | terminale, `claude --desktop --resume`, `claude remote-control` |
 | HTTP + WS server (~2307) | controlli d'accesso (Origin, biglietto, cartelle) e `handleRequest` con tutte le rotte |
 
@@ -111,6 +122,7 @@ downloads/             zip del Bridge e dell'estensione serviti dalla board
 - **Nuova rotta del Bridge**: in `handleRequest`; le scritture solo `POST` + `isAllowedOrigin` + `application/json`. Per usarla da remoto aggiungila a `RELAY_PATHS` e a `YKAN_RELAY_PATHS`. Poi `npm run build` e sostituisci l'exe.
 - **Nuovo tool MCP**: in `mcp.php` (definizione nel `tools/list` + handler).
 - **Tema custom**: copia `themes/_TEMPLATE.jsonc`.
+- **Documenti del progetto**: il menu 📚 non scrive nulla da solo, apre Claude Code con un prompt per la skill `ykan-docs` (`~/.claude/skills/ykan-docs`); per cambiare cosa scrivono i documenti si modifica la skill, non la board.
 
 ## Pattern e convenzioni
 - File unico, monolitico per scelta; nessun build per la board.

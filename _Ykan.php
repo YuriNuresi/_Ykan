@@ -317,7 +317,7 @@ const YKAN_RELAY_PATHS = ['/sessions', '/session', '/reviews', '/git', '/claude/
     '/claude/memory', '/claude/memory/file', '/claude/memory/write', '/claude/memory/delete',
     '/claude/skill/write', '/claude/skill/override', '/claude/skill/copy', '/claude/plugins', '/claude/plugins/toggle',
     '/rc', '/rc/start', '/rc/stop', '/rc/answer', '/rc/autostart',
-    '/claude/context', '/claude/context/project', '/claude/mode', '/claude/mode/apply', '/claude/mode/clear', '/claude/mode/suggest', '/git/changes', '/git/diff', '/git/commit', '/git/test', '/git/ai', '/claude/scheduled', '/claude/scheduled/write', '/lanes/paths',
+    '/claude/context', '/claude/context/project', '/claude/mode', '/claude/mode/apply', '/claude/mode/clear', '/claude/mode/suggest', '/git/changes', '/git/diff', '/git/commit', '/git/test', '/git/ai', '/claude/scheduled', '/claude/scheduled/write', '/lanes/paths', '/docs/status', '/claude/providers', '/claude/providers/delete', '/claude/providers/apply', '/claude/providers/test', '/ollama/models',
     '/desktop-archive', '/desktop/new', '/desktop/resume'];
 const YKAN_RELAY_WAIT_SECS = 25; // quanto la board aspetta la risposta del PC
 const YKAN_POLL_HOLD_SECS = 8;   // quanto una ?bridge=poll resta aperta se non ci sono comandi
@@ -4688,6 +4688,7 @@ $dataJson = json_encode(ykanPublicData($data));
                 <button data-tab="routines" onclick="claudeNav('routines')">Routine <span class="dash-count"></span></button>
                 <button data-tab="context" onclick="claudeNav('context')">Contesto <span class="dash-count"></span></button>
                 <button data-tab="modes" onclick="claudeNav('modes')">Modalità <span class="dash-count"></span></button>
+                <button data-tab="providers" onclick="claudeNav('providers')">Provider AI <span class="dash-count"></span></button>
                 <button data-tab="rc" onclick="claudeNav('rc')">Remote Control <span class="dash-count"></span></button>
             <button data-tab="news" onclick="showView('claude');claudeTab('news')">Novità <span class="dash-count"></span></button>
             <button data-tab="wa" onclick="showView('claude');claudeTab('wa')">WhatsApp <span class="dash-count"></span></button>
@@ -5382,6 +5383,7 @@ $dataJson = json_encode(ykanPublicData($data));
             <button data-tab="routines" onclick="claudeTab('routines')">Routine <span class="dash-count"></span></button>
             <button data-tab="context" onclick="claudeTab('context')">Contesto <span class="dash-count"></span></button>
             <button data-tab="modes" onclick="claudeTab('modes')">Modalità <span class="dash-count"></span></button>
+            <button data-tab="providers" onclick="claudeTab('providers')">Provider AI <span class="dash-count"></span></button>
         </div>
         <div id="claudeBody"></div>
     </section>
@@ -6510,6 +6512,7 @@ Assegnarla al task?`)) cardPatch(card, { work_mode_id: m.id });
             safeUrl(lane.url) ? { label: 'Apri sito', icon: '🌐', action: () => window.open(safeUrl(lane.url), '_blank', 'noopener') } : null,
             lane.local_path ? { label: 'Terminale', icon: '🖥️', action: () => openTerminalModal(lane.id) } : null,
             lane.local_path ? { label: 'Commit e push…', icon: '📝', action: () => gitCommitOpen(lane.id) } : null,
+            lane.local_path ? { label: 'Documentazione', icon: '📚', sub: docsMenuItems(lane) } : null,
             lane.local_path ? { label: 'Sessioni Claude Code', icon: '🕒', action: () => openSessionsModal(lane.id) } : null,
             { label: 'Documentazione per l\'AI', icon: '📄', action: () => openDocsModal(lane.id) },
             { label: 'Collegamenti (cartella, repo, URL)', icon: '🔗', action: () => openProjectsModal(lane.id) },
@@ -6521,6 +6524,67 @@ Assegnarla al task?`)) cardPatch(card, { work_mode_id: m.id });
             '-',
             { label: 'Elimina progetto', icon: '🗑️', danger: true, action: () => deleteSwimlane(lane.id) }
         ];
+    }
+
+    // ---- Documenti del progetto: Claude Code li crea o aggiorna con la skill ykan-docs ----
+    const DOC_KINDS = [['documentazione', 'DOCUMENTAZIONE.md', 'cosa fa'], ['struttura', 'STRUTTURA.md', 'dove sta il codice'],
+        ['changelog', 'CHANGELOG.md', 'cosa è cambiato'], ['readme', 'README.md', 'presentazione e avvio']];
+    const docsStat = {}; // laneId -> stato letto dal Bridge
+    async function docsStatusLoad(lane) {
+        try { docsStat[lane.id] = await ctxCall('/docs/status?dir=' + encodeURIComponent(lane.local_path)); }
+        catch (_) { if (!docsStat[lane.id]) docsStat[lane.id] = null; } // un errore passeggero non cancella lo stato già letto
+    }
+    function docsMenuItems(lane) {
+        const st = docsStat[lane.id];
+        if (st === undefined) docsStatusLoad(lane); // la prossima apertura del menu mostra lo stato
+        const last = st && st.lastCommit ? new Date(st.lastCommit).getTime() : 0;
+        const items = DOC_KINDS.map(([kind, file, what]) => {
+            const f = st && st.files ? st.files[file] : null;
+            const when = f && f.exists ? new Date(f.modified).toLocaleString('it-IT', { day: '2-digit', month: '2-digit', year: '2-digit', hour: '2-digit', minute: '2-digit' }) : '';
+            const late = f && f.exists ? (f.commitsAfter != null ? f.commitsAfter : (last && new Date(f.modified).getTime() < last ? 1 : 0)) : 0;
+            const tag = !st ? '' : !f || !f.exists ? ' — manca'
+                : ` — ${when} · ` + (late ? `⚠️ ${f.commitsAfter != null ? late + ' commit dopo' : 'più vecchio del codice'}` : '✓ aggiornato');
+            const verb = !st ? 'Crea o aggiorna' : f && f.exists ? 'Aggiorna' : 'Crea';
+            return { label: `${verb} ${file}${tag}`, icon: st && f && !f.exists ? '➕' : '📄', title: what,
+                action: () => docsRun(lane, kind, file) };
+        });
+        if (st === null) items.unshift({ label: 'Stato non letto: Bridge non raggiungibile', icon: '⚠️', disabled: true });
+        else if (st === undefined) items.unshift({ label: 'Leggo lo stato dei file…', icon: '⏳', disabled: true });
+        return items.concat(['-',
+            { label: 'Tutti e quattro', icon: '📚', action: () => docsRun(lane, 'tutto', 'la documentazione') },
+            { label: 'Note di progettazione della sessione…', icon: '📝', action: () => docsSessionNote(lane) },
+            { label: 'Rileggi lo stato', icon: '↻', action: () => { docsStatusLoad(lane).then(() => toast('Stato dei documenti aggiornato: riapri il menu', 'success')); } }]);
+    }
+    // Apre Claude Code nel terminale del progetto con la skill ykan-docs
+    function docsRun(lane, kind, label) {
+        const prompt = `Usa la skill ykan-docs con argomento "${kind}": crea o aggiorna ${label} del progetto in questa cartella leggendo il codice. Non fare commit.`;
+        openTerminalModal(lane.id, { launch: 'claude', prompt });
+        // Claude ci mette qualche minuto: lo stato si rilegge a intervalli per 20 minuti, senza mai azzerarlo
+        let n = 0;
+        const t = setInterval(() => { docsStatusLoad(lane); if (++n >= 20) clearInterval(t); }, 60000);
+        toast(`📚 Claude Code al lavoro su ${label} di ${lane.name}`, 'success');
+    }
+    // Le note di una sessione: si riprende la sessione scelta e le si chiede di salvarle
+    async function docsSessionNote(lane) {
+        let list = [];
+        try { const r = await bridgeFetch('/sessions?dir=' + encodeURIComponent(lane.local_path)); list = r.ok ? ((await r.json()).sessions || []) : []; } catch (_) {}
+        if (!list.length) { toast('Nessuna sessione di Claude Code trovata per questo progetto', 'info'); return; }
+        const ov = document.createElement('div');
+        ov.className = 'modal-overlay active';
+        ov.innerHTML = `<div class="modal" style="max-width:560px">
+            <h2>📝 Note di progettazione · ${escHtml(lane.name)}</h2>
+            <p style="font-size:13px;color:var(--text2);margin:6px 0 12px">Claude riprende la sessione scelta e salva decisioni, alternative scartate e prossimi passi in <code>docs/design/</code>, aggiornando gli altri documenti se serve.</p>
+            <select id="docsSess" style="width:100%;margin-bottom:12px">${list.slice(0, 30).map(s => `<option value="${escHtml(s.id || s.sessionId || '')}">${escHtml(((s.title || s.preview || s.id || '') + '').slice(0, 90))}${s.modified || s.lastModified ? ' · ' + escHtml(new Date(s.modified || s.lastModified).toLocaleString('it-IT')) : ''}</option>`).join('')}</select>
+            <div style="display:flex;gap:8px;justify-content:flex-end"><button class="btn" data-x="no">Annulla</button><button class="btn btn-primary" data-x="ok">Salva le note</button></div></div>`;
+        document.body.appendChild(ov);
+        ov.addEventListener('click', e => {
+            const x = e.target.dataset && e.target.dataset.x;
+            if (e.target === ov || x === 'no') { ov.remove(); return; }
+            if (x !== 'ok') return;
+            const sessionId = ov.querySelector('#docsSess').value;
+            ov.remove();
+            openTerminalModal(lane.id, { launch: 'claude', sessionId, prompt: 'Usa la skill ykan-docs con argomento "sessione": salva le note di progettazione di questa sessione. Non fare commit.' });
+        });
     }
 
     // Un solo listener sulla board: sceglie il menu in base a cosa c'è sotto il mouse
@@ -6928,6 +6992,8 @@ Assegnarla al task?`)) cardPatch(card, { work_mode_id: m.id });
         try { lanePaths = (await ctxCall('/lanes/paths')).paths || {}; } catch (_) { lanePaths = null; return; }
         lanePathsApply();
         render();
+        // stato dei documenti per il menu 📚 (solo sul PC locale: dal relay sarebbero troppe chiamate)
+        if (!bridgeIsRemote()) boardData.swimlanes.filter(l => l.local_path).forEach(l => docsStatusLoad(l));
     }
     setTimeout(lanePathsLoad, 0);
 
@@ -9002,7 +9068,7 @@ Assegnarla al task?`)) cardPatch(card, { work_mode_id: m.id });
 
         const tabEl = document.createElement('div');
         tabEl.className = 'term-tab';
-        const tabIco = { powershell: '🟦', claude: '🤖', resume: '🤖' }[context.launch] || '🖥️';
+        const tabIco = { powershell: '🟦', claude: '🤖', resume: '🤖', ollama: '🦙' }[context.launch] || '🖥️';
         tabEl.innerHTML = `<span>${tabIco} ${escHtml(lane.name)}</span><span class="term-tab-x" title="Chiudi (termina il processo)">&times;</span>`;
         tabEl.addEventListener('click', e => { if (!e.target.classList.contains('term-tab-x')) termSwitchTab(id); });
         tabEl.querySelector('.term-tab-x').addEventListener('click', e => { e.stopPropagation(); termCloseTab(id); });
@@ -10738,7 +10804,9 @@ Assegnarla al task?`)) cardPatch(card, { work_mode_id: m.id });
             memory: memNow && memNow.files ? memNow.files.length : '',
             rc: Array.isArray(rcServers) ? rcServers.filter(x => ['running', 'starting', 'waiting'].includes(x.status)).length || '' : '',
             routines: (boardData.routines || []).length || '' };
-        if (claudeTabName === 'modes') {
+        if (claudeTabName === 'providers') {
+            body.innerHTML = provHtml();
+        } else if (claudeTabName === 'modes') {
             body.innerHTML = modesHtml();
         } else if (claudeTabName === 'context') {
             body.innerHTML = ctxRender();
@@ -11145,6 +11213,124 @@ Assegnarla al task?`)) cardPatch(card, { work_mode_id: m.id });
         try { localRoutines = (await ctxCall('/claude/scheduled')).routines || []; } catch (_) { localRoutines = null; }
         if (claudeTabName === 'routines') claudeRenderBody();
     }
+    // ---- Provider di Claude Code: Anthropic ufficiale, Ollama, OpenRouter… (profili e chiavi sul PC, nel Bridge) ----
+    let prov, provLane = '', provEdit = null, provTestRes = {}, provOllama = null;
+    const PROV_TYPES = { ollama: '🦙 Ollama locale', 'ollama-cloud': '☁️ Ollama cloud', openrouter: '🔀 OpenRouter', custom: '🔧 Altro (compatibile Anthropic)' };
+    async function provLoad() {
+        const lane = boardData.swimlanes.find(l => l.id === provLane);
+        try { prov = await ctxCall('/claude/providers' + (lane && lane.local_path ? '?dir=' + encodeURIComponent(lane.local_path) : '')); }
+        catch (_) { prov = null; }
+        if (claudeTabName === 'providers') claudeRenderBody();
+    }
+    function provName(act) {
+        if (!act) return '—';
+        if (act.id === 'anthropic') return '🅰️ Anthropic ufficiale';
+        const p = prov.profiles.find(x => x.id === act.id);
+        return p ? `${PROV_TYPES[p.type] ? PROV_TYPES[p.type].split(' ')[0] : '🔧'} ${escHtml(p.name)}` : `🔧 impostato a mano (${escHtml(act.base_url)})`;
+    }
+    function provHtml() {
+        if (prov === undefined) { prov = 'loading'; provLoad(); }
+        if (prov === 'loading') return '<div class="dash-empty">Leggo i provider dal PC…</div>';
+        if (prov === null) return '<div class="dash-empty"><i class="ib"></i> Bridge non raggiungibile (o da aggiornare): i provider si gestiscono dal PC.</div>';
+        const lanes = boardData.swimlanes.filter(l => l.local_path);
+        const lane = lanes.find(l => l.id === provLane);
+        const opts = (scope) => `<option value="anthropic">🅰️ Anthropic ufficiale</option>` + prov.profiles.map(p => `<option value="${escHtml(p.id)}">${escHtml(p.name)}${p.model ? ' · ' + escHtml(p.model) : ''}</option>`).join('');
+        const sel = (act, scope) => `<select onchange="provApply(this.value,'${scope}')" style="min-width:220px">${opts(scope).replace(`value="${escHtml(act ? act.id : '')}"`, `value="${escHtml(act ? act.id : '')}" selected`)}${act && act.id === 'custom-env' ? `<option selected disabled>🔧 impostato a mano</option>` : ''}</select>`;
+        let h = `<div class="dash-sub" style="margin-bottom:12px">Con quale AI lavora Claude Code. Ykan scrive solo le variabili <code>ANTHROPIC_*</code> nel blocco <code>env</code> di <code>~/.claude/settings.json</code> (tutti i progetti) o di <code>.claude/settings.local.json</code> (un progetto, vince sul globale), con backup <code>.ykan-bak</code>. Vale per le sessioni nuove. Le chiavi restano sul PC.</div>
+        <div class="dash-card" style="padding:12px;margin-bottom:12px;display:grid;gap:10px">
+            <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap"><b style="min-width:110px">🌍 Tutti i progetti</b>${sel(prov.global, 'global')}<span class="dash-sub">ora: ${provName(prov.global)}</span></div>
+            <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap"><b style="min-width:110px">📁 Progetto</b>
+                <select onchange="provLane=this.value;prov='loading';provLoad();claudeRenderBody()"><option value="">— scegli —</option>${lanes.map(l => `<option value="${l.id}"${l.id === provLane ? ' selected' : ''}>${escHtml(l.name)}</option>`).join('')}</select>
+                ${lane && prov.project ? sel(prov.project.id === 'anthropic' && !prov.project.base_url ? { id: '' } : prov.project, 'project').replace('<option value="anthropic">🅰️ Anthropic ufficiale</option>', '<option value="">= come tutti i progetti</option><option value="anthropic">🅰️ Anthropic ufficiale</option>') + `<span class="dash-sub">${prov.project.base_url ? 'ora: ' + provName(prov.project) : 'segue il globale'}</span>` : ''}</div>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;margin:4px 0 8px"><h3 style="margin:0;font-size:14px;flex:1">Profili</h3>
+            ${Object.entries(PROV_TYPES).map(([t, n]) => `<button class="btn" style="font-size:12px" onclick="provNew('${t}')">+ ${n}</button>`).join('')}</div>`;
+        if (provEdit) h += provFormHtml();
+        if (!prov.profiles.length && !provEdit) h += '<div class="dash-empty">Nessun profilo. Aggiungine uno con i bottoni qui sopra.</div>';
+        h += prov.profiles.map(p => {
+            const t = provTestRes[p.id];
+            const res = !t ? '' : t === 'run' ? '⏳ provo…' : t.ok ? `✅ risponde (${escHtml(t.model || '')}, ${t.ms} ms)${t.reply ? ' — «' + escHtml(t.reply) + '»' : ''}` : `❌ ${escHtml(String(t.error || 'errore'))}${t.status ? ' (HTTP ' + t.status + ')' : ''}`;
+            return `<div class="dash-card" style="padding:10px 12px;margin-bottom:8px">
+                <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><b>${escHtml(PROV_TYPES[p.type] ? PROV_TYPES[p.type].split(' ')[0] : '🔧')} ${escHtml(p.name)}</b>
+                <span class="dash-sub" style="flex:1">${escHtml(p.base_url)} · modello <code>${escHtml(p.model || 'predefinito')}</code>${p.small_model ? ' · veloce <code>' + escHtml(p.small_model) + '</code>' : ''} · chiave ${p.has_token ? escHtml(p.token_masked) : 'nessuna'}</span>
+                ${p.type === 'ollama' ? `<button class="btn" style="font-size:12px" onclick="provOllamaStart()" title="Avvia ollama serve nel terminale della board">▶ Avvia</button>` : ''}
+                <button class="btn" style="font-size:12px" onclick="provTest('${p.id}')">Prova</button>
+                <button class="btn" style="font-size:12px" onclick="provEditOpen('${p.id}')">Modifica</button>
+                <button class="btn" style="font-size:12px" onclick="provDel('${p.id}')">🗑</button></div>
+                ${res ? `<div class="dash-sub" style="margin-top:6px">${res}</div>` : ''}</div>`;
+        }).join('');
+        return h + `<div class="dash-sub" style="margin-top:12px">⚠️ I modelli non Anthropic usano peggio gli strumenti di Claude Code: bene per lavori semplici, meno per sessioni lunghe. Ollama serve una versione recente con l'API compatibile Anthropic.</div>`;
+    }
+    function provFormHtml() {
+        const e = provEdit, isOl = e.type === 'ollama';
+        return `<div class="dash-card" style="padding:12px;margin-bottom:10px;display:grid;gap:8px;grid-template-columns:120px 1fr;align-items:center">
+            <b style="grid-column:1/-1">${e.id ? 'Modifica' : 'Nuovo'} profilo · ${PROV_TYPES[e.type]}</b>
+            <label>Nome</label><input id="pvName" value="${escHtml(e.name || '')}">
+            <label>Server</label><input id="pvUrl" value="${escHtml(e.base_url || '')}" placeholder="https://…">
+            <label>Chiave</label><input id="pvTok" type="password" placeholder="${e.has_token ? 'lascia vuoto per tenere ' + escHtml(e.token_masked) : isOl ? 'non serve' : 'la chiave del provider'}">
+            <label>Modello</label><div style="display:flex;gap:6px"><input id="pvModel" list="pvModels" style="flex:1" value="${escHtml(e.model || '')}" placeholder="${e.type === 'openrouter' ? 'es. anthropic/claude-sonnet-4.5, qwen/qwen3-coder' : isOl ? 'es. qwen3-coder' : ''}">
+                ${isOl ? `<button class="btn" style="font-size:12px" onclick="provOllamaLoad()">Leggi modelli</button>` : ''}</div>
+            <label>Modello veloce</label><input id="pvSmall" list="pvModels" value="${escHtml(e.small_model || '')}" placeholder="facoltativo (per i lavori secondari)">
+            <datalist id="pvModels">${(provOllama && provOllama.models || []).map(m => `<option value="${escHtml(m.name)}">`).join('')}</datalist>
+            ${isOl && provOllama ? `<div style="grid-column:1/-1" class="dash-sub">${provOllama.ok ? `Ollama ${escHtml(provOllama.version || '')}: ${provOllama.models.length} modelli (${provOllama.models.map(m => escHtml(m.name)).join(', ') || 'nessuno: ollama pull …'})` : '❌ ' + escHtml(provOllama.error) + (provOllama.installed === false ? ' — Ollama non sembra installato (ollama.com/download)' : ` <button class="btn" style="font-size:12px" onclick="provOllamaStart()">▶ Avvia Ollama</button>`)}</div>` : ''}
+            <div style="grid-column:1/-1;display:flex;gap:8px;justify-content:flex-end"><button class="btn" onclick="provEdit=null;claudeRenderBody()">Annulla</button><button class="btn btn-primary" onclick="provSaveForm()">Salva</button></div></div>`;
+    }
+    async function provNew(type) {
+        const pr = (prov.presets || {})[type] || {};
+        provEdit = { type, name: PROV_TYPES[type].replace(/^\S+\s/, ''), base_url: pr.base_url || '', model: '', small_model: '' };
+        provOllama = null; claudeRenderBody();
+        if (type === 'ollama') provOllamaLoad();
+    }
+    function provEditOpen(id) { provEdit = { ...prov.profiles.find(p => p.id === id) }; provOllama = null; claudeRenderBody(); }
+    async function provOllamaLoad() {
+        const url = (document.getElementById('pvUrl') || {}).value || 'http://localhost:11434';
+        if (provEdit) Object.assign(provEdit, provFormRead());
+        try { provOllama = await ctxCall('/ollama/models?base=' + encodeURIComponent(url)); } catch (e) { provOllama = { ok: false, error: e.message }; }
+        claudeRenderBody();
+    }
+    // Avvia "ollama serve" in una scheda del terminale della board (resta aperta: chiudendola si ferma)
+    function provOllamaStart() {
+        const lane = boardData.swimlanes.find(l => l.id === provLane && l.local_path) || boardData.swimlanes.find(l => l.local_path);
+        if (!lane) { toast('Serve almeno un progetto con cartella locale per aprire il terminale', 'error'); return; }
+        if (bridgeIsRemote()) { toast('Ollama si avvia solo su questo computer', 'error'); return; }
+        openTerminalModal(lane.id, { launch: 'ollama' });
+        toast('🦙 Avvio Ollama nel terminale…', 'info');
+        setTimeout(() => { if (provEdit) provOllamaLoad(); }, 4000);
+    }
+    function provFormRead() {
+        const v = id => (document.getElementById(id) || {}).value || '';
+        return { name: v('pvName'), base_url: v('pvUrl'), model: v('pvModel'), small_model: v('pvSmall'), tokenNew: v('pvTok') };
+    }
+    async function provSaveForm() {
+        const f = provFormRead();
+        if (bridgeIsRemote()) { toast('Le chiavi dei provider si salvano solo dal PC (non passano dal server)', 'error'); return; }
+        const profile = { id: provEdit.id, type: provEdit.type, name: f.name, base_url: f.base_url, model: f.model, small_model: f.small_model };
+        if (f.tokenNew) profile.token = f.tokenNew; else if (!provEdit.id) profile.token = provEdit.type === 'ollama' ? 'ollama' : '';
+        try { await ctxCall('/claude/providers/save', { profile }); provEdit = null; toast('Profilo salvato', 'success'); provLoad(); }
+        catch (e) { toast('Non salvato: ' + e.message, 'error'); }
+    }
+    async function provDel(id) {
+        if (!confirm('Eliminare il profilo? Le impostazioni già applicate restano finché non scegli un altro provider.')) return;
+        try { await ctxCall('/claude/providers/delete', { id }); provLoad(); } catch (e) { toast(e.message, 'error'); }
+    }
+    async function provTest(id) {
+        provTestRes[id] = 'run'; claudeRenderBody();
+        try { provTestRes[id] = await ctxCall('/claude/providers/test', { id }); } catch (e) { provTestRes[id] = { ok: false, error: e.message }; }
+        claudeRenderBody();
+    }
+    async function provApply(id, scope) {
+        const lane = boardData.swimlanes.find(l => l.id === provLane);
+        const dir = scope === 'project' ? (lane && lane.local_path) : '';
+        if (scope === 'project' && !dir) return;
+        // "= come tutti i progetti": nel progetto si tolgono le variabili (anthropic = nessuna variabile)
+        const target = scope === 'project' && id === '' ? 'anthropic' : id;
+        if (scope === 'project' && id === 'anthropic' && prov.global.id !== 'anthropic') {
+            toast('Per forzare Anthropic su un progetto mentre il globale è un altro provider, imposta il globale su Anthropic', 'info');
+        }
+        try { await ctxCall('/claude/providers/apply', { id: target, dir }); toast('Provider applicato: vale per le nuove sessioni di Claude Code', 'success'); provLoad(); }
+        catch (e) { toast('Non applicato: ' + e.message, 'error'); }
+    }
+
     function localRoutinesHtml() {
         if (localRoutines === undefined) { localRoutinesLoad(); localRoutines = 'loading'; }
         let html = `<h3 style="margin:18px 0 6px;font-size:14px">🖥️ Routine locali di Claude Desktop <button class="btn" style="padding:0 6px;font-size:11px" onclick="localRoutines=undefined;claudeRenderBody()" title="Rileggi">↻</button></h3>
