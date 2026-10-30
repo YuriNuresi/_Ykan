@@ -317,7 +317,7 @@ const YKAN_RELAY_PATHS = ['/sessions', '/session', '/reviews', '/git', '/claude/
     '/claude/memory', '/claude/memory/file', '/claude/memory/write', '/claude/memory/delete',
     '/claude/skill/write', '/claude/skill/override', '/claude/skill/copy', '/claude/plugins', '/claude/plugins/toggle',
     '/rc', '/rc/start', '/rc/stop', '/rc/answer', '/rc/autostart',
-    '/claude/context', '/claude/context/project', '/claude/mode', '/claude/mode/apply', '/claude/mode/clear', '/claude/mode/suggest',
+    '/claude/context', '/claude/context/project', '/claude/mode', '/claude/mode/apply', '/claude/mode/clear', '/claude/mode/suggest', '/git/changes', '/git/diff', '/git/commit', '/git/test', '/git/ai', '/claude/scheduled', '/claude/scheduled/write', '/lanes/paths',
     '/desktop-archive', '/desktop/new', '/desktop/resume'];
 const YKAN_RELAY_WAIT_SECS = 25; // quanto la board aspetta la risposta del PC
 const YKAN_POLL_HOLD_SECS = 8;   // quanto una ?bridge=poll resta aperta se non ci sono comandi
@@ -4303,6 +4303,26 @@ $dataJson = json_encode(ykanPublicData($data));
         .git-name { font-size: 14px; font-weight: 600; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
         .git-last { font-size: 12px; color: var(--text2); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
         .git-state { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 5px; }
+
+        /* Commit dalla board (#408/#409) */
+        .gc-modal { max-width: 1100px; width: 96vw; height: 88vh; display: flex; flex-direction: column; gap: 10px; }
+        .gc-body { flex: 1; min-height: 0; display: grid; grid-template-columns: 320px 1fr; gap: 10px; }
+        .gc-files { overflow: auto; border: 1px solid var(--border); border-radius: 8px; padding: 4px; }
+        .gc-file { display: flex; gap: 6px; align-items: center; padding: 4px 6px; border-radius: 6px; font-size: 12px; cursor: pointer; }
+        .gc-file:hover, .gc-file.on { background: var(--bg2); }
+        .gc-file .p { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; }
+        .gc-st { font-size: 10px; font-weight: 700; width: 14px; text-align: center; }
+        .gc-st.new, .gc-st.added { color: #2e9e5b; } .gc-st.deleted { color: #d64545; } .gc-st.modified, .gc-st.renamed { color: #c98a1b; }
+        .gc-warn { font-size: 10px; color: #d64545; white-space: nowrap; }
+        .gc-diff { overflow: auto; border: 1px solid var(--border); border-radius: 8px; margin: 0; padding: 8px; font: 12px/1.45 ui-monospace, Consolas, monospace; white-space: pre; background: var(--bg2); }
+        .gc-diff .a { color: #2e9e5b; } .gc-diff .d { color: #d64545; } .gc-diff .h { color: #6c7bd9; }
+        .gc-msg { width: 100%; min-height: 64px; font-family: inherit; }
+        .gc-bar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+        .gc-note { font-size: 12px; color: var(--text2); }
+        .gc-out { max-height: 30vh; overflow: auto; border: 1px solid var(--border); border-radius: 8px; padding: 8px; font-size: 12px; }
+        .gc-out pre { white-space: pre-wrap; margin: 4px 0 0; font-size: 11px; }
+        .gc-issue { padding: 4px 0; border-top: 1px dashed var(--border); }
+        @media (max-width: 760px) { .gc-body { grid-template-columns: 1fr; grid-template-rows: 35% 1fr; } }
         .git-tag { font-size: 11px; padding: 1px 8px; border-radius: 10px; background: var(--bg2); border: 1px solid var(--border); white-space: nowrap; }
         .git-tag.warn { background: #ea580c; border-color: #ea580c; color: #fff; }
         .git-tag.ok { color: #16a34a; border-color: #16a34a; }
@@ -4632,11 +4652,8 @@ $dataJson = json_encode(ykanPublicData($data));
     </style>
     <!-- Custom theme overrides (populated on load + when switching themes) -->
     <style id="customThemeStyle"><?= !empty($data['config']['theme_file']) ? ykanThemeCss($data['config']['theme_file']) : '' ?></style>
-    <!-- Terminale live (pannello Sessioni/Bridge): xterm.js da CDN -->
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css">
+    <!-- Terminale live: xterm.js caricato quando serve, prima dal Bridge (anche senza internet) poi dal CDN -->
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@3.31.0/dist/tabler-icons.min.css">
-    <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.js"></script>
 </head>
 <?php
     // Body base class: a custom theme supplies all vars itself (no .dark base);
@@ -6492,6 +6509,7 @@ Assegnarla al task?`)) cardPatch(card, { work_mode_id: m.id });
             '-',
             safeUrl(lane.url) ? { label: 'Apri sito', icon: '🌐', action: () => window.open(safeUrl(lane.url), '_blank', 'noopener') } : null,
             lane.local_path ? { label: 'Terminale', icon: '🖥️', action: () => openTerminalModal(lane.id) } : null,
+            lane.local_path ? { label: 'Commit e push…', icon: '📝', action: () => gitCommitOpen(lane.id) } : null,
             lane.local_path ? { label: 'Sessioni Claude Code', icon: '🕒', action: () => openSessionsModal(lane.id) } : null,
             { label: 'Documentazione per l\'AI', icon: '📄', action: () => openDocsModal(lane.id) },
             { label: 'Collegamenti (cartella, repo, URL)', icon: '🔗', action: () => openProjectsModal(lane.id) },
@@ -6877,8 +6895,9 @@ Assegnarla al task?`)) cardPatch(card, { work_mode_id: m.id });
                     <input type="text" id="proj-url-${lane.id}" value="${escHtml(lane.url || '')}" placeholder="https://...">
                 </div>
                 <div class="form-group" style="margin-bottom:6px">
-                    <label style="font-size:11px">Local folder (on this machine, e.g. for the local Bridge)</label>
+                    <label style="font-size:11px">Cartella locale di questo PC${typeof bridgeIsRemote === 'function' && bridgeIsRemote() ? ' (' + escHtml(bridgeTargetName()) + ')' : ''}</label>
                     <input type="text" id="proj-local-${lane.id}" value="${escHtml(lane.local_path || '')}" placeholder="e.g. C:\\Script locali\\clienteA">
+                    <small style="color:var(--text2)">${lane.pc_path ? '💻 Salvata su questo PC' + (lane.board_local_path && lane.board_local_path !== lane.local_path ? ' (nella board: ' + escHtml(lane.board_local_path) + ')' : '') : lanePaths ? 'Ora viene dalla board: salvandola diventa di questo PC' : 'Bridge non raggiungibile: si salva nella board'}</small>
                 </div>
                 <div class="form-group" style="margin-bottom:6px">
                     <label style="font-size:11px">Claude Code Project (link claude.ai, opzionale)</label>
@@ -6894,6 +6913,24 @@ Assegnarla al task?`)) cardPatch(card, { work_mode_id: m.id });
         `).join('');
     }
 
+    // Cartelle dei progetti per PC (#410): il Bridge del PC scelto le tiene e prevalgono su quelle della board
+    let lanePaths = null; // null = Bridge non raggiungibile
+    function lanePathsApply() {
+        if (!lanePaths) return;
+        boardData.swimlanes.forEach(l => {
+            if (!(l.id in lanePaths)) return;
+            if (l.board_local_path === undefined) l.board_local_path = l.local_path || '';
+            l.local_path = lanePaths[l.id];
+            l.pc_path = true;
+        });
+    }
+    async function lanePathsLoad() {
+        try { lanePaths = (await ctxCall('/lanes/paths')).paths || {}; } catch (_) { lanePaths = null; return; }
+        lanePathsApply();
+        render();
+    }
+    setTimeout(lanePathsLoad, 0);
+
     async function saveProjectLink(id) {
         const path = document.getElementById('proj-path-' + id).value.trim();
         const url = document.getElementById('proj-url-' + id).value.trim();
@@ -6901,8 +6938,26 @@ Assegnarla al task?`)) cardPatch(card, { work_mode_id: m.id });
         const claude_project_url = document.getElementById('proj-claude-' + id).value.trim();
         if (claude_project_url && !/^https:\/\/claude\.ai\//.test(claude_project_url)) { toast('Il link del Project deve iniziare con https://claude.ai/', 'error'); return; }
         const lane = boardData.swimlanes.find(l => l.id === id);
-        if (lane) { lane.path = path; lane.url = url; lane.local_path = local_path; lane.claude_project_url = claude_project_url; }
-        await api('update_swimlane', { id, path, url, local_path, claude_project_url });
+        // La cartella locale va sul Bridge di questo PC; se non risponde resta nella board come prima
+        let onPc = false;
+        const pathChanged = !!lane && local_path !== (lane.local_path || '');
+        if (pathChanged) {
+            try {
+                lanePaths = (await ctxCall('/lanes/paths', { lane_id: id, dir: local_path })).paths || {};
+                onPc = true;
+            } catch (e) {
+                if (/non esiste/.test(e.message)) { toast('❌ ' + e.message, 'error'); return; }
+                toast('Bridge non raggiungibile: cartella salvata nella board (vale per tutti i PC)', 'info');
+            }
+        }
+        if (lane) { lane.path = path; lane.url = url; lane.claude_project_url = claude_project_url; if (!onPc) lane.local_path = local_path; }
+        const patch = { id, path, url, claude_project_url };
+        if (pathChanged && !onPc) patch.local_path = local_path;
+        await api('update_swimlane', patch);
+        if (onPc) {
+            if (!local_path) { lane.local_path = lane.board_local_path || ''; delete lane.pc_path; } else { lane.local_path = local_path; lanePathsApply(); }
+            toast(local_path ? '✅ Cartella salvata per questo PC' : 'Cartella di questo PC tolta: vale quella della board', 'success');
+        }
         renderProjectsManager();
         render();
     }
@@ -7677,9 +7732,135 @@ Assegnarla al task?`)) cardPatch(card, { work_mode_id: m.id });
                     <div class="git-last">${last}</div>
                     <div class="git-state">${tags.join('')}</div>
                 </div>
+                <button class="btn" style="padding:2px 8px;font-size:11px" onclick="gitCommitOpen('${escHtml(lane.id)}')">📝 Commit</button>
                 <button class="btn" style="padding:2px 8px;font-size:11px" onclick="openTerminalModal('${escHtml(lane.id)}')">🖥️ Terminale</button>
             </div>`;
         }).join('');
+    }
+
+
+    // ---- Commit e push dalla board (#408), revisione Claude e test prima del commit (#409) ----
+    let gc = null; // { lane, dir, data, sel:Set, cur, ov }
+    async function gitCommitOpen(laneId) {
+        const lane = boardData.swimlanes.find(l => l.id === laneId);
+        if (!lane || !lane.local_path) { toast('Il progetto non ha una cartella locale', 'error'); return; }
+        const ov = document.createElement('div');
+        ov.className = 'modal-overlay active';
+        ov.innerHTML = `<div class="modal gc-modal"><h2 style="margin:0">📝 Commit · ${escHtml(lane.name)}</h2><div class="gc-note">Leggo le modifiche…</div></div>`;
+        document.body.appendChild(ov);
+        ov.addEventListener('click', e => { if (e.target === ov) gitCommitClose(); });
+        gc = { lane, dir: lane.local_path, sel: new Set(), cur: '', ov };
+        await gitCommitLoad();
+    }
+    function gitCommitClose() { if (gc) gc.ov.remove(); gc = null; if (document.body.dataset.view === 'dashboard' && dashTabName === 'git') dashGitLoad(); }
+    async function gitCommitLoad() {
+        try { gc.data = await ctxCall('/git/changes?dir=' + encodeURIComponent(gc.dir)); }
+        catch (e) { gc.ov.querySelector('.gc-note').textContent = '❌ ' + e.message; return; }
+        gc.sel = new Set(gc.data.files.filter(f => !f.warn).map(f => f.path));
+        gc.cur = (gc.data.files.find(f => !f.warn) || gc.data.files[0] || {}).path || '';
+        gitCommitRender();
+        if (gc.cur) gitCommitShow(gc.cur);
+    }
+    function gitCommitRender() {
+        const d = gc.data, main = /^(main|master)$/.test(d.branch || '');
+        const st = { new: 'N', added: 'A', modified: 'M', deleted: 'D', renamed: 'R' };
+        const files = d.files.map(f => `<label class="gc-file${f.path === gc.cur ? ' on' : ''}" data-f="${escHtml(f.path)}" title="${escHtml(f.path)}">
+                <input type="checkbox" ${gc.sel.has(f.path) ? 'checked' : ''} ${f.warn ? 'disabled' : ''} onclick="event.stopPropagation();gitCommitToggle(this.closest('.gc-file').dataset.f, this.checked)">
+                <span class="gc-st ${f.status}">${st[f.status] || '?'}</span><span class="p">${escHtml(f.path)}</span>
+                ${f.warn ? `<span class="gc-warn">${f.warn === 'secret' ? '🔒 segreto' : '⚠️ > 5 MB'}</span>` : ''}</label>`).join('');
+        const m = gc.ov.querySelector('.gc-msg');
+        const msg = m ? m.value : '';
+        gc.ov.querySelector('.modal').innerHTML = `
+            <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+                <h2 style="margin:0;flex:1">📝 Commit · ${escHtml(gc.lane.name)}</h2>
+                <span class="git-tag">⎇ ${escHtml(d.branch || '?')}</span>
+                ${d.remote && d.remote.repo ? `<span class="git-tag">${escHtml(d.remote.repo)}</span>` : ''}
+                ${d.ahead ? `<span class="git-tag">↑ ${d.ahead} da pushare</span>` : ''}
+                ${d.behind ? `<span class="git-tag" style="color:#d64545">↓ ${d.behind} su GitHub</span>` : ''}
+                <button class="btn" onclick="gitCommitLoad()" title="Rileggi">↻</button>
+                <button class="btn" onclick="gitCommitClose()">✕</button>
+            </div>
+            ${!d.files.length ? `<div class="gc-note">Nessuna modifica da committare.${d.ahead ? ' Ci sono ' + d.ahead + ' commit da pushare.' : ''}</div>
+                ${d.ahead ? '<div class="gc-bar"><button class="btn btn-primary" onclick="gitCommitPushOnly()">⬆️ Push</button></div>' : ''}` : `
+            <div class="gc-body">
+                <div class="gc-files"><div class="gc-note" style="padding:4px 6px">${d.files.length} file · ${gc.sel.size} scelti
+                    · <a href="#" onclick="gitCommitAll(true);return false">tutti</a> · <a href="#" onclick="gitCommitAll(false);return false">nessuno</a></div>${files}</div>
+                <pre class="gc-diff">Scegli un file per vedere le modifiche</pre>
+            </div>
+            <textarea class="gc-msg" placeholder="Messaggio di commit (prima riga breve: cosa cambia)">${escHtml(msg)}</textarea>
+            ${main ? '<div class="gc-note">⚠️ Sei su <b>' + escHtml(d.branch) + '</b>: il commit va direttamente sul branch principale.</div>' : ''}
+            ${d.behind ? '<div class="gc-note" style="color:#d64545">GitHub ha commit che qui mancano: il push verrà saltato finché non fai pull.</div>' : ''}
+            <div class="gc-bar">
+                <button class="btn" onclick="gitCommitAi('message', this)">✨ Proponi messaggio</button>
+                <button class="btn" onclick="gitCommitAi('review', this)">🔍 Revisione Claude</button>
+                ${d.test ? `<button class="btn" onclick="gitCommitTest(this)">🧪 ${escHtml(d.test.label)}</button>` : ''}
+                <span style="flex:1"></span>
+                <button class="btn" onclick="gitCommitDo(false, this)">Commit</button>
+                <button class="btn btn-primary" onclick="gitCommitDo(true, this)" ${d.remote ? '' : 'disabled title="Nessun remote"'}>Commit e push</button>
+            </div>
+            <div class="gc-out" style="display:none"></div>`}`;
+        gc.ov.querySelectorAll('.gc-file').forEach(el => el.addEventListener('click', e => { if (e.target.tagName !== 'INPUT') { e.preventDefault(); gitCommitShow(el.dataset.f); } }));
+    }
+    function gitCommitToggle(f, on) { on ? gc.sel.add(f) : gc.sel.delete(f); gitCommitRender(); if (gc.cur) gitCommitShow(gc.cur); }
+    function gitCommitAll(on) { gc.sel = new Set(on ? gc.data.files.filter(f => !f.warn).map(f => f.path) : []); gitCommitRender(); if (gc.cur) gitCommitShow(gc.cur); }
+    async function gitCommitShow(f) {
+        gc.cur = f;
+        gc.ov.querySelectorAll('.gc-file').forEach(el => el.classList.toggle('on', el.dataset.f === f));
+        const pre = gc.ov.querySelector('.gc-diff');
+        if (!pre) return;
+        pre.textContent = 'Carico…';
+        try {
+            const r = await ctxCall('/git/diff?dir=' + encodeURIComponent(gc.dir) + '&file=' + encodeURIComponent(f));
+            if (gc.cur !== f) return;
+            pre.innerHTML = escHtml(r.diff || '(nessuna differenza)').split('\n').map(l =>
+                /^(\+\+\+|---|diff |index )/.test(l) ? `<span class="h">${l}</span>` : l[0] === '+' ? `<span class="a">${l}</span>` : l[0] === '-' ? `<span class="d">${l}</span>` : /^@@/.test(l) ? `<span class="h">${l}</span>` : l).join('\n');
+        } catch (e) { pre.textContent = '❌ ' + e.message; }
+    }
+    function gitCommitOut(html) { const o = gc.ov.querySelector('.gc-out'); o.style.display = ''; o.innerHTML = html; o.scrollTop = 0; }
+    async function gitBusy(btn, label, fn) {
+        const old = btn.textContent; btn.disabled = true; btn.textContent = label;
+        try { return await fn(); } finally { if (btn.isConnected) { btn.disabled = false; btn.textContent = old; } }
+    }
+    async function gitCommitAi(what, btn) {
+        if (!gc.sel.size) { toast('Scegli almeno un file', 'error'); return; }
+        await gitBusy(btn, what === 'review' ? '🔍 Claude legge il diff…' : '✨ …', async () => {
+            try {
+                const r = await ctxCall('/git/ai', { dir: gc.dir, files: [...gc.sel], what });
+                if (what === 'message') { if (r.message) gc.ov.querySelector('.gc-msg').value = r.message; return; }
+                const icon = { ok: '✅', attenzione: '⚠️', blocca: '⛔' }[r.verdict] || '⚠️';
+                gitCommitOut(`<b>${icon} Revisione: ${escHtml(r.verdict)}</b> — ${escHtml(r.summary || '')}` +
+                    (r.issues || []).map(i => `<div class="gc-issue"><b>${escHtml(i.severity || '')}</b> · <code>${escHtml(i.file || '')}${i.line ? ':' + i.line : ''}</code><br>${escHtml(i.text || '')}</div>`).join(''));
+            } catch (e) { toast('❌ ' + e.message, 'error'); }
+        });
+    }
+    async function gitCommitTest(btn) {
+        await gitBusy(btn, '🧪 test in corso…', async () => {
+            try {
+                const r = await ctxCall('/git/test', { dir: gc.dir });
+                gitCommitOut(`<b>${r.ok ? '✅ Test passati' : '❌ Test falliti'}</b> ${r.label ? '· ' + escHtml(r.label) : ''} ${r.seconds != null ? '· ' + r.seconds + ' s' : ''}<pre>${escHtml(r.output || '')}</pre>`);
+            } catch (e) { toast('❌ ' + e.message, 'error'); }
+        });
+    }
+    async function gitCommitDo(push, btn) {
+        const message = gc.ov.querySelector('.gc-msg').value.trim();
+        if (!gc.sel.size) { toast('Scegli almeno un file', 'error'); return; }
+        if (!message) { toast('Scrivi il messaggio (o ✨ Proponi messaggio)', 'error'); return; }
+        await gitBusy(btn, push ? 'Commit e push…' : 'Commit…', async () => {
+            try {
+                const r = await ctxCall('/git/commit', { dir: gc.dir, files: [...gc.sel], message, push });
+                const steps = (r.steps || []).map(x => `<div>${x.ok ? '✅' : '❌'} ${escHtml(x.label)}${x.out && !x.ok ? `<pre>${escHtml(x.out)}</pre>` : ''}</div>`).join('');
+                if (r.hash) toast(`✅ Commit ${r.hash}${push && r.ok ? ' e push fatti' : ''}`, r.ok ? 'success' : 'info');
+                gc.ov.querySelector('.gc-msg').value = '';
+                await gitCommitLoad();
+                gitCommitOut(steps);
+            } catch (e) { toast('❌ ' + e.message, 'error'); }
+        });
+    }
+    async function gitCommitPushOnly() {
+        try {
+            const r = await ctxCall('/git/commit', { dir: gc.dir, files: [], message: '', push: true });
+            gitCommitOut(JSON.stringify(r));
+        } catch (e) { toast('❌ ' + e.message, 'error'); }
     }
 
     // ---- Tab "Focus": su cosa lavorare ora + quanto manca per una versione stable ----
@@ -8795,7 +8976,22 @@ Assegnarla al task?`)) cardPatch(card, { work_mode_id: m.id });
 
     // Apre sempre una scheda NUOVA (mai riusa/chiude quelle esistenti): lanciare più cose in
     // parallelo deve dare più terminali distinti, non sostituire quello che stava girando.
-    function openTerminalModal(laneId, context) {
+    // xterm.js: prima dal Bridge del PC (#460, niente internet), se manca dal CDN. Una volta sola.
+    let xtermReady = null;
+    function xtermLoad() {
+        if (typeof Terminal !== 'undefined' && typeof FitAddon !== 'undefined') return Promise.resolve();
+        if (xtermReady) return xtermReady;
+        const js = src => new Promise((ok, ko) => { const s = document.createElement('script'); s.src = src; s.onload = ok; s.onerror = ko; document.head.appendChild(s); });
+        const css = href => { const l = document.createElement('link'); l.rel = 'stylesheet'; l.href = href; document.head.appendChild(l); };
+        const from = async (xt, fit, st) => { await js(xt); await js(fit); css(st); };
+        xtermReady = from(BRIDGE_URL + '/vendor/xterm.js', BRIDGE_URL + '/vendor/addon-fit.js', BRIDGE_URL + '/vendor/xterm.css')
+            .catch(() => from('https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.js', 'https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.js',
+                'https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css'))
+            .catch(e => { xtermReady = null; throw e; });
+        return xtermReady;
+    }
+    async function openTerminalModal(laneId, context) {
+        try { await xtermLoad(); } catch (_) { toast('❌ Terminale non disponibile: xterm.js non si carica né dal Bridge né da internet', 'error'); return; }
         const lane = boardData.swimlanes.find(l => l.id === laneId);
         if (!lane || !lane.local_path) return;
         context = context || {}; // { launch: 'claude', prompt: '...' } to seed Claude Code with a task's context
@@ -10938,7 +11134,48 @@ Assegnarla al task?`)) cardPatch(card, { work_mode_id: m.id });
                     ${last ? `<div class="dash-sub">Ultimo avvio ${escHtml(last.at)}: ${last.ok ? `<a href="${escHtml(last.session_url)}" target="_blank" rel="noopener">apri la sessione</a>` : '<span style="color:#dc2626">' + escHtml(last.error) + '</span>'}</div>`
                           : (!r.fire_url || !r.has_token ? '<div class="dash-sub">Manca il trigger API: modifica la routine per aggiungere URL e token.</div>' : '')}
                 </div>`;
-            }).join('') : (routineEditing === 'new' ? '' : '<div class="dash-empty">Nessuna routine registrata. Aggiungi ad esempio «Claude Do» o «Sistema Vacanze» per avviarle da qui.</div>'));
+            }).join('') : (routineEditing === 'new' ? '' : '<div class="dash-empty">Nessuna routine registrata. Aggiungi ad esempio «Claude Do» o «Sistema Vacanze» per avviarle da qui.</div>'))
+            + localRoutinesHtml();
+    }
+
+    // Routine locali di Claude Desktop (#443): lette dal Bridge in ~/.claude/scheduled-tasks
+    let localRoutines; // undefined = da leggere, null = Bridge non raggiungibile
+    let localRoutineOpen = '', localRoutineEdit = '';
+    async function localRoutinesLoad() {
+        try { localRoutines = (await ctxCall('/claude/scheduled')).routines || []; } catch (_) { localRoutines = null; }
+        if (claudeTabName === 'routines') claudeRenderBody();
+    }
+    function localRoutinesHtml() {
+        if (localRoutines === undefined) { localRoutinesLoad(); localRoutines = 'loading'; }
+        let html = `<h3 style="margin:18px 0 6px;font-size:14px">🖥️ Routine locali di Claude Desktop <button class="btn" style="padding:0 6px;font-size:11px" onclick="localRoutines=undefined;claudeRenderBody()" title="Rileggi">↻</button></h3>
+            <div class="dash-sub" style="margin-bottom:8px">Da <code>~/.claude/scheduled-tasks</code> del PC. Qui vedi e modifichi il prompt; orario, pausa ed esecuzione si gestiscono in Claude Desktop → Routine.</div>`;
+        if (localRoutines === 'loading') return html + '<div class="dash-empty">Leggo le routine dal PC…</div>';
+        if (localRoutines === null) return html + '<div class="dash-empty"><i class="ib"></i> Bridge non raggiungibile: le routine locali si leggono dal PC.</div>';
+        if (!localRoutines.length) return html + '<div class="dash-empty">Nessuna routine locale.</div>';
+        return html + localRoutines.map(r => {
+            const open = localRoutineOpen === r.id, edit = localRoutineEdit === r.id;
+            return `<div class="dash-projcard">
+                <div class="dash-projhead"><b>${escHtml(r.name)}</b><span class="git-tag">modificata ${escHtml(new Date(r.modified).toLocaleDateString('it-IT'))}</span>
+                    <span style="flex:1"></span>
+                    <button class="btn" style="padding:2px 8px;font-size:12px" onclick="localRoutineOpen=${open ? "''" : `'${escHtml(r.id)}'`};localRoutineEdit='';claudeRenderBody()">${open ? 'Chiudi' : 'Prompt'}</button>
+                    <button class="btn" style="padding:2px 8px;font-size:12px" onclick="localRoutineOpen='${escHtml(r.id)}';localRoutineEdit='${escHtml(r.id)}';claudeRenderBody()">✏️</button></div>
+                ${r.description ? `<div class="dash-sub">${escHtml(r.description)}</div>` : ''}
+                ${edit ? `<textarea id="lrPrompt" style="width:100%;min-height:300px;margin-top:8px;font:12px/1.4 ui-monospace,Consolas,monospace">${escHtml(r.prompt)}</textarea>
+                    <div style="display:flex;gap:8px;margin-top:6px"><button class="btn btn-primary" onclick="localRoutineSave('${escHtml(r.id)}')">Salva</button>
+                    <button class="btn" onclick="localRoutineEdit='';claudeRenderBody()">Annulla</button>
+                    <span class="dash-sub">Il file precedente resta in SKILL.md.ykan-bak</span></div>`
+                  : open ? `<pre style="white-space:pre-wrap;font-size:12px;max-height:400px;overflow:auto;margin-top:8px">${escHtml(r.prompt)}</pre>` : ''}
+            </div>`;
+        }).join('');
+    }
+    async function localRoutineSave(id) {
+        try {
+            await ctxCall('/claude/scheduled/write', { id, prompt: document.getElementById('lrPrompt').value });
+            toast('✅ Prompt della routine salvato', 'success');
+            localRoutineEdit = '';
+            localRoutines = undefined;
+            claudeRenderBody();
+        } catch (e) { toast('❌ ' + e.message, 'error'); }
     }
 
     async function routineSave(id) {
@@ -12196,7 +12433,7 @@ Rules:
         if (!res.success) { pmOut(`<div class="pm-busy">⚠️ ${escHtml(res.error)}</div>`); return; }
         toast(`${res.count} card create`, 'success');
         const data = await api('get_data');
-        if (data.success) { boardData = data.data || data; render(); }
+        if (data.success) { boardData = data.data || data; lanePathsApply(); render(); }
         await pmRefresh();
         pmOut(`<div class="pm-out">${res.created.map(c => `#${c.seq} — ${escHtml(c.title)}${c.depends_on && c.depends_on.length ? '  (dopo #' + c.depends_on.join(' #') + ')' : ''}`).join('\n')}</div>`);
     }

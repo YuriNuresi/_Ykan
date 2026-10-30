@@ -1,246 +1,121 @@
 # _Ykan — Struttura Progetto
 
-> Ultimo aggiornamento: 2026-07-13
-> Per AI: mappa completa dei file e delle loro responsabilità.
+> Ultimo aggiornamento: 2026-10-30
+> Per AI: **dove sta il codice** e come si modifica. Cosa fa ogni funzione: DOCUMENTAZIONE.md.
+> I numeri di riga sono indicativi: cerca le intestazioni `// === NOME ===`.
 
 ---
 
-## Tech Stack
-
-| Layer | Tecnologia |
-|-------|-----------|
-| Backend | PHP 8.2+ (no framework, single-file) |
-| Frontend | HTML/CSS/JS inline (tutto dentro _Ykan.php) |
-| Database | Nessuno — file JSON (`_Ykan_data.json`) |
-| MCP Server | PHP (JSON-RPC 2.0 over HTTPS, stateless) |
-| AI | Google Gemini API (gemini-2.5-flash) |
-| VCS | GitHub integration via API |
-| Hosting | OVH shared hosting |
-| Auth sito | Basic Auth via `.htaccess` |
-| Auth MCP | Secret nell'URL (HTTPS only) |
-
----
+## Tech stack
+- **Board**: PHP 8.4, un solo file; JS vanilla e CSS inline; nessun build step. MySQL (online) o file JSON (locale).
+- **Bridge**: Node 22 (`http` + `ws` + `node-pty`), impacchettato come Node SEA (`ykan-bridge.exe`) con `npm run build`.
+- **MCP**: `mcp.php`, JSON-RPC 2.0 stateless.
+- **Estensione Chrome**: `extension/` (badge consumo Claude).
 
 ## Albero file
-
 ```
-_Ykan/
-│
-├── _Ykan.php              # IL FILE — tutto il Kanban (~4000 righe)
-│                          #   ├── PHP: data functions, API handler, themes, scanner
-│                          #   ├── HTML: full page structure
-│                          #   ├── CSS: complete stylesheet (light+dark)
-│                          #   └── JS: board logic, drag&drop, AI, GitHub, UI
-│
-├── _Ykan_data.json        # Dati board (auto-generato, MAI committare)
-│                          #   ├── config (API keys, settings)
-│                          #   ├── columns (array)
-│                          #   ├── swimlanes (array, con path/url progetto)
-│                          #   ├── cards (array, attive + archiviate)
-│                          #   └── labels (array)
-│
-├── mcp.php                # MCP endpoint — server JSON-RPC 2.0 per Claude
-│                          #   ├── Auth via MCP_SECRET
-│                          #   ├── 6 board tools (list/add/move/complete)
-│                          #   ├── 5 file tools (list/read/edit/write/search)
-│                          #   ├── Path safety (canonical, symlink check)
-│                          #   ├── Backup before write
-│                          #   └── Audit log
-│
-├── index.php              # Entry point — redirect a _Ykan.php
-│
-├── .env                   # Secrets (MCP_SECRET, MCP_ROOT) — NON committare
-│
-├── .htaccess              # Basic Auth (esclude mcp.php)
-│
-├── themes/                # Temi custom (JSON)
-│   ├── _TEMPLATE.jsonc    # Template documentato per creare temi
-│   └── *.json             # Temi utente
-│
-├── _ykan_mcp_audit.log    # Log operazioni MCP (auto-generato)
-│
-├── README.md              # Documentazione pubblica GitHub
-├── MCP_SETUP.md           # Guida setup MCP
-│
-└── .claude/
-    └── settings.local.json # Permessi Claude Code per questo progetto
+_Ykan.php              board: backend + HTML + CSS + JS (~13.500 righe)
+index.php              ingresso
+mcp.php                server MCP (task, file, DB, mail, memoria, thread)
+auth_callback.php      login Google
+gmail_*.php            invio mail (OAuth Gmail)
+tasks_sync.php         sincronizzazione Google Tasks
+themes/                temi custom (.jsonc)
+bridge/
+  bridge-server.js     Bridge (~3.300 righe)
+  build-dist.js        build Windows: exe SEA + node_modules → dist/ykan-bridge + zip in downloads/
+  build-mac.py         pacchetto Mac
+  tray.ps1             icona nella tray (Riavvia/Aggiorna/Log)
+  autostart-hidden.vbs, install-autostart.bat, start-bridge.bat
+  wa-loader.cjs        bot WhatsApp (Baileys)
+extension/             estensione Chrome
+downloads/             zip del Bridge e dell'estensione serviti dalla board
 ```
 
----
+## Anatomia di `_Ykan.php`
 
-## Anatomia di _Ykan.php (~4000 righe)
+### PHP (righe ~1–3800)
+| Sezione | Cosa |
+|---|---|
+| `STORAGE` (~94) | JSON o MySQL; `loadData()` / `saveData()` |
+| `LOGIN GOOGLE` (~213) | utenti, sessione |
+| `PC COLLEGATI` (~304) | tabelle `ykan_bridges`, `ykan_bridge_cmds`, `YKAN_RELAY_PATHS`, endpoint `?bridge=poll/result/update_download` |
+| `RIGHE VERSIONE` (~811) | `ykanLaneVersionsInit`, `ykanActiveVersions`, `ykanCardVersion`, `ykanSetCardVersion` |
+| `SHORT TASK IDS` (~882) | `#25` |
+| `ANOTHER AI` (~933) | `YKAN_AI_PROVIDERS`, `ykanAiSettings`, `ykanAiAsk`, `ykanAiJson` |
+| `PM LAYER` (~1098) | PRD/epic/card |
+| `API HANDLER` (~1446) | `match($action)`: ogni API è una closure con `use (&$data, $input)`, chiama `saveData($data)` e ritorna un array |
+| `LOAD DATA FOR HTML` (~3782) | `$dataJson` iniettato in JS come `boardData` |
 
-Il file è un monolite intenzionale. Ecco le sezioni principali:
+### HTML e CSS
+`<style>` da ~3804; poi le pagine (Home, Kanban, Progetti, Claude, Settings) e i modali (card, terminale, progetti…).
 
-### PHP Backend (righe 1–1400 circa)
+### JavaScript (da ~5550)
+| Sezione | Cosa |
+|---|---|
+| `STATE`, `API`, `RENDER` | `boardData`, `api(action, payload)`, `render()` |
+| `RIGHE VERSIONE` | `laneVersions`, `renderVersionRow`, `promoteVersion`, `deleteVersionRow` |
+| `MODALITÀ DI LAVORO` | `workModes`, `MODE_PRESETS`, `modesHtml`, `setLaneMode`, `suggestModeFor`, `cardSuggestMode` |
+| `MENU DEL TASTO DESTRO` | `ctxMenu`, `cardContextItems`, `versionContextItems`, `laneContextItems` |
+| `ARCHIVIO` | pagina archivio |
+| `PROJECTS` | collegamenti del progetto, `saveProjectLink`, cartelle per PC (`lanePaths`) |
+| `DASHBOARD` | schede Progetti; Git (`dashGitLoad`, `dashGitHtml`) e finestra commit (`gitCommitOpen`) |
+| `PC COLLEGATI` | `bridgeFetch` (diretto o relay), `bridgeTarget`, `ctxCall` |
+| `TERMINAL` | `xtermLoad`, `openTerminalModal` |
+| `PANNELLO CLAUDE` | `claudeRenderBody` e una sezione per scheda (skill, plugin, memoria, contesto, RC, routine, novità, WhatsApp) |
+| `HOME` | cruscotto |
 
-| Sezione | Righe | Responsabilità |
-|---------|-------|----------------|
-| Constants & defaults | 1-90 | `DATA_FILE`, `DEFAULT_DATA`, theme keys |
-| Data functions | 95-110 | `loadData()`, `saveData()`, `generateId()` |
-| MCP project root | 112-175 | `ykanMcpRoot()`, `ykanCanonical()`, `ykanProjectBase()`, `ykanSafePath()` |
-| Theme system | 177-265 | `ykanThemeSlug()`, `ykanNormalizeTheme()`, `ykanListThemes()`, `ykanThemeCss()` |
-| Project scanner | 268-340 | `scanProject()` — analisi codebase per AI |
-| API handler | 343-1400 | `match($action)` con tutte le API REST |
-
-### API handler breakdown
-
-| Gruppo | API | Descrizione |
-|--------|-----|-------------|
-| Config | `save_config` | Salva settings |
-| Columns | `add/update/delete/reorder_column(s)` | Gestione colonne |
-| Swimlanes | `add/update/delete/reorder_swimlane(s)` | Gestione swimlane + project link |
-| Cards | `add/update/move/archive/restore/delete_card` | CRUD card |
-| Labels | `add/update/delete_label` | Gestione etichette |
-| Themes | `list/save/delete_themes` | Gestione temi custom |
-| Files | `list_project_files` | Browse file progetto collegato |
-| AI Summary | `get_summary` | Board summary plain-text per AI |
-| AI Task | `complete_task`, `move_task` | Task by title (per AI) |
-| AI Gemini | `gemini_analyze`, `analyze_project`, `verify_task` | Analisi AI |
-| AI Quick | `ai_categorize`, `ai_estimate`, `ai_standup` | Categorizzazione, stime, standup |
-| Utility | `scan_todos`, `burndown_data` | TODO scanner, burndown |
-| GitHub | `github_issues`, `github_prs`, `github_commits` | Integrazione GitHub |
-
-### HTML (dopo il PHP)
-- Full page structure con header, board, modali, settings panel
-- Tutto inline nel PHP via heredoc/echo
-
-### CSS (tag `<style>` inline)
-- Light + dark theme via CSS custom properties
-- Layout responsive (flexbox/grid)
-- Temi custom override variabili CSS via `:root{}`
-
-### JavaScript (tag `<script>` inline)
-- Board rendering e drag&drop
-- API calls (fetch)
-- AI integration (Gemini calls)
-- GitHub integration
-- Search, filtri, export
-- Theme switcher
-- Burndown chart (Canvas)
-
----
-
-## Struttura dati (_Ykan_data.json)
-
-```json
+## Struttura dati (una riga di `ykan_boards` o `_Ykan_data.json`)
+```jsonc
 {
   "config": {
-    "gemini_api_key": "...",
-    "github_token": "...",
-    "github_repo": "owner/repo",
-    "theme": "light|dark|<theme-file>",
-    "project_name": "My Project",
-    "ai_language": "en|it|es|fr|de|pt"
+    "ai": { "provider": "groq", "providers": { "groq": { "api_key": "", "model": "" } } },
+    "github_token": "", "theme": "dark",
+    "work_modes": [{ "id": "p-fix", "name": "…", "icon": "🔧", "description": "regole", "plugins": { "ecc@ecc": ["ecc:error-handling"] }, "skills": ["ovh-yuri"] }],
+    "mode_pinned": { "plugins": {}, "skills": [] }
   },
-  "columns": [
-    { "id": "col_1", "name": "To Do", "position": 0 }
-  ],
-  "swimlanes": [
-    {
-      "id": "lane_1",
-      "name": "Project Name",
-      "position": 0,
-      "path": "folder-name",      // relativo a MCP_ROOT
-      "url": "https://...",        // URL pubblico (opzionale)
-      "doc_files": ["file.md"]     // file doc per AI (opzionale)
-    }
-  ],
-  "cards": [
-    {
-      "id": "card_xxx",
-      "title": "Task title",
-      "description": "Details (markdown)",
-      "priority": "high|medium|low",
-      "due_date": "2026-07-15",
-      "label_id": "lbl_1",
-      "column_id": "col_1",
-      "swimlane_id": "lane_1",
-      "archived": false,
-      "auto_regenerate": false,
-      "regenerate_delay_days": 7,
-      "files": ["path/to/file.php"],
-      "position": 0,
-      "created_at": "2026-07-13 10:00:00",
-      "regenerated_count": 0
-    }
-  ],
-  "labels": [
-    { "id": "lbl_1", "name": "Bug", "color": "#ef4444" }
-  ]
+  "columns":   [{ "id": "col_…", "name": "To Do", "position": 0 }],
+  "swimlanes": [{
+    "id": "lane_…", "name": "_Ykan", "position": 0, "color": "#…",
+    "path": "ykan", "url": "https://…", "local_path": "C:\\…", "github_repo": "owner/repo",
+    "versions": [{ "id": "ver_…", "name": "V2.0" }], "archived_versions": [],
+    "mode_id": "p-feature", "mode_pinned": {}, "mode_contexts": {}
+  }],
+  "cards": [{
+    "id": "card_…", "seq": 25, "title": "…", "description": "…",
+    "column_id": "col_…", "swimlane_id": "lane_…", "version_id": "ver_…",
+    "version_history": [{ "id": "ver_…", "name": "V2.0", "from": "…", "to": "…" }],
+    "priority": "high|medium|low", "label_id": "…", "work_mode_id": "p-fix",
+    "files": [], "archived": false
+  }],
+  "labels": [], "routines": []
 }
 ```
+`local_path` nella board è il default: se il Bridge del PC ha una cartella per quel progetto (`~/.ykan-lane-paths.json`) vince quella.
 
----
-
-## mcp.php — Anatomia
-
-| Sezione | Responsabilità |
-|---------|----------------|
-| `.env` loader | Legge MCP_SECRET e MCP_ROOT da `.env` |
-| Auth gate | Verifica secret via `?k=` o `Authorization: Bearer` |
-| Data helpers | `mcp_load()`, `mcp_save()`, `mcp_id()`, `mcp_audit()` |
-| Swimlane lookup | `mcp_find_lane()` — match fuzzy per nome |
-| Path safety | `mcp_canonical()`, `mcp_project_dir()`, `mcp_safe_path()`, `mcp_backup()` |
-| Tool definitions | `mcp_tool_defs()` — schema JSON per 11 tools |
-| Tool execution | `mcp_run_tool()` — switch su tool name |
-| JSON-RPC dispatch | `mcp_handle()` — initialize, ping, tools/list, tools/call |
-| Request parsing | Body JSON-RPC, supporta batch e single |
-
----
-
-## Flusso dati
-
-```
-[Browser UI]
-    │
-    ├── fetch('?api=add_card', POST) ──→ _Ykan.php ──→ _Ykan_data.json
-    │
-    └── fetch('?api=get_summary', POST) ──→ plain text summary
-
-[Claude Mobile / claude.ai]
-    │
-    └── JSON-RPC POST ──→ mcp.php ──→ _Ykan_data.json
-                                   └──→ project files (read/edit/write)
-
-[Gemini AI]
-    │
-    └── _Ykan.php ──→ Gemini API ──→ analysis/suggestions/estimates
-```
-
----
+## Anatomia di `bridge/bridge-server.js`
+| Sezione | Cosa |
+|---|---|
+| Collegamento, profili, relay (~45–330) | account Ykan online, biglietti, `RELAY_PATHS`, `runRelayCommand` |
+| Aggiornamento automatico (~335) | `selfUpdate` (solo pacchetto zip) |
+| Skill, plugin, memoria, contesto (~407–1100) | lettura/scrittura in `~/.claude` e `.claude/` del progetto |
+| Modalità di lavoro (~1105) | `applyWorkMode`, `clearWorkMode`, `modeCatalog`, `proposeWorkMode`, `workModeContext`, `suggestWorkMode` |
+| Sessioni e analisi (~1330–1800) | trascrizioni, analisi con `runClaudePrint`, archiviazione in Desktop |
+| Git (~1802, ~1961) | `gitInfo`, `gitInit`, `gitChanges`, `gitDiff`, `gitCommit`, `gitPush`, `gitRunTests`, `gitAi` |
+| Routine locali, cartelle per PC, vendor (~1912) | `listScheduled`, `writeScheduled`, `readLanePaths`, `writeLanePath`, `VENDOR_FILES` (xterm) |
+| PTY, Desktop, Remote Control (~2109) | terminale, `claude --desktop --resume`, `claude remote-control` |
+| HTTP + WS server (~2307) | controlli d'accesso (Origin, biglietto, cartelle) e `handleRequest` con tutte le rotte |
 
 ## Come fare modifiche comuni
-
-### Aggiungere un nuovo tool MCP
-1. Aggiungere definizione in `mcp_tool_defs()` (mcp.php)
-2. Aggiungere case in `mcp_run_tool()` (mcp.php)
-3. Aggiungere audit call se è un write
-
-### Aggiungere una nuova API nel board
-1. Aggiungere case nel `match($action)` in _Ykan.php (sezione API handler)
-2. Aggiungere il call JS nel frontend (sezione `<script>`)
-
-### Creare un tema custom
-1. Copiare `themes/_TEMPLATE.jsonc` → `themes/mio-tema.json`
-2. Modificare colori in `colors`, layout in `layout`, superfici in `surfaces`
-3. Il tema appare automaticamente nello switcher
-
-### Collegare un nuovo progetto
-1. UI → toolbar → 🔗 Projects
-2. Impostare Folder (path relativo a MCP_ROOT) e URL
-3. Il progetto diventa accessibile via MCP file tools
-
----
+- **Nuova API della board**: aggiungi `'nome' => (function() use (&$data, $input) { …; saveData($data); return ['success' => true]; })(),` nel `match($action)`; dal JS `await api('nome', {...})`.
+- **Nuova rotta del Bridge**: in `handleRequest`; le scritture solo `POST` + `isAllowedOrigin` + `application/json`. Per usarla da remoto aggiungila a `RELAY_PATHS` e a `YKAN_RELAY_PATHS`. Poi `npm run build` e sostituisci l'exe.
+- **Nuovo tool MCP**: in `mcp.php` (definizione nel `tools/list` + handler).
+- **Tema custom**: copia `themes/_TEMPLATE.jsonc`.
 
 ## Pattern e convenzioni
-
-- **Single-file PHP** — tutto in _Ykan.php, deliberatamente monolitico
-- **No build step** — no npm, no webpack, no transpiler
-- **No database** — JSON file flat, letto/scritto atomicamente
-- **API = query param** — `?api=action_name` (POST)
-- **MCP = JSON-RPC 2.0** — standard protocol, stateless
-- **AI = Gemini** — tutte le chiamate AI passano per Gemini 2.5 Flash
-- **Fuzzy match** — swimlane e task trovati per partial match (stripos)
-- **Backup before write** — ogni modifica file crea backup timestamped
-- **Audit trail** — log TSV per ogni operazione MCP di scrittura
+- File unico, monolitico per scelta; nessun build per la board.
+- API = `?api=nome` in POST JSON; risposta `{ success, … }`.
+- Testi dell'interfaccia e commenti in italiano.
+- Backup prima di scrivere (DB: tabella di copia; file: `.ykan-bak` o backup con data).
+- Claude in locale sempre con `runClaudePrint` e strumenti minimi (nessuno, oppure `Read,Grep,Glob`).
+- Script PowerShell solo ASCII (PS 5.1 legge senza BOM come ANSI); JSON con accenti da leggere con Python/Node, non con PS 5.1.

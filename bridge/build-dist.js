@@ -36,6 +36,8 @@ execFileSync(process.execPath, [
 const nm = path.join(root, 'node_modules');
 const outNm = path.join(out, 'node_modules');
 fs.cpSync(path.join(nm, 'ws'), path.join(outNm, 'ws'), { recursive: true });
+// xterm.js per il terminale della board servito dal Bridge (senza CDN)
+for (const m of ['@xterm/xterm', '@xterm/addon-fit']) fs.cpSync(path.join(nm, m), path.join(outNm, m), { recursive: true });
 // WhatsApp: Baileys e le sue dipendenze (tutto l'albero, letto dai package.json)
 const copyTree = (name, seen = new Set()) => {
     if (seen.has(name) || !fs.existsSync(path.join(nm, name, 'package.json'))) return;
