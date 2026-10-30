@@ -317,7 +317,7 @@ const YKAN_RELAY_PATHS = ['/sessions', '/session', '/reviews', '/git', '/claude/
     '/claude/memory', '/claude/memory/file', '/claude/memory/write', '/claude/memory/delete',
     '/claude/skill/write', '/claude/skill/override', '/claude/skill/copy', '/claude/plugins', '/claude/plugins/toggle',
     '/rc', '/rc/start', '/rc/stop', '/rc/answer', '/rc/autostart',
-    '/claude/context', '/claude/context/project',
+    '/claude/context', '/claude/context/project', '/claude/mode', '/claude/mode/apply', '/claude/mode/clear', '/claude/mode/suggest',
     '/desktop-archive', '/desktop/new', '/desktop/resume'];
 const YKAN_RELAY_WAIT_SECS = 25; // quanto la board aspetta la risposta del PC
 const YKAN_POLL_HOLD_SECS = 8;   // quanto una ?bridge=poll resta aperta se non ci sono comandi
@@ -857,6 +857,19 @@ function ykanStampLaneVersions(array &$data, array $lane): void {
         if ($v !== '' && ($c['version_id'] ?? '') !== $v) ykanSetCardVersion($c, $lane, $v);
     }
     unset($c);
+}
+
+/** Selezione di una modalità: plugins = {chiave: 'all' | [plugin:skill, …]}, skills = [nome, …]. */
+function ykanModeSelection(array $m): array {
+    $plugins = [];
+    foreach ((array)($m['plugins'] ?? []) as $k => $v) {
+        if (!preg_match('/^[\w.@:-]{1,120}$/', (string)$k)) continue;
+        if ($v === 'all') { $plugins[$k] = 'all'; continue; }
+        $list = array_values(array_filter(array_map('strval', (array)$v), fn($x) => preg_match('/^[\w.:-]{1,160}$/', $x)));
+        if ($list) $plugins[$k] = array_slice($list, 0, 400);
+    }
+    $skills = array_values(array_filter(array_map('strval', (array)($m['skills'] ?? [])), fn($x) => preg_match('/^[\w.:-]{1,120}$/', $x)));
+    return ['plugins' => (object)$plugins, 'skills' => array_slice($skills, 0, 200)];
 }
 
 function ykanIsDoneColumn(array $data, string $colId): bool {
@@ -1648,6 +1661,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['api'])) {
                         if (array_key_exists('color', $input) && preg_match('/^(#[0-9a-fA-F]{6})?$/', (string)$input['color'])) $lane['color'] = $input['color'];
                         // Doc/structure files the AI should study before working
                         if (array_key_exists('doc_files', $input)) $lane['doc_files'] = array_values($input['doc_files'] ?? []);
+                        // Modalità di lavoro attiva, fissi del progetto e contesto generato per ogni modalità
+                        if (array_key_exists('mode_id', $input) && preg_match('/^[\w-]{0,40}$/', (string)$input['mode_id'])) $lane['mode_id'] = (string)$input['mode_id'];
+                        if (array_key_exists('mode_pinned', $input) && is_array($input['mode_pinned'])) $lane['mode_pinned'] = ykanModeSelection($input['mode_pinned']);
+                        if (array_key_exists('mode_contexts', $input) && is_array($input['mode_contexts'])) {
+                            $lane['mode_contexts'] = [];
+                            foreach ($input['mode_contexts'] as $k => $v) if (preg_match('/^[\w-]{1,40}$/', (string)$k)) $lane['mode_contexts'][$k] = mb_substr((string)$v, 0, 6000);
+                        }
                         break;
                     }
                 }
@@ -1772,6 +1792,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['api'])) {
                 $data['labels'] = array_values(array_filter($data['labels'], fn($l) => !in_array($l['id'], $gone, true)));
                 saveData($data);
                 return ['success' => true, 'moved' => $moved];
+            })(),
+
+            // Modalità di lavoro (globali) e fissi globali
+            'save_work_modes' => (function() use (&$data, $input) {
+                $modes = [];
+                foreach (array_slice((array)($input['modes'] ?? []), 0, 40) as $m) {
+                    if (!is_array($m) || !preg_match('/^[\w-]{1,40}$/', (string)($m['id'] ?? ''))) continue;
+                    $sel = ykanModeSelection($m);
+                    $modes[] = ['id' => (string)$m['id'], 'name' => mb_substr(trim((string)($m['name'] ?? '')), 0, 60) ?: 'Modalità',
+                        'icon' => mb_substr((string)($m['icon'] ?? ''), 0, 8), 'description' => mb_substr((string)($m['description'] ?? ''), 0, 2000),
+                        'plugins' => $sel['plugins'], 'skills' => $sel['skills']];
+                }
+                $data['config']['work_modes'] = $modes;
+                if (isset($input['pinned']) && is_array($input['pinned'])) $data['config']['mode_pinned'] = ykanModeSelection($input['pinned']);
+                saveData($data);
+                return ['success' => true, 'modes' => $modes, 'pinned' => $data['config']['mode_pinned'] ?? null];
             })(),
 
             'reorder_swimlanes' => (function() use (&$data, $input) {
@@ -2607,6 +2643,38 @@ PROMPT;
                 $r = ykanAiAsk($data['config'], '', $prompt, 0.2, 256, 30);
                 if (!$r['success']) return $r;
                 return ['success' => true, 'suggestion' => ykanAiJson($r['text'])];
+            })(),
+
+            // Suggerisce la categoria (modalità di lavoro) di un task
+            'ai_suggest_mode' => (function() use ($data, $input) {
+                $modes = (array)($data['config']['work_modes'] ?? []);
+                if (!$modes) return ['success' => false, 'error' => 'Nessuna modalità definita (Claude → Modalità)'];
+                $list = implode("
+", array_map(fn($m) => "- id={$m['id']} | {$m['name']}: " . mb_substr((string)($m['description'] ?? ''), 0, 300), $modes));
+                $prompt = "Scegli la categoria di lavoro più adatta a questo task di sviluppo software, tra quelle elencate. Se nessuna è chiaramente adatta, rispondi mode_id null.
+
+Task: " . ($input['title'] ?? '') . "
+Descrizione: " . mb_substr((string)($input['description'] ?? ''), 0, 2000) . "
+Progetto: " . ($input['project'] ?? '') . "
+
+Categorie:
+{$list}
+
+Rispondi SOLO con JSON: {\"mode_id\":\"id oppure null\",\"reason\":\"una frase in italiano\"}";
+                // prima l'AI scelta in Settings, poi le altre che hanno una chiave
+                $first = ykanAiProvider($data['config']);
+                $errs = [];
+                foreach (array_unique(array_merge([$first], array_keys(YKAN_AI_PROVIDERS))) as $prov) {
+                    if ($prov !== $first && ($prov === 'ollama' || ykanAiSettings($data['config'], $prov)['api_key'] === '')) continue;
+                    $r = ykanAiAsk($data['config'], '', $prompt, 0.2, 200, 30, $prov);
+                    if ($r['success']) break;
+                    $errs[] = $r['error'];
+                }
+                if (!$r['success']) return ['success' => false, 'error' => implode(' · ', $errs)];
+                $j = ykanAiJson($r['text']) ?: [];
+                $id = (string)($j['mode_id'] ?? '');
+                if (!in_array($id, array_column($modes, 'id'), true)) $id = '';
+                return ['success' => true, 'mode_id' => $id ?: null, 'reason' => (string)($j['reason'] ?? ''), 'by' => YKAN_AI_PROVIDERS[$r['provider']]['name'] ?? $r['provider']];
             })(),
 
             // AI Estimate
@@ -3814,6 +3882,22 @@ $dataJson = json_encode(ykanPublicData($data));
         .ver-tag { font-size: 10px; padding: 1px 6px; border-radius: 8px; background: var(--accent); color: #fff; }
         .ver-count { color: var(--text2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 
+        /* Modalità di lavoro */
+        .mode-chip { font-size: 11px; padding: 1px 8px; border-radius: 10px; background: rgba(var(--lane, 120,120,120), .22); border: 1px solid rgba(var(--lane, 120,120,120), .45); color: var(--text); cursor: pointer; white-space: nowrap; }
+        .mode-chip.busy { opacity: .6; }
+        .mode-card { border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 14px; margin-bottom: 10px; background: var(--bg2); }
+        .mode-card h4 { margin: 0; font-size: 15px; display: flex; align-items: center; gap: 8px; }
+        .mode-row { display: flex; align-items: center; gap: 8px; padding: 4px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+        .mode-row:last-child { border-bottom: none; }
+        .mode-row select { width: auto; padding: 1px 4px; font-size: 12px; }
+        .mode-skills { padding: 4px 0 6px 24px; display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 2px 12px; font-size: 12px; }
+        .mode-skills label { display: flex; gap: 6px; align-items: flex-start; cursor: pointer; }
+        .mode-skills input { width: auto; margin-top: 2px; }
+        .mode-why { font-size: 11px; color: var(--accent); }
+        .mode-tok { font-size: 11px; color: var(--text2); margin-left: auto; white-space: nowrap; }
+        .mode-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg2); margin: 6px 0 12px; font-size: 13px; }
+        .mode-bar select { width: auto; padding: 2px 4px; }
+
         /* Menu del tasto destro */
         .ctx-menu { position: fixed; z-index: 10000; min-width: 200px; max-width: 280px; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 8px 28px rgba(0,0,0,.22); padding: 4px; font-size: 13px; user-select: none; }
         .ctx-item { display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-radius: 5px; cursor: pointer; position: relative; white-space: nowrap; }
@@ -4586,6 +4670,7 @@ $dataJson = json_encode(ykanPublicData($data));
                 <button data-tab="memory" onclick="claudeNav('memory')">Memoria <span class="dash-count"></span></button>
                 <button data-tab="routines" onclick="claudeNav('routines')">Routine <span class="dash-count"></span></button>
                 <button data-tab="context" onclick="claudeNav('context')">Contesto <span class="dash-count"></span></button>
+                <button data-tab="modes" onclick="claudeNav('modes')">Modalità <span class="dash-count"></span></button>
                 <button data-tab="rc" onclick="claudeNav('rc')">Remote Control <span class="dash-count"></span></button>
             <button data-tab="news" onclick="showView('claude');claudeTab('news')">Novità <span class="dash-count"></span></button>
             <button data-tab="wa" onclick="showView('claude');claudeTab('wa')">WhatsApp <span class="dash-count"></span></button>
@@ -4892,6 +4977,11 @@ $dataJson = json_encode(ykanPublicData($data));
                                 <select id="cardLabelInput">
                                     <option value="">None</option>
                                 </select>
+                            </div>
+                            <div class="form-group">
+                                <label>Categoria di lavoro <span style="font-weight:400;color:var(--text2)">(facoltativa)</span></label>
+                                <div style="display:flex;gap:6px"><select id="cardModeInput" style="flex:1"></select>
+                                <button type="button" class="btn" onclick="cardModalSuggestMode(this)" title="Claude legge il task e propone la categoria">✨ Suggerisci</button></div>
                             </div>
                             <div class="form-group">
                                 <label>Versione</label>
@@ -5274,6 +5364,7 @@ $dataJson = json_encode(ykanPublicData($data));
             <button data-tab="wa" onclick="showView('claude');claudeTab('wa')">WhatsApp <span class="dash-count"></span></button>
             <button data-tab="routines" onclick="claudeTab('routines')">Routine <span class="dash-count"></span></button>
             <button data-tab="context" onclick="claudeTab('context')">Contesto <span class="dash-count"></span></button>
+            <button data-tab="modes" onclick="claudeTab('modes')">Modalità <span class="dash-count"></span></button>
         </div>
         <div id="claudeBody"></div>
     </section>
@@ -5658,6 +5749,7 @@ $dataJson = json_encode(ykanPublicData($data));
                 <div class="swimlane${collapsedLanes.has(lane.id) ? ' collapsed' : ''}" data-lane-id="${lane.id}" style="--lane:${laneRgb(lane)}">
                     <div class="swimlane-header" style="cursor:default">
                         <span class="swimlane-name">${escHtml(lane.name)}</span>
+                        ${modeChipHtml(lane)}
                         <label class="lane-color" title="Colore del progetto" onclick="event.stopPropagation()">
                             <i class="ti ti-pencil" aria-hidden="true"></i>
                             <input type="color" value="${laneHex(lane)}" onchange="setLaneColor('${lane.id}', this.value)">
@@ -5824,6 +5916,357 @@ $dataJson = json_encode(ykanPublicData($data));
         });
     }
 
+    // === MODALITÀ DI LAVORO ===
+    // Globali (config.work_modes), ognuna = plugin interi o solo alcune loro skill + skill utente.
+    // Fissi globali (config.mode_pinned) e del progetto (lane.mode_pinned) restano accesi in ogni modalità.
+    // Il progetto ha una modalità attiva (lane.mode_id) che il Bridge scrive nella sua cartella.
+    const workModes = () => boardData.config.work_modes || [];
+    const modeById = id => workModes().find(m => m.id === id) || null;
+    const modeLabel = m => m ? ((m.icon ? m.icon + ' ' : '') + m.name) : '';
+    let modeCat; // undefined = non caricato, null = Bridge non raggiungibile
+    let modeEdit = null; // { id, name, icon, description, plugins, skills, proposal, busy } oppure { pinned: 'global'|laneId, … }
+    const modeBusy = {}; // laneId -> testo mentre applica/genera
+
+    let modeCatErr = '';
+    async function modeLoadCatalog() {
+        try { modeCat = await ctxCall('/claude/mode?catalog=1'); modeCatErr = ''; }
+        catch (e) { modeCat = null; modeCatErr = (e && e.message) || String(e); console.warn('Modalità: catalogo non letto:', modeCatErr); }
+        if (claudeTabName === 'modes') claudeRenderBody();
+    }
+    function modeSelEmpty() { return { plugins: {}, skills: [] }; }
+    function modeMerge(a, b) {
+        const out = { plugins: {}, skills: [...new Set([...(a && a.skills || []), ...(b && b.skills || [])])] };
+        for (const src of [a && a.plugins, b && b.plugins]) for (const [k, v] of Object.entries(src || {})) {
+            if (v === 'all' || out.plugins[k] === 'all') out.plugins[k] = 'all';
+            else out.plugins[k] = [...new Set([...(out.plugins[k] || []), ...v])];
+        }
+        return out;
+    }
+    // Stima token di una selezione: skill tenute + agenti e comandi dei plugin accesi
+    function modeTokens(sel) {
+        if (!modeCat) return 0;
+        let t = 0;
+        for (const p of modeCat.plugins) {
+            const v = sel.plugins[p.key];
+            if (!v) continue;
+            t += p.baseTokens || 0;
+            for (const sk of p.skills) if (v === 'all' || v.includes(p.name + ':' + sk.name)) t += sk.tokens;
+        }
+        for (const sk of modeCat.skills) if (sel.skills.includes(sk.name)) t += sk.tokens;
+        return t;
+    }
+
+    // ---- Pagina Claude → Modalità ----
+    function modesHtml() {
+        if (modeCat === undefined) return '<div class="dash-empty">Leggo plugin e skill installati…</div>';
+        if (modeCat === null) return '<div class="dash-empty"><i class="ib"></i> Bridge non raggiungibile o da aggiornare (serve la 0.9.5): le modalità leggono plugin e skill dal PC.' + (modeCatErr ? '<br><small>Motivo: ' + escHtml(modeCatErr) + '</small>' : '') + ' <button class="btn" onclick="modeCat=undefined;claudeRenderBody();modeLoadCatalog()">↻ Riprova</button></div>';
+        const pinnedG = boardData.config.mode_pinned || modeSelEmpty();
+        let html = `<div class="dash-sub" style="margin-bottom:10px">Una <b>modalità</b> tiene accesi solo i plugin e le skill che servono per un tipo di lavoro; il resto esce dal contesto
+            (le skill restano richiamabili con <code>/nome</code>). La scegli per un progetto dal Kanban (🔧 → Modalità) o da Contesto, e vale dalle sessioni nuove.</div>
+            <div style="display:flex;gap:8px;margin-bottom:12px">
+                <button class="btn btn-primary" onclick="modeNew()">＋ Nuova modalità</button>
+                <button class="btn" onclick="modeAddPresets()" title="Crea le modalità consigliate che non hai ancora">✨ Modalità suggerite</button>
+                <button class="btn" onclick="modeEditPinned('global')">📌 Fissi globali (${Object.keys(pinnedG.plugins || {}).length + (pinnedG.skills || []).length})</button>
+                <button class="btn" onclick="modeCat=undefined;claudeRenderBody();modeLoadCatalog()" title="Rileggi plugin e skill">↻</button>
+            </div>`;
+        if (modeEdit) html += modeEditorHtml();
+        const used = id => boardData.swimlanes.filter(l => l.mode_id === id).map(l => l.name);
+        html += workModes().map(m => {
+            const sel = { plugins: m.plugins || {}, skills: m.skills || [] };
+            const np = Object.keys(sel.plugins).length;
+            const ns = Object.entries(sel.plugins).reduce((t, [, v]) => t + (v === 'all' ? 0 : v.length), 0) + sel.skills.length;
+            const on = used(m.id);
+            return `<div class="mode-card">
+                <h4><span>${escHtml(m.icon || '🎛️')}</span>${escHtml(m.name)}
+                    <span class="mode-tok">${np} plugin · ${ns} skill scelte · ~${ctxK(modeTokens(sel))} token</span></h4>
+                ${m.description ? `<div class="dash-sub" style="margin-top:4px">${escHtml(m.description)}</div>` : ''}
+                <div class="dash-sub" style="margin-top:4px">${on.length ? 'Attiva su: ' + on.map(escHtml).join(', ') : 'Non attiva su nessun progetto'}</div>
+                <div style="display:flex;gap:6px;margin-top:8px">
+                    <button class="btn" onclick="modeOpen('${escHtml(m.id)}')">✏️ Modifica</button>
+                    <button class="btn btn-danger" onclick="modeDelete('${escHtml(m.id)}')">Elimina</button>
+                </div>
+            </div>`;
+        }).join('') || '<div class="dash-empty">Nessuna modalità. Creane una: per esempio «Front-end — rifare layout e UI, responsive, accessibilità».</div>';
+        return html;
+    }
+
+    // Modalità consigliate: [plugin, skill] dove skill '*' = plugin intero; si tengono solo quelle installate.
+    // La descrizione contiene le regole di lavoro: finisce nel contesto generato per il progetto.
+    const MODE_PRESETS = [
+        { id: 'p-fix', icon: '🔧', name: 'Manutenzione / fix', description: 'Bug, errori in console, piccoli ritocchi. Regole: riproduci prima di correggere; cambia il minimo indispensabile, non toccare stile e struttura; lint prima dell\'upload; deploy su OVH solo dopo diff col server, commit solo dopo la verifica di Yuri.',
+            keep: [['', 'ovh-yuri'], ['ecc', 'error-handling'], ['ecc', 'verification-loop']] },
+        { id: 'p-feature', icon: '🏗️', name: 'Feature', description: 'Nuove funzioni su un progetto esistente. Regole: segui lo stile del codice che c\'è; prima di scrivere chiarisci i dubbi con domande; un pezzo alla volta, Yuri prova lui; deploy → verifica → commit.',
+            keep: [['', 'ovh-yuri'], ['', 'ykan-pm'], ['ecc', 'mysql-patterns'], ['ecc', 'change-impact'], ['ecc', 'inherit-legacy-style']] },
+        { id: 'p-ui', icon: '🎨', name: 'UI / redesign', description: 'Aspetto, layout, mobile. Regole: niente look da template; controlla chiaro/scuro e mobile; non cambiare la logica mentre ritocchi lo stile.',
+            keep: [['', 'design-taste-frontend'], ['', 'redesign-existing-projects'], ['', 'high-end-visual-design'], ['ui-ux-pro-max', 'ui-ux-pro-max'], ['ui-ux-pro-max', 'ui-styling'], ['design', 'design-critique'], ['design', 'ux-copy'], ['ecc', 'make-interfaces-feel-better']] },
+        { id: 'p-proto', icon: '🧪', name: 'Prototipo / progetto nuovo', description: 'Progetti da zero. Regole: arriva presto a qualcosa che si vede e si prova; scelte semplici e reversibili; niente infrastruttura prima che serva.',
+            keep: [['', 'design-taste-frontend'], ['', 'imagegen-frontend-web'], ['ui-ux-pro-max', 'ui-ux-pro-max'], ['ecc', 'orch-build-mvp'], ['ecc', 'search-first']] },
+        { id: 'p-data', icon: '🗄️', name: 'Dati / server', description: 'MySQL, migrazioni, NAS, JSON live. Regole: backup prima di ogni scrittura; diff col server prima di caricare (il live può essere più avanti); chiedi conferma prima di ogni modifica ai dati.',
+            keep: [['', 'ovh-yuri'], ['ecc', 'mysql-patterns'], ['ecc', 'database-migrations'], ['ecc', 'deployment-patterns']] },
+        { id: 'p-review', icon: '🔍', name: 'Analisi / revisione', description: 'Capire, discutere, fare audit. Regole: NON modificare file; leggi, spiega, proponi; il codice si scrive solo quando Yuri dice di procedere.',
+            keep: [['', 'graphify-windows'], ['ecc', 'codebase-onboarding'], ['ecc', 'security-review'], ['ecc', 'production-audit'], ['ecc', 'context-and-decisions']] },
+        { id: 'p-game', icon: '🎮', name: 'Videogiochi', description: 'Giochi 2D/3D (browser, Godot, Unreal). Regole: prima il game loop giocabile, poi la grafica; numeri di bilanciamento in un posto solo e facili da ritoccare; prestazioni (60 fps) da controllare presto; giochi originali, mai copie di giochi esistenti.',
+            keep: [['', 'godot-gameplay-scripter'], ['', 'godot-gdscript-patterns'], ['', 'basket-levels'], ['', 'imagegen-frontend-web'], ['b8562a75-b166-4116-801a-491608cd1a7f', '*'], ['ecc', 'motion-foundations']] },
+        { id: 'p-market', icon: '📈', name: 'Commerciale / mercato', description: 'Prima di pianificare (progetto nuovo o vecchio): concorrenti, mercato, posizionamento, prezzi. Poi il lancio: messaggio, landing, SEO, canali, contenuti. Regole: fonti citate e datate, distingui fatti da stime; chiudi sempre con 3-5 decisioni concrete per il piano (da passare a ykan-pm).',
+            keep: [['ecc', 'market-research'], ['ecc', 'competitive-platform-analysis'], ['ecc', 'competitive-report-structure'], ['ecc', 'deep-research'], ['ecc', 'product-lens'], ['ecc', 'brand-voice'], ['ecc', 'seo'], ['ecc', 'marketing-campaign'], ['ecc', 'content-engine'], ['', 'ykan-pm'], ['design', 'user-research']] },
+    ];
+    async function modeAddPresets() {
+        if (!modeCat) return;
+        const have = new Set(workModes().map(m => m.id));
+        const add = [];
+        for (const pr of MODE_PRESETS) {
+            if (have.has(pr.id)) continue;
+            const m = { id: pr.id, name: pr.name, icon: pr.icon, description: pr.description, plugins: {}, skills: [] };
+            for (const [pk, sk] of pr.keep) {
+                if (!pk) { if (modeCat.skills.some(x => x.name === sk)) m.skills.push(sk); continue; }
+                const pl = modeCat.plugins.find(x => x.key.split('@')[0] === pk);
+                if (!pl) continue;
+                if (sk === '*') { m.plugins[pl.key] = 'all'; continue; }
+                if (!pl.skills.some(x => x.name === sk) || m.plugins[pl.key] === 'all') continue;
+                (m.plugins[pl.key] = m.plugins[pl.key] || []).push(pl.name + ':' + sk);
+            }
+            add.push(m);
+        }
+        if (!add.length) { toast('Hai già tutte le modalità suggerite'); return; }
+        const r = await api('save_work_modes', { modes: workModes().concat(add) });
+        if (!r.success) return;
+        boardData.config.work_modes = r.modes;
+        toast('✨ Aggiunte ' + add.length + ' modalità: ritoccale con ✏️', 'success');
+        claudeRenderBody();
+    }
+    function modeNew() {
+        modeEdit = { id: 'm' + Date.now().toString(36), name: '', icon: '🎛️', description: '', plugins: {}, skills: [], isNew: true };
+        claudeRenderBody();
+    }
+    function modeOpen(id) {
+        const m = modeById(id);
+        if (!m) return;
+        modeEdit = JSON.parse(JSON.stringify(Object.assign({ plugins: {}, skills: [] }, m)));
+        claudeRenderBody();
+    }
+    function modeEditPinned(which) {
+        const lane = which === 'global' ? null : boardData.swimlanes.find(l => l.id === which);
+        const src = lane ? (lane.mode_pinned || modeSelEmpty()) : (boardData.config.mode_pinned || modeSelEmpty());
+        modeEdit = Object.assign({ pinned: which, name: lane ? 'Fissi di ' + lane.name : 'Fissi globali' }, JSON.parse(JSON.stringify(Object.assign(modeSelEmpty(), src))));
+        if (document.body.dataset.view !== 'claude' || claudeTabName !== 'modes') claudeNav('modes'); else claudeRenderBody();
+    }
+
+    function modeEditorHtml() {
+        const e = modeEdit;
+        const why = k => e.proposal && e.proposal.reasons && e.proposal.reasons[k] ? `<span class="mode-why">💡 ${escHtml(e.proposal.reasons[k])}</span>` : '';
+        const head = e.pinned
+            ? `<h4>📌 ${escHtml(e.name)}</h4><div class="dash-sub">Restano accesi in qualunque modalità${e.pinned === 'global' ? ', su tutti i progetti' : ' di questo progetto'} (es. <code>ovh-yuri</code> per i progetti su OVH).</div>`
+            : `<div style="display:flex;gap:8px;align-items:center">
+                    <input value="${escHtml(e.icon || '')}" maxlength="4" style="width:46px;text-align:center" oninput="modeEdit.icon=this.value">
+                    <input value="${escHtml(e.name)}" placeholder="Nome (es. Front-end)" style="flex:1" oninput="modeEdit.name=this.value">
+               </div>
+               <textarea rows="2" style="width:100%;margin-top:6px" placeholder="Cosa vuoi fare in questa modalità (Claude la usa per proporre cosa accendere)" oninput="modeEdit.description=this.value">${escHtml(e.description || '')}</textarea>
+               <div style="display:flex;gap:8px;align-items:center;margin-top:6px">
+                    <button class="btn btn-primary" ${e.busy ? 'disabled' : ''} onclick="modePropose()">${e.busy ? '⏳ Claude sta scegliendo…' : '✨ Proponi con Claude'}</button>
+                    <span class="dash-sub">Legge nome e descrizione di tutti i plugin e skill installati e sceglie il minimo utile.</span>
+               </div>
+               ${e.proposal && e.proposal.summary ? `<div class="dash-hint" style="margin-top:8px">💡 ${escHtml(e.proposal.summary)}</div>` : ''}`;
+        const rows = modeCat.plugins.slice().sort((a, b) => b.tokens - a.tokens).map(p => {
+            const v = e.plugins[p.key];
+            const st = !v ? 'off' : v === 'all' ? 'all' : 'some';
+            const kk = escHtml(p.key);
+            return `<div class="mode-row">
+                    <select data-key="${kk}" onchange="modeSetPlugin(this)">
+                        <option value="off" ${st === 'off' ? 'selected' : ''}>spento</option>
+                        <option value="all" ${st === 'all' ? 'selected' : ''}>intero</option>
+                        <option value="some" ${st === 'some' ? 'selected' : ''} ${p.skills.length ? '' : 'disabled'}>solo alcune skill</option>
+                    </select>
+                    <b>${escHtml(p.name)}</b> <span class="git-tag">${escHtml(p.source)}</span>
+                    <span class="dash-sub">${p.skills.length} skill · ${p.agents} agenti · ${p.hooks} hook${p.mcp.length ? ' · MCP ' + escHtml(p.mcp.join(', ')) : ''}${p.baseTokens > 500 ? ` · <span title="agenti e comandi restano anche tenendo una sola skill">base ~${ctxK(p.baseTokens)}</span>` : ''}</span>
+                    ${why(p.key)}
+                    <span class="mode-tok">~${ctxK(p.tokens)}</span>
+                </div>
+                ${st === 'some' ? `<div class="mode-skills">${p.skills.map(sk => {
+                    const n = p.name + ':' + sk.name;
+                    return `<label title="${escHtml(sk.description)}"><input type="checkbox" data-key="${kk}" data-skill="${escHtml(n)}" ${v.includes(n) ? 'checked' : ''} onchange="modeSetSkill(this)">${escHtml(sk.name)}</label>`;
+                }).join('')}</div>` : ''}`;
+        }).join('');
+        const skills = modeCat.skills.map(sk => `<label title="${escHtml(sk.description)}"><input type="checkbox" data-skill="${escHtml(sk.name)}" ${e.skills.includes(sk.name) ? 'checked' : ''} onchange="modeSetUserSkill(this)">${escHtml(sk.name)} ${why('skill:' + sk.name)}</label>`).join('');
+        return `<div class="mode-card" style="border-color:var(--accent)">
+            ${head}
+            <h4 style="margin-top:12px;font-size:13px">Plugin</h4>${rows || '<div class="dash-sub">Nessun plugin installato</div>'}
+            <h4 style="margin-top:12px;font-size:13px">Skill tue (~/.claude/skills)</h4><div class="mode-skills" style="padding-left:0">${skills || '<span class="dash-sub">nessuna</span>'}</div>
+            <div style="display:flex;gap:8px;align-items:center;margin-top:12px">
+                <button class="btn btn-primary" onclick="modeSave()">💾 Salva</button>
+                <button class="btn" onclick="modeEdit=null;claudeRenderBody()">Annulla</button>
+                <span class="mode-tok">~${ctxK(modeTokens(e))} token in tutto</span>
+            </div>
+        </div>`;
+    }
+    function modeSetPlugin(el) {
+        const p = modeCat.plugins.find(x => x.key === el.dataset.key);
+        if (el.value === 'off') delete modeEdit.plugins[p.key];
+        else if (el.value === 'all') modeEdit.plugins[p.key] = 'all';
+        else modeEdit.plugins[p.key] = Array.isArray(modeEdit.plugins[p.key]) ? modeEdit.plugins[p.key] : [];
+        claudeRenderBody();
+    }
+    function modeSetSkill(el) {
+        const list = modeEdit.plugins[el.dataset.key] || [];
+        modeEdit.plugins[el.dataset.key] = el.checked ? [...new Set([...list, el.dataset.skill])] : list.filter(x => x !== el.dataset.skill);
+    }
+    function modeSetUserSkill(el) {
+        modeEdit.skills = el.checked ? [...new Set([...modeEdit.skills, el.dataset.skill])] : modeEdit.skills.filter(x => x !== el.dataset.skill);
+    }
+    async function modePropose() {
+        const e = modeEdit;
+        if (!e.name.trim()) { toast('Dai prima un nome alla modalità', 'error'); return; }
+        e.busy = true; claudeRenderBody();
+        try {
+            const r = await ctxCall('/claude/mode/propose', { name: e.name, description: e.description, pinned: boardData.config.mode_pinned || null });
+            e.plugins = r.plugins || {}; e.skills = r.skills || []; e.proposal = r;
+            toast(`✨ Proposta pronta in ${r.seconds}s: controlla e salva`, 'success');
+        } catch (err) { toast('Proposta non riuscita: ' + err.message, 'error'); }
+        e.busy = false;
+        if (modeEdit === e) claudeRenderBody();
+    }
+    async function modeSave() {
+        const e = modeEdit;
+        const sel = { plugins: e.plugins, skills: e.skills };
+        if (e.pinned) {
+            if (e.pinned === 'global') {
+                const r = await api('save_work_modes', { modes: workModes(), pinned: sel });
+                if (!r.success) return;
+                boardData.config.mode_pinned = r.pinned;
+            } else {
+                const lane = boardData.swimlanes.find(l => l.id === e.pinned);
+                lane.mode_pinned = sel;
+                await api('update_swimlane', { id: lane.id, mode_pinned: sel });
+            }
+        } else {
+            if (!e.name.trim()) { toast('Manca il nome', 'error'); return; }
+            const m = { id: e.id, name: e.name.trim(), icon: e.icon, description: e.description, plugins: e.plugins, skills: e.skills };
+            const modes = workModes().filter(x => x.id !== m.id);
+            const idx = workModes().findIndex(x => x.id === m.id);
+            modes.splice(idx < 0 ? modes.length : idx, 0, m);
+            const r = await api('save_work_modes', { modes });
+            if (!r.success) return;
+            boardData.config.work_modes = r.modes;
+        }
+        const changedId = e.pinned ? null : e.id;
+        modeEdit = null;
+        claudeRenderBody();
+        render();
+        // progetti già in questa modalità (o tutti, per i fissi): riapplico così vale subito per le sessioni nuove
+        const lanes = boardData.swimlanes.filter(l => l.local_path && l.mode_id && (changedId ? l.mode_id === changedId : (e.pinned === 'global' || l.id === e.pinned)));
+        for (const l of lanes) await setLaneMode(l.id, l.mode_id, { quiet: true });
+        if (lanes.length) toast('Riapplicata su ' + lanes.map(l => l.name).join(', '), 'success');
+    }
+    async function modeDelete(id) {
+        const m = modeById(id);
+        const on = boardData.swimlanes.filter(l => l.mode_id === id);
+        if (!confirm(`Eliminare la modalità «${m.name}»?` + (on.length ? `\nÈ attiva su ${on.map(l => l.name).join(', ')}: lì torna tutto com'era.` : ''))) return;
+        for (const l of on) await setLaneMode(l.id, '', { quiet: true });
+        const r = await api('save_work_modes', { modes: workModes().filter(x => x.id !== id) });
+        if (r.success) boardData.config.work_modes = r.modes;
+        claudeRenderBody();
+        render();
+    }
+
+    // ---- Applicare a un progetto ----
+    async function setLaneMode(laneId, modeId, opt = {}) {
+        const lane = boardData.swimlanes.find(l => l.id === laneId);
+        if (!lane || !lane.local_path) { toast('Il progetto non ha una cartella locale collegata (🔗)', 'error'); return false; }
+        const dir = lane.local_path;
+        modeBusy[laneId] = modeId ? 'applico…' : 'ripristino…';
+        render();
+        try {
+            if (!modeId) {
+                await ctxCall('/claude/mode/clear', { dir });
+            } else {
+                const mode = modeById(modeId);
+                if (!mode) throw new Error('modalità non trovata');
+                const pinned = modeMerge(boardData.config.mode_pinned, lane.mode_pinned);
+                const context = (lane.mode_contexts || {})[modeId] || '';
+                const r = await ctxCall('/claude/mode/apply', { dir, mode, pinned, context });
+                if (!opt.quiet) toast(`${modeLabel(mode)} attiva su ${lane.name}: ${r.summary.pluginsOn.length} plugin, ${r.summary.skillsKept} skill (~${ctxK(r.summary.tokens)} token). Vale dalle sessioni nuove.`, 'success');
+                if (!context) modeGenContext(laneId, modeId); // la prima volta Claude legge il progetto
+            }
+            if ((lane.mode_id || '') !== modeId) {
+                lane.mode_id = modeId;
+                await api('update_swimlane', { id: laneId, mode_id: modeId });
+            }
+            if (!modeId && !opt.quiet) toast(`${lane.name}: modalità tolta, plugin e skill come prima`, 'success');
+            return true;
+        } catch (e) {
+            toast('Modalità non applicata: ' + e.message, 'error');
+            return false;
+        } finally {
+            delete modeBusy[laneId];
+            render();
+            if (claudeTabName === 'context' && ctxState.dir === dir) ctxLoadProject(dir, true);
+        }
+    }
+    async function modeGenContext(laneId, modeId) {
+        const lane = boardData.swimlanes.find(l => l.id === laneId);
+        const mode = modeById(modeId);
+        if (!lane || !mode) return;
+        modeBusy[laneId] = 'Claude legge il progetto…';
+        render();
+        try {
+            const r = await ctxCall('/claude/mode/context', { dir: lane.local_path, mode });
+            lane.mode_contexts = Object.assign({}, lane.mode_contexts, { [modeId]: r.context });
+            await api('update_swimlane', { id: laneId, mode_contexts: lane.mode_contexts });
+            delete modeBusy[laneId];
+            if (lane.mode_id === modeId) await setLaneMode(laneId, modeId, { quiet: true });
+            toast(`📖 Contesto ${modeLabel(mode)} di ${lane.name} pronto`, 'success');
+        } catch (e) {
+            toast('Contesto non generato: ' + e.message, 'error');
+        } finally { delete modeBusy[laneId]; render(); }
+    }
+
+    function modeChipHtml(lane) {
+        if (!lane.local_path || (!lane.mode_id && !modeBusy[lane.id])) return '';
+        const m = modeById(lane.mode_id);
+        const txt = modeBusy[lane.id] ? '⏳ ' + modeBusy[lane.id] : modeLabel(m) || '?';
+        return `<span class="mode-chip${modeBusy[lane.id] ? ' busy' : ''}" title="Modalità di lavoro del progetto: clicca per cambiarla" onclick="event.stopPropagation();modeChipMenu(event,'${lane.id}')">${escHtml(txt)}</span>`;
+    }
+    function modeChipMenu(e, laneId) {
+        const lane = boardData.swimlanes.find(l => l.id === laneId);
+        const r = e.currentTarget.getBoundingClientRect();
+        ctxCloseAll();
+        ctxEl = ctxBuild([{ head: 'Modalità di ' + lane.name }].concat(modeMenuItems(lane)), r.left, r.bottom + 2);
+    }
+    function modeMenuItems(lane) {
+        return [{ label: 'Nessuna (tutto come prima)', checked: !lane.mode_id, action: () => lane.mode_id && setLaneMode(lane.id, '') }]
+            .concat(workModes().map(m => ({ label: modeLabel(m), checked: lane.mode_id === m.id, action: () => lane.mode_id !== m.id && setLaneMode(lane.id, m.id) })))
+            .concat(['-',
+                lane.mode_id ? { label: 'Rigenera contesto della modalità', icon: '📖', action: () => modeGenContext(lane.id, lane.mode_id) } : null,
+                { label: 'Fissi di questo progetto…', icon: '📌', action: () => modeEditPinned(lane.id) },
+                { label: 'Gestisci modalità…', icon: '🎛️', action: () => claudeNav('modes') }]);
+    }
+
+    // Barra in Contesto (progetto scelto): modalità attiva + cambio
+    function modeProjectBarHtml(pr) {
+        const lane = boardData.swimlanes.find(l => l.local_path && l.local_path.toLowerCase() === String(pr.dir).toLowerCase());
+        if (!lane) return '';
+        const st = pr.mode;
+        const opts = '<option value="">— nessuna —</option>' + workModes().map(m => `<option value="${escHtml(m.id)}" ${lane.mode_id === m.id ? 'selected' : ''}>${escHtml(modeLabel(m))}</option>`).join('');
+        return `<div class="mode-bar">🎛️ <b>Modalità</b>
+            <select onchange="setLaneMode('${lane.id}', this.value)" ${modeBusy[lane.id] ? 'disabled' : ''}>${opts}</select>
+            ${modeBusy[lane.id] ? `<span class="dash-sub">⏳ ${escHtml(modeBusy[lane.id])}</span>` : ''}
+            ${st && st.summary ? `<span class="dash-sub">applicata ${escHtml(ctxWhen(st.applied_at))}: ${st.summary.pluginsOn.length} plugin, ${st.summary.skillsKept} skill tenute, ${st.summary.skillsHidden} nascoste (richiamabili con /nome)</span>` : ''}
+            ${lane.mode_id && !(st && st.mode && st.mode.id === lane.mode_id) && !modeBusy[lane.id] ? `<span class="git-tag warn">non applicata su questo PC</span> <button class="btn" onclick="setLaneMode('${lane.id}','${escHtml(lane.mode_id)}')">Applica</button>` : ''}
+            <span style="flex:1"></span>
+            ${lane.mode_id ? `<button class="btn" onclick="modeGenContext('${lane.id}','${escHtml(lane.mode_id)}')" title="Claude rilegge il progetto e riscrive il contesto della modalità">📖 Rigenera contesto</button>` : ''}
+            <button class="btn" onclick="modeEditPinned('${lane.id}')">📌 Fissi del progetto (${Object.keys((lane.mode_pinned || {}).plugins || {}).length + ((lane.mode_pinned || {}).skills || []).length})</button>
+            <button class="btn" onclick="claudeNav('modes')">Gestisci modalità</button>
+        </div>`;
+    }
+
+    // Lancio di Claude da un task con categoria: se il progetto è in un'altra modalità, chiede sempre
+    async function modeLaunchCheck(card, lane) {
+        const want = card.work_mode_id && modeById(card.work_mode_id);
+        if (!want || !lane || !lane.local_path || lane.mode_id === want.id) return;
+        const cur = modeById(lane.mode_id);
+        if (!confirm(`Il task è «${modeLabel(want)}», il progetto ${lane.name} è ${cur ? 'in «' + modeLabel(cur) + '»' : 'senza modalità'}.\nPasso il progetto a «${modeLabel(want)}» prima di aprire la sessione?`)) return;
+        await setLaneMode(lane.id, want.id);
+    }
+
     // === MENU DEL TASTO DESTRO ===
     // ctxMenu(e, voci): voce = { label, icon, action, danger, disabled, checked, sub: [voci] },
     // '-' per un separatore, { head: 'testo' } per un titoletto. Shift+destro = menu del browser.
@@ -5950,6 +6393,9 @@ $dataJson = json_encode(ykanPublicData($data));
             { label: 'Sposta in colonna', icon: '➡️', sub: cols.map(c => ({ label: c.name, checked: c.id === card.column_id, action: () => c.id !== card.column_id && cardMoveTo(card, { column_id: c.id, version_id: curVer }) })) },
             { label: 'Sposta in progetto', icon: '📁', sub: boardData.swimlanes.slice().sort((a, b) => a.position - b.position).map(l => ({ label: l.name, checked: l.id === card.swimlane_id, action: () => l.id !== card.swimlane_id && cardMoveTo(card, { swimlane_id: l.id }) })) },
             { label: 'Priorità', icon: '🚩', sub: [['high', 'Alta'], ['medium', 'Media'], ['low', 'Bassa']].map(([v, n]) => ({ label: n, checked: card.priority === v, action: () => cardPatch(card, { priority: v }) })) },
+            workModes().length ? { label: 'Categoria', icon: '🎛️', sub: [{ label: 'Nessuna', checked: !card.work_mode_id, action: () => cardPatch(card, { work_mode_id: null }) }]
+                .concat(workModes().map(m => ({ label: (m.icon || '🎛️') + ' ' + m.name, checked: card.work_mode_id === m.id, action: () => cardPatch(card, { work_mode_id: m.id }) })))
+                .concat(['-', { label: 'Suggerisci categoria', icon: '✨', action: () => cardSuggestMode(card) }]) } : null,
             { label: 'Etichetta', icon: '🔖', sub: [{ label: 'Nessuna', checked: !card.label_id, action: () => cardPatch(card, { label_id: null }) }].concat(boardData.labels.map(l => ({ label: l.name, checked: card.label_id === l.id, action: () => cardPatch(card, { label_id: l.id }) }))) },
             '-',
             { label: 'Fai lavorare Claude', icon: '🤖', sub: [
@@ -5963,6 +6409,46 @@ $dataJson = json_encode(ykanPublicData($data));
             { label: 'Archivia', icon: '📦', action: () => cardArchive(card) },
             { label: 'Elimina definitivamente', icon: '🗑️', danger: true, action: () => permanentDeleteCard(card.id) }
         ];
+    }
+
+    // Suggerimento categoria: prima Claude dal Bridge (legge il progetto e conosce le skill), poi l'AI della board
+    async function suggestModeFor(title, description, lane) {
+        const task = { title, description, project: lane ? lane.name : '' };
+        const modes = workModes().map(m => ({ id: m.id, name: m.name, description: m.description || '',
+            keep: Object.entries(m.plugins || {}).map(([k, v]) => v === 'all' ? k.split('@')[0] : v.join(', ')).concat(m.skills || []).join(', ') }));
+        try {
+            const r = await ctxCall('/claude/mode/suggest', { dir: lane && lane.local_path ? lane.local_path : '', task, modes });
+            return Object.assign({ success: true }, r);
+        } catch (e) { console.warn('Suggerisci categoria: Claude dal Bridge non disponibile, uso l\'AI della board:', e.message); }
+        return await api('ai_suggest_mode', task);
+    }
+    // Dal popup: legge titolo/descrizione dal form (anche per card nuove) e imposta la select, salvi tu
+    async function cardModalSuggestMode(btn) {
+        const title = document.getElementById('cardTitleInput')?.value || '';
+        if (!title.trim()) { toast('Scrivi prima il titolo', 'error'); return; }
+        const lane = boardData.swimlanes.find(l => l.id === document.getElementById('cardSwimlaneId').value);
+        btn.disabled = true; btn.textContent = '✨ …';
+        const r = await suggestModeFor(title, document.getElementById('cardDescInput')?.value || '', lane);
+        btn.disabled = false; btn.textContent = '✨ Suggerisci';
+        if (!r || !r.success) return;
+        const m = r.mode_id && modeById(r.mode_id);
+        if (!m) { toast('Nessuna categoria adatta' + (r.reason ? ': ' + r.reason : ''), 'info'); return; }
+        document.getElementById('cardModeInput').value = m.id;
+        toast(`✨ ${m.icon || ''} ${m.name}: ${r.reason || ''} (${r.by === 'claude' ? 'Claude' : r.by || 'AI'} · salva per confermare)`, 'success');
+    }
+    async function cardSuggestMode(card) {
+        toast('✨ Claude legge il task… (può volerci mezzo minuto)');
+        const lane = boardData.swimlanes.find(l => l.id === card.swimlane_id);
+        const r = await suggestModeFor(card.title, card.description || '', lane);
+        if (!r || !r.success) return;
+        const m = r.mode_id && modeById(r.mode_id);
+        if (!m) { toast('Nessuna categoria adatta' + (r.reason ? ': ' + r.reason : ''), 'info'); return; }
+        if (card.work_mode_id === m.id) { toast(`Ha già la categoria giusta: ${m.icon || ''} ${m.name}`, 'success'); return; }
+        if (confirm(`Categoria suggerita da ${r.by === 'claude' ? 'Claude' : r.by || 'AI'}: ${m.icon || ''} ${m.name}
+
+${r.reason || ''}
+
+Assegnarla al task?`)) cardPatch(card, { work_mode_id: m.id });
     }
 
     function pasteItem(colId, laneId, verId) {
@@ -6000,6 +6486,7 @@ $dataJson = json_encode(ykanPublicData($data));
             { label: 'Nuovo task (attuale)', icon: '＋', action: () => openCardModal(null, firstCol.id, lane.id, vers[0].id) },
             pasteItem(firstCol.id, lane.id, vers[0].id),
             { label: 'Nuova riga versione', icon: '➕', action: () => addVersionRow(lane.id) },
+            lane.local_path ? { label: 'Modalità di lavoro', icon: '🎛️', sub: modeMenuItems(lane) } : null,
             { label: 'Apri tutte le righe', icon: '▼', action: () => setAll(true) },
             { label: 'Chiudi tutte le righe', icon: '▲', action: () => setAll(false) },
             '-',
@@ -6087,6 +6574,7 @@ $dataJson = json_encode(ykanPublicData($data));
                     <div class="card-priority ${card.priority}"></div>
                     ${card.seq ? `<span class="card-seq" title="ID task — dì «risolvi il task ${card.seq}»">#${card.seq}</span>` : ''}
                     <div class="card-title">${escHtml(card.title)}</div>
+                    ${(() => { const wm = card.work_mode_id && modeById(card.work_mode_id); return wm ? `<span class="card-mode" title="Categoria: ${escHtml(wm.name)}" style="font-size:12px">${escHtml(wm.icon || '🎛️')}</span>` : ''; })()}
                     ${hasFiles ? `<span title="${card.files.length} file associati" style="font-size:12px">📁</span>` : ''}
                     ${isRecurring ? '<span title="Task autorigenerante" style="font-size:12px">🔄</span>' : ''}
                     ${runBadge}
@@ -8779,7 +9267,14 @@ $dataJson = json_encode(ykanPublicData($data));
             : '';
     }
 
+    function fillCardMode(card) {
+        const sel = document.getElementById('cardModeInput');
+        sel.innerHTML = '<option value="">— nessuna —</option>' + workModes().map(m => `<option value="${escHtml(m.id)}">${escHtml((m.icon ? m.icon + ' ' : '') + m.name)}</option>`).join('');
+        sel.value = (card && card.work_mode_id && workModes().some(m => m.id === card.work_mode_id)) ? card.work_mode_id : '';
+    }
+
     function openCardModal(cardId = null, colId = null, laneId = null, verId = null) {
+        fillCardMode(cardId ? boardData.cards.find(c => c.id === cardId) : null);
         const modal = document.getElementById('cardModal');
         const form = document.getElementById('cardForm');
         const deleteBtn = document.getElementById('deleteCardBtn');
@@ -9046,13 +9541,14 @@ $dataJson = json_encode(ykanPublicData($data));
         window.location.href = 'https://claude.ai/new';
     }
 
-    function playCardInTerminal() {
+    async function playCardInTerminal() {
         const cardId = document.getElementById('cardId').value;
         if (!cardId) return;
         const card = boardData.cards.find(c => c.id === cardId);
         if (!card) return;
         const lane = boardData.swimlanes.find(l => l.id === card.swimlane_id);
         if (!lane || !lane.local_path) return;
+        await modeLaunchCheck(card, lane);
         const prompt = cardTaskPrompt(card);
 
         // Fixed session id: lets the Dashboard know this session belongs to this task
@@ -9078,13 +9574,14 @@ $dataJson = json_encode(ykanPublicData($data));
     // Claude Desktop sempre, qualunque sia session_open_mode: su questo PC deep link
     // claude://code/new con la cartella del progetto (Desktop chiede conferma), su un PC
     // collegato il Bridge lancia Claude Code e a fine lavoro apre la sessione in Desktop.
-    function openCardInClaudeDesktop() {
+    async function openCardInClaudeDesktop() {
         const cardId = document.getElementById('cardId').value;
         if (!cardId) return;
         const card = boardData.cards.find(c => c.id === cardId);
         if (!card) return;
         const lane = boardData.swimlanes.find(l => l.id === card.swimlane_id);
         if (!lane) return;
+        await modeLaunchCheck(card, lane);
         const prompt = cardTaskPrompt(card);
         closeCardModal();
         if (bridgeIsRemote()) {
@@ -9242,7 +9739,8 @@ $dataJson = json_encode(ykanPublicData($data));
             estimate: document.getElementById('cardEstimateInput').value || null,
             parallel: document.getElementById('cardParallel').checked,
             depends_on: cardDepends.map(Number),
-            acceptance: cardAcc.map(a => ({ text: a.text, done: !!a.done }))
+            acceptance: cardAcc.map(a => ({ text: a.text, done: !!a.done })),
+            work_mode_id: document.getElementById('cardModeInput').value || null
         };
 
         const verSel = document.getElementById('cardVersionInput');
@@ -9559,6 +10057,7 @@ $dataJson = json_encode(ykanPublicData($data));
         document.querySelectorAll('#claudeView .dash-tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
         claudeRenderBody();
         if (name === 'context' && !ctxState.inv) ctxLoad();
+        if (name === 'modes' && modeCat === undefined) modeLoadCatalog();
         if (name === 'news' && !newsState.data && !newsState.busy) newsLoad();
         if (name === 'wa') waLoad(); else clearTimeout(waState.timer);
         aiEdgeContext();
@@ -9959,6 +10458,7 @@ $dataJson = json_encode(ykanPublicData($data));
         if (!pr) return '<div class="dash-empty">Leggo le sessioni del progetto…</div>';
         const used = Object.entries(pr.usage.skills).sort((a, b) => b[1].count - a[1].count);
         let html = `<div class="dash-sub" style="margin:0 0 8px">${pr.usage.sessions} sessioni lette · contesto effettivo ~${ctxK(pr.totalTokens)} token · gli interruttori qui scrivono in <code>.claude/settings.local.json</code> del progetto.</div>`;
+        html += modeProjectBarHtml(pr);
         html += `<div style="margin:6px 0 12px">${ctxOptimizeHtml(pr.dir)}</div>`;
         html += pr.plugins.slice().sort((a, b) => b.tokens - a.tokens).map(p => ctxPluginCard(p, pr.dir)).join('');
         html += `<div class="dash-sub" style="margin-top:8px"><b>Skill usate davvero qui:</b> ${used.length ? used.map(([n, u]) => `${escHtml(n)} ×${u.count} (${ctxWhen(u.last)})`).join(' · ') : 'nessuna'}</div>`;
@@ -9979,7 +10479,7 @@ $dataJson = json_encode(ykanPublicData($data));
         document.querySelectorAll('#claudeNav button').forEach(b => b.classList.toggle('active', b.dataset.tab === claudeTabName));
         document.getElementById('claudeTitle').textContent = sideNavTitle('claudeNav', claudeTabName) || 'Claude';
         claudeRenderBody();
-        await Promise.all([claudeFetchSkills(), claudeFetchMemory(), claudeFetchPlugins(), claudeTabName === 'context' ? ctxLoad() : null]);
+        await Promise.all([claudeFetchSkills(), claudeFetchMemory(), claudeFetchPlugins(), claudeTabName === 'context' ? ctxLoad() : null, claudeTabName === 'modes' && !modeCat ? modeLoadCatalog() : null]);
     }
 
     function claudeProjectChanged() {
@@ -10042,7 +10542,9 @@ $dataJson = json_encode(ykanPublicData($data));
             memory: memNow && memNow.files ? memNow.files.length : '',
             rc: Array.isArray(rcServers) ? rcServers.filter(x => ['running', 'starting', 'waiting'].includes(x.status)).length || '' : '',
             routines: (boardData.routines || []).length || '' };
-        if (claudeTabName === 'context') {
+        if (claudeTabName === 'modes') {
+            body.innerHTML = modesHtml();
+        } else if (claudeTabName === 'context') {
             body.innerHTML = ctxRender();
         } else if (claudeTabName === 'news') {
             body.innerHTML = newsHtml();
