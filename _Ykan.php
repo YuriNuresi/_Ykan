@@ -528,7 +528,7 @@ function ykanAuthPage(string $error = ''): never {
     $err = $error !== '' ? '<p class="err">' . htmlspecialchars($error) . '</p>' : '';
     echo <<<HTML
 <!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Ykan — accesso</title><style>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 32 32%27%3E%3Crect width=%2732%27 height=%2732%27 rx=%277%27 fill=%27%23378ADD%27/%3E%3Crect x=%276%27 y=%277%27 width=%275%27 height=%2718%27 rx=%271.5%27 fill=%27%23fff%27/%3E%3Crect x=%2713.5%27 y=%277%27 width=%275%27 height=%2712%27 rx=%271.5%27 fill=%27%23fff%27 opacity=%27.85%27/%3E%3Crect x=%2721%27 y=%277%27 width=%275%27 height=%277%27 rx=%271.5%27 fill=%27%23fff%27 opacity=%27.7%27/%3E%3C/svg%3E"><title>Ykan — accesso</title><style>
 :root{--bg:#f6f6f4;--card:#fff;--text:#1d1d1b;--muted:#6b6b66;--border:#e3e3de;--accent:#2563eb}
 @media (prefers-color-scheme:dark){:root{--bg:#141412;--card:#1e1e1b;--text:#ececea;--muted:#9a9a94;--border:#2e2e2a}}
 body{margin:0;min-height:100vh;display:grid;place-items:center;background:var(--bg);color:var(--text);font-family:system-ui,sans-serif;padding:16px}
@@ -808,6 +808,64 @@ function generateId(string $prefix = 'id'): string {
     return $prefix . '_' . bin2hex(random_bytes(8));
 }
 
+// === RIGHE VERSIONE DENTRO UN PROGETTO ========================================
+// lane.versions = [{id, name, archived?}] in ordine: la prima non archiviata è "l'attuale".
+// Una riga eliminata resta con archived=true, così i task che ne hanno fatto parte
+// mantengono il legame (card.version_id + card.version_history con le date).
+// Un progetto senza 'versions' ha una sola riga implicita: la si crea al primo bisogno.
+
+function ykanLaneVersionsInit(array &$lane): void {
+    if (empty($lane['versions'])) $lane['versions'] = [['id' => generateId('ver'), 'name' => 'Attuale']];
+}
+
+function ykanActiveVersions(array $lane): array {
+    return array_values(array_filter($lane['versions'] ?? [], fn($v) => empty($v['archived'])));
+}
+
+/** Versione effettiva di un task: la sua se è una riga attiva, altrimenti la prima. */
+function ykanCardVersion(array $card, array $lane): string {
+    $ids = array_column(ykanActiveVersions($lane), 'id');
+    if (!$ids) return '';
+    return in_array($card['version_id'] ?? '', $ids, true) ? $card['version_id'] : $ids[0];
+}
+
+/** Sposta un task su una versione aggiornando lo storico (chiude la voce aperta, ne apre una nuova). */
+function ykanSetCardVersion(array &$card, array $lane, string $vid): void {
+    $cur = ykanCardVersion($card, $lane);
+    $names = array_column($lane['versions'] ?? [], 'name', 'id');
+    $now = date('Y-m-d H:i:s');
+    $created = $card['created_at'] ?? $now;
+    $hist = $card['version_history'] ?? [];
+    $n = count($hist) - 1;
+    if (!$hist) {
+        // primo ingresso nello storico: la versione implicita di prima conta da quando è nato il task
+        if ($cur !== '' && $cur !== $vid) $hist[] = ['id' => $cur, 'name' => $names[$cur] ?? '', 'from' => $created, 'to' => $now];
+        $hist[] = ['id' => $vid, 'name' => $names[$vid] ?? '', 'from' => $cur === $vid ? $created : $now];
+    } elseif ($hist[$n]['id'] !== $vid || !empty($hist[$n]['to'])) {
+        if (empty($hist[$n]['to'])) $hist[$n]['to'] = $now;
+        $hist[] = ['id' => $vid, 'name' => $names[$vid] ?? '', 'from' => $now];
+    }
+    $card['version_id'] = $vid;
+    $card['version_history'] = $hist;
+}
+
+/** Scrive version_id su ogni task del progetto che ne è senza (prima di riordinare/eliminare righe). */
+function ykanStampLaneVersions(array &$data, array $lane): void {
+    foreach ($data['cards'] as &$c) {
+        if (($c['swimlane_id'] ?? '') !== $lane['id']) continue;
+        $v = ykanCardVersion($c, $lane);
+        if ($v !== '' && ($c['version_id'] ?? '') !== $v) ykanSetCardVersion($c, $lane, $v);
+    }
+    unset($c);
+}
+
+function ykanIsDoneColumn(array $data, string $colId): bool {
+    foreach ($data['columns'] as $col) {
+        if ($col['id'] === $colId) return (bool)preg_match('/done|fatto|chius|completat/i', (string)$col['name']);
+    }
+    return false;
+}
+
 // === SHORT TASK IDS (#25) =====================================================
 // Every card carries a short, globally-progressive integer 'seq' shown on the
 // board and via MCP, so a task can be referenced as "#25" from the phone.
@@ -966,6 +1024,14 @@ function ykanAiJson(string $text): ?array {
 function ykanGithubToken(array $data): string {
     $env = ykanEnv('GITHUB_TOKEN');
     return $env !== '' ? $env : (string)($data['config']['github_token'] ?? '');
+}
+
+// Repository su cui lavorano gli endpoint github_*: quello del progetto passato dal browser
+// (owner/repo), altrimenti quello globale di Settings.
+function ykanGithubRepo(array $data, array $input): string {
+    $r = trim((string)($input['repo'] ?? ''));
+    if ($r !== '' && preg_match('/^[\w.-]+\/[\w.-]+$/', $r)) return $r;
+    return (string)($data['config']['github_repo'] ?? '');
 }
 
 // === MCP project root + safe file browsing (shared model with mcp.php) ========
@@ -1604,6 +1670,110 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['api'])) {
                 return ['success' => true];
             })(),
 
+            // Righe versione di un progetto: add / rename / move / promote / delete
+            'version_op' => (function() use (&$data, $input) {
+                $li = null;
+                foreach ($data['swimlanes'] as $i => $l) if ($l['id'] === ($input['lane_id'] ?? '')) $li = $i;
+                if ($li === null) return ['success' => false, 'error' => 'Progetto non trovato'];
+                $lane = &$data['swimlanes'][$li];
+                ykanLaneVersionsInit($lane);
+                ykanStampLaneVersions($data, $lane);
+                $active = array_column(ykanActiveVersions($lane), 'id');
+                $vid = (string)($input['version_id'] ?? '');
+                if ($vid === '') $vid = $active[0];
+                $vIdx = null;
+                foreach ($lane['versions'] as $i => $v) if ($v['id'] === $vid) $vIdx = $i;
+                $op = (string)($input['op'] ?? '');
+                $name = trim((string)($input['name'] ?? ''));
+                if ($op !== 'add' && ($vIdx === null || !in_array($vid, $active, true))) return ['success' => false, 'error' => 'Riga non trovata'];
+
+                if ($op === 'add') {
+                    if ($name === '') return ['success' => false, 'error' => 'Nome mancante'];
+                    $lane['versions'][] = ['id' => generateId('ver'), 'name' => mb_substr($name, 0, 60)];
+                } elseif ($op === 'rename') {
+                    if ($name === '') return ['success' => false, 'error' => 'Nome mancante'];
+                    $lane['versions'][$vIdx]['name'] = mb_substr($name, 0, 60);
+                    foreach ($data['cards'] as &$c) {
+                        if (($c['swimlane_id'] ?? '') !== $lane['id']) continue;
+                        foreach (($c['version_history'] ?? []) as $k => $h) if ($h['id'] === $vid) $c['version_history'][$k]['name'] = $lane['versions'][$vIdx]['name'];
+                    }
+                    unset($c);
+                } elseif ($op === 'move') {
+                    // scambia con la riga attiva vicina (la prima resta "l'attuale")
+                    $pos = array_search($vid, $active, true) + ((int)($input['dir'] ?? 0) < 0 ? -1 : 1);
+                    if (!isset($active[$pos])) return ['success' => false, 'error' => 'Spostamento non possibile'];
+                    $oIdx = null;
+                    foreach ($lane['versions'] as $i => $v) if ($v['id'] === $active[$pos]) $oIdx = $i;
+                    [$lane['versions'][$vIdx], $lane['versions'][$oIdx]] = [$lane['versions'][$oIdx], $lane['versions'][$vIdx]];
+                } elseif ($op === 'promote' || $op === 'delete') {
+                    $to = (string)($input['to'] ?? '');
+                    $hasOpen = false;
+                    foreach ($data['cards'] as $c) {
+                        if (($c['swimlane_id'] ?? '') === $lane['id'] && empty($c['archived']) && ykanCardVersion($c, $lane) === $vid && !ykanIsDoneColumn($data, $c['column_id'])) $hasOpen = true;
+                    }
+                    if ($op === 'delete' && count($active) <= 1) return ['success' => false, 'error' => 'È l\'unica riga del progetto'];
+                    if (($op === 'promote' || $hasOpen) && ($to === $vid || !in_array($to, $active, true))) return ['success' => false, 'error' => 'Riga di destinazione non valida'];
+                    $now = date('Y-m-d H:i:s');
+                    foreach ($data['cards'] as &$c) {
+                        if (($c['swimlane_id'] ?? '') !== $lane['id'] || !empty($c['archived']) || ykanCardVersion($c, $lane) !== $vid) continue;
+                        if (ykanIsDoneColumn($data, $c['column_id'])) {
+                            // promuovi: i fatti restano nella loro versione; elimina riga: vanno in archivio
+                            if ($op === 'delete') { $c['archived'] = true; $c['archived_at'] = $now; }
+                            continue;
+                        }
+                        ykanSetCardVersion($c, $lane, $to);
+                    }
+                    unset($c);
+                    if ($op === 'delete') {
+                        // chiude lo storico dei task rimasti in quella versione e la tiene come archiviata
+                        foreach ($data['cards'] as &$c) {
+                            if (($c['swimlane_id'] ?? '') !== $lane['id'] || empty($c['version_history'])) continue;
+                            $n = count($c['version_history']) - 1;
+                            if ($c['version_history'][$n]['id'] === $vid && empty($c['version_history'][$n]['to'])) $c['version_history'][$n]['to'] = $now;
+                        }
+                        unset($c);
+                        $lane['versions'][$vIdx]['archived'] = true;
+                        $lane['versions'][$vIdx]['archived_at'] = $now;
+                    }
+                } else {
+                    return ['success' => false, 'error' => 'Operazione sconosciuta'];
+                }
+                $out = $lane;
+                unset($lane);
+                saveData($data);
+                return ['success' => true, 'swimlane' => $out,
+                    'cards' => array_values(array_filter($data['cards'], fn($c) => ($c['swimlane_id'] ?? '') === $out['id']))];
+            })(),
+
+            // Una tantum: le etichette "stable" / "prossima versione" diventano righe versione
+            'migrate_version_labels' => (function() use (&$data) {
+                $next = array_column(array_filter($data['labels'] ?? [], fn($l) => preg_match('/prossima\s*versione/i', (string)$l['name'])), 'id');
+                $stable = array_column(array_filter($data['labels'] ?? [], fn($l) => preg_match('/^\s*stable\s*$/i', (string)$l['name'])), 'id');
+                if (!$next && !$stable) return ['success' => true, 'moved' => 0];
+                @file_put_contents(__DIR__ . '/_Ykan_backup_versions_u' . ykanCurrentUserId() . '_' . date('Ymd_His') . '.json', json_encode($data, JSON_UNESCAPED_UNICODE));
+                $moved = 0;
+                foreach ($data['swimlanes'] as &$lane) {
+                    $mine = array_filter($data['cards'], fn($c) => ($c['swimlane_id'] ?? '') === $lane['id'] && in_array($c['label_id'] ?? null, $next, true));
+                    if (!$mine) continue;
+                    ykanLaneVersionsInit($lane);
+                    ykanStampLaneVersions($data, $lane);
+                    $vid = null;
+                    foreach (ykanActiveVersions($lane) as $v) if (preg_match('/prossima\s*versione/i', $v['name'])) $vid = $v['id'];
+                    if (!$vid) { $vid = generateId('ver'); $lane['versions'][] = ['id' => $vid, 'name' => 'Prossima versione']; }
+                    foreach ($data['cards'] as &$c) {
+                        if (($c['swimlane_id'] ?? '') === $lane['id'] && in_array($c['label_id'] ?? null, $next, true)) { ykanSetCardVersion($c, $lane, $vid); $moved++; }
+                    }
+                    unset($c);
+                }
+                unset($lane);
+                $gone = array_merge($next, $stable);
+                foreach ($data['cards'] as &$c) if (in_array($c['label_id'] ?? null, $gone, true)) $c['label_id'] = null;
+                unset($c);
+                $data['labels'] = array_values(array_filter($data['labels'], fn($l) => !in_array($l['id'], $gone, true)));
+                saveData($data);
+                return ['success' => true, 'moved' => $moved];
+            })(),
+
             'reorder_swimlanes' => (function() use (&$data, $input) {
                 $order = $input['order'] ?? [];
                 foreach ($data['swimlanes'] as &$lane) {
@@ -1714,6 +1884,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['api'])) {
                     'created_at' => date('Y-m-d H:i:s'),
                     'regenerated_count' => 0
                 ];
+                foreach ($data['swimlanes'] as $l) {
+                    if ($l['id'] === $card['swimlane_id'] && !empty($l['versions'])) {
+                        $vid = (string)($input['version_id'] ?? '');
+                        if (!in_array($vid, array_column(ykanActiveVersions($l), 'id'), true)) $vid = ykanCardVersion($card, $l);
+                        ykanSetCardVersion($card, $l, $vid);
+                    }
+                }
                 $data['cards'][] = $card;
                 saveData($data);
                 return ['success' => true, 'card' => $card];
@@ -1723,14 +1900,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['api'])) {
                 foreach ($data['cards'] as &$card) {
                     if ($card['id'] === $input['id']) {
                         $prevCol = $card['column_id'] ?? null;
-                        $card = array_merge($card, array_filter($input, fn($k) => $k !== 'id', ARRAY_FILTER_USE_KEY));
+                        $newVer = $input['version_id'] ?? null;
+                        $card = array_merge($card, array_filter($input, fn($k) => !in_array($k, ['id', 'version_id', 'version_history'], true), ARRAY_FILTER_USE_KEY));
+                        if ($newVer !== null) {
+                            foreach ($data['swimlanes'] as &$l) {
+                                if ($l['id'] !== $card['swimlane_id']) continue;
+                                ykanLaneVersionsInit($l);
+                                if (in_array($newVer, array_column(ykanActiveVersions($l), 'id'), true)) ykanSetCardVersion($card, $l, $newVer);
+                            }
+                            unset($l);
+                        }
                         $card['updated_at'] = date('Y-m-d H:i:s');
                         if (($card['column_id'] ?? null) !== $prevCol) $card['moved_at'] = $card['updated_at'];
+                        $found = $card;
                         break;
                     }
                 }
+                unset($card);
                 saveData($data);
-                return ['success' => true];
+                return ['success' => true, 'card' => $found ?? null];
             })(),
 
             'move_card' => (function() use (&$data, $input) {
@@ -1740,13 +1928,33 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['api'])) {
                             $card['moved_at'] = date('Y-m-d H:i:s');
                             $card['updated_at'] = $card['moved_at'];
                         }
+                        $laneChanged = ($card['swimlane_id'] ?? '') !== $input['swimlane_id'];
                         $card['column_id'] = $input['column_id'];
                         $card['swimlane_id'] = $input['swimlane_id'];
                         $card['position'] = $input['position'] ?? 0;
+                        // Riga versione: quella di arrivo; cambiando progetto senza riga si va sulla sua prima
+                        if ($laneChanged) unset($card['version_id']);
+                        foreach ($data['swimlanes'] as &$l) {
+                            if ($l['id'] !== $card['swimlane_id']) continue;
+                            $vid = (string)($input['version_id'] ?? '');
+                            if ($vid === '' && empty($l['versions'])) break;
+                            ykanLaneVersionsInit($l);
+                            if (!in_array($vid, array_column(ykanActiveVersions($l), 'id'), true)) $vid = ykanCardVersion($card, $l);
+                            ykanSetCardVersion($card, $l, $vid);
+                            break;
+                        }
+                        unset($l);
                         break;
                     }
                 }
+                unset($card);
                 saveData($data);
+                foreach ($data['swimlanes'] as $l) {
+                    if ($l['id'] === $input['swimlane_id'] && !empty($l['versions'])) {
+                        return ['success' => true, 'swimlane' => $l,
+                            'cards' => array_values(array_filter($data['cards'], fn($c) => ($c['swimlane_id'] ?? '') === $l['id']))];
+                    }
+                }
                 return ['success' => true];
             })(),
 
@@ -2576,9 +2784,9 @@ PROMPT;
             })(),
 
             // GitHub API - List Issues
-            'github_issues' => (function() use ($data) {
+            'github_issues' => (function() use ($data, $input) {
                 $token = ykanGithubToken($data);
-                $repo = $data['config']['github_repo'] ?? '';
+                $repo = ykanGithubRepo($data, $input);
                 if (empty($token) || empty($repo)) {
                     return ['success' => false, 'error' => 'GitHub not configured. Go to Settings.'];
                 }
@@ -2612,9 +2820,9 @@ PROMPT;
             })(),
 
             // GitHub API - List Pull Requests
-            'github_prs' => (function() use ($data) {
+            'github_prs' => (function() use ($data, $input) {
                 $token = ykanGithubToken($data);
-                $repo = $data['config']['github_repo'] ?? '';
+                $repo = ykanGithubRepo($data, $input);
                 if (empty($token) || empty($repo)) {
                     return ['success' => false, 'error' => 'GitHub not configured'];
                 }
@@ -2642,9 +2850,9 @@ PROMPT;
             })(),
 
             // GitHub API - List Commits
-            'github_commits' => (function() use ($data) {
+            'github_commits' => (function() use ($data, $input) {
                 $token = ykanGithubToken($data);
-                $repo = $data['config']['github_repo'] ?? '';
+                $repo = ykanGithubRepo($data, $input);
                 if (empty($token) || empty($repo)) {
                     return ['success' => false, 'error' => 'GitHub not configured'];
                 }
@@ -2674,7 +2882,7 @@ PROMPT;
             // GitHub API - Create Issue from Card
             'github_create_issue' => (function() use ($data, $input) {
                 $token = ykanGithubToken($data);
-                $repo = $data['config']['github_repo'] ?? '';
+                $repo = ykanGithubRepo($data, $input);
                 if (empty($token) || empty($repo)) {
                     return ['success' => false, 'error' => 'GitHub not configured'];
                 }
@@ -2722,7 +2930,7 @@ PROMPT;
             // GitHub API - Close Issue
             'github_close_issue' => (function() use ($data, $input) {
                 $token = ykanGithubToken($data);
-                $repo = $data['config']['github_repo'] ?? '';
+                $repo = ykanGithubRepo($data, $input);
                 if (empty($token) || empty($repo)) {
                     return ['success' => false, 'error' => 'GitHub not configured'];
                 }
@@ -2760,11 +2968,21 @@ PROMPT;
             })(),
 
             // GitHub API - Repo Info
-            'github_repo_info' => (function() use ($data) {
+            'github_repo_info' => (function() use ($data, $input) {
                 $token = ykanGithubToken($data);
-                $repo = $data['config']['github_repo'] ?? '';
-                if (empty($token) || empty($repo)) {
-                    return ['success' => false, 'error' => 'GitHub not configured'];
+                $repo = ykanGithubRepo($data, $input);
+                if (empty($token)) return ['success' => false, 'error' => 'Token GitHub mancante (né in .env né in Settings)'];
+                if (empty($repo)) {
+                    // nessun repository globale: basta verificare che il token sia valido
+                    $ch = curl_init('https://api.github.com/user');
+                    curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 15, CURLOPT_HTTPHEADER => [
+                        "Authorization: Bearer {$token}", 'Accept: application/vnd.github+json', 'User-Agent: _Ykan-Kanban', 'X-GitHub-Api-Version: 2022-11-28']]);
+                    $response = curl_exec($ch);
+                    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                    curl_close($ch);
+                    if ($httpCode !== 200) return ['success' => false, 'error' => $httpCode === 401 ? 'Token GitHub non valido o scaduto' : 'GitHub API error: ' . $httpCode];
+                    $u = json_decode($response, true);
+                    return ['success' => true, 'user' => $u['login'] ?? '?'];
                 }
 
                 $ch = curl_init("https://api.github.com/repos/{$repo}");
@@ -3513,6 +3731,7 @@ $dataJson = json_encode(ykanPublicData($data));
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 32 32%27%3E%3Crect width=%2732%27 height=%2732%27 rx=%277%27 fill=%27%23378ADD%27/%3E%3Crect x=%276%27 y=%277%27 width=%275%27 height=%2718%27 rx=%271.5%27 fill=%27%23fff%27/%3E%3Crect x=%2713.5%27 y=%277%27 width=%275%27 height=%2712%27 rx=%271.5%27 fill=%27%23fff%27 opacity=%27.85%27/%3E%3Crect x=%2721%27 y=%277%27 width=%275%27 height=%277%27 rx=%271.5%27 fill=%27%23fff%27 opacity=%27.7%27/%3E%3C/svg%3E">
     <title>_Ykan - <?= htmlspecialchars($data['config']['project_name'] ?? 'Kanban') ?></title>
     <style>
         :root {
@@ -3573,8 +3792,6 @@ $dataJson = json_encode(ykanPublicData($data));
         .swimlane.collapsed .cells-row { display: none; }
         .swimlane.collapsed .column-header-row { border-bottom: none; }
         .swimlane-name { font-weight: 600; font-size: 14px; color: var(--text); user-select: none; }
-        .swimlane-actions { margin-left: auto; display: flex; gap: 4px; opacity: 0; transition: opacity 0.15s; }
-        .swimlane:hover .swimlane-actions { opacity: 1; }
 
         /* Columns */
         .columns-row { display: flex; }
@@ -3586,6 +3803,33 @@ $dataJson = json_encode(ykanPublicData($data));
         .column-count { font-size: 11px; background: var(--bg); padding: 2px 6px; border-radius: 10px; color: var(--text2); }
         .column-actions { display: flex; gap: 2px; opacity: 0; transition: opacity 0.15s; }
         .column-header:hover .column-actions { opacity: 1; }
+
+        /* Righe versione dentro un progetto */
+        .ver-head { display: flex; align-items: center; gap: 8px; padding: 5px 12px; background: var(--bg2); border-bottom: 1px solid var(--border); cursor: pointer; font-size: 12px; }
+        .ver-row + .ver-row .ver-head { border-top: 2px solid var(--border); }
+        .ver-toggle { font-size: 10px; color: var(--text2); transition: transform 0.2s; }
+        .ver-row.closed .ver-toggle { transform: rotate(-90deg); }
+        .ver-row.closed .cells-row { display: none; }
+        .ver-name { font-weight: 600; color: var(--text); }
+        .ver-tag { font-size: 10px; padding: 1px 6px; border-radius: 8px; background: var(--accent); color: #fff; }
+        .ver-count { color: var(--text2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+
+        /* Menu del tasto destro */
+        .ctx-menu { position: fixed; z-index: 10000; min-width: 200px; max-width: 280px; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 8px 28px rgba(0,0,0,.22); padding: 4px; font-size: 13px; user-select: none; }
+        .ctx-item { display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-radius: 5px; cursor: pointer; position: relative; white-space: nowrap; }
+        .ctx-item:hover, .ctx-item.open { background: var(--bg2); }
+        .ctx-item.disabled { opacity: .4; pointer-events: none; }
+        .ctx-item.danger { color: var(--high); }
+        .ctx-item .ctx-ico { width: 16px; text-align: center; flex-shrink: 0; }
+        .ctx-item .ctx-lbl { flex: 1; overflow: hidden; text-overflow: ellipsis; }
+        .ctx-item .ctx-check { color: var(--accent); }
+        .ctx-item .ctx-arrow { color: var(--text2); font-size: 10px; }
+        /* Chiave inglese: apre lo stesso menu del tasto destro (utile da mobile) */
+        .ctx-btn { flex-shrink: 0; border: none; background: transparent; color: var(--text2); cursor: pointer; padding: 0 3px; border-radius: 4px; font-size: 14px; line-height: 18px; opacity: .55; }
+        .ctx-btn:hover { opacity: 1; background: var(--bg3); color: var(--text); }
+        .swimlane-header > .ctx-btn, .ver-head > .ctx-btn { margin-left: auto; }
+        .ctx-sep { height: 1px; background: var(--border); margin: 4px 6px; }
+        .ctx-head { padding: 4px 10px 2px; font-size: 11px; color: var(--text2); text-transform: uppercase; letter-spacing: .04em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
         /* Cells */
         .cells-row { display: flex; }
@@ -3647,8 +3891,24 @@ $dataJson = json_encode(ykanPublicData($data));
         .archive-panel { position: fixed; right: 0; top: 0; bottom: 0; width: 350px; background: var(--bg3); border-left: 1px solid var(--border); transform: translateX(100%); transition: transform 0.3s; z-index: 500; overflow-y: auto; }
         .archive-panel.open { transform: translateX(0); }
         .archive-header { padding: 16px; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; }
-        .archive-list { padding: 12px; }
-        .archive-card { opacity: 0.7; }
+        .archive-card { opacity: 0.85; cursor: pointer; }
+        /* Pagina Archivio (dentro il kanban) */
+        .archive-view { display: none; }
+        #kanbanView.archive-mode .archive-view { display: block; }
+        #kanbanView.archive-mode > .filters-bar:not(.arc-bar), #kanbanView.archive-mode > .board-container { display: none; }
+        .arc-total { font-size: 12px; color: var(--text2); margin: 4px 0 10px; }
+        .arc-group { border: 1px solid rgba(var(--tone), .3); border-radius: var(--radius); margin-bottom: 14px; overflow: hidden; }
+        .arc-group-head { display: flex; align-items: center; gap: 8px; padding: 8px 12px; background: linear-gradient(90deg, rgba(var(--tone), .18), transparent 70%), var(--bg2); border-left: 3px solid rgb(var(--tone)); }
+        .arc-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 8px; padding: 10px; }
+        .arc-grid .card { margin: 0; }
+        .arc-ver { display: inline-block; font-size: 10px; padding: 1px 6px; border-radius: 4px; background: var(--bg3); border: 1px solid var(--border); color: var(--text2); margin: 0 4px 6px 0; }
+        /* Pannelli GitHub e PM ospitati nelle pagine di Progetti */
+        .dash-hosted { position: static !important; transform: none !important; width: auto !important; max-width: none !important; height: auto; box-shadow: none !important; z-index: auto !important; border: 1px solid var(--border) !important; border-radius: var(--radius); }
+        .dash-hosted.github-panel .github-header, .dash-hosted.pm-panel .pm-head .btn-icon { display: none; }
+        .dash-hosted.pm-panel .pm-head h3 { display: none; }
+        .dash-hosted .pm-body, .dash-hosted .github-content { overflow: visible; }
+        .dash-gh-wrap { margin-top: 18px; }
+        .dash-gh-title { font-size: 14px; margin: 0 0 8px; }
 
         /* GitHub Panel */
         .github-panel { position: fixed; right: 0; top: 0; bottom: 0; width: 420px; background: var(--bg3); border-left: 1px solid var(--border); transform: translateX(100%); transition: transform 0.3s; z-index: 501; display: flex; flex-direction: column; }
@@ -3658,6 +3918,9 @@ $dataJson = json_encode(ykanPublicData($data));
         .github-tab { flex: 1; padding: 10px; text-align: center; cursor: pointer; font-size: 12px; border: none; background: none; color: var(--text2); transition: all 0.2s; }
         .github-tab:hover { background: var(--bg2); }
         .github-tab.active { color: var(--accent); border-bottom: 2px solid var(--accent); margin-bottom: -1px; }
+        .gh-badge:empty { display: none; }
+        .gh-badge { display: inline-block; min-width: 18px; padding: 0 5px; margin-left: 4px; border-radius: 9px; font-size: 10px; line-height: 16px; background: var(--bg2); color: var(--text2); }
+        .gh-badge.hot { background: var(--accent); color: #fff; font-weight: 600; }
         .github-content { flex: 1; padding: 12px; overflow-y: auto; }
         .github-item { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 12px; margin-bottom: 8px; cursor: pointer; transition: border-color 0.2s; }
         .github-item:hover { border-color: var(--accent); }
@@ -4309,6 +4572,7 @@ $dataJson = json_encode(ykanPublicData($data));
             <button id="tabDash" class="side-head" onclick="showView('dashboard')">📁 Progetti</button>
             <div id="dashTabs" class="side-group side-sub" data-for="dashboard">
                 <button data-tab="focus" onclick="dashTab('focus')">🎯 Focus <span class="dash-count"></span></button>
+                <button data-tab="pm" onclick="dashTab('pm')">📋 PM <span class="dash-count"></span></button>
                 <button data-tab="resume" onclick="dashTab('resume')">⏸️ Da riprendere <span class="dash-count"></span></button>
                 <button data-tab="week" onclick="dashTab('week')">📅 Attività <span class="dash-count"></span></button>
                 <button data-tab="review" onclick="dashTab('review')">👀 Revisione sessioni <span class="dash-count"></span></button>
@@ -4394,9 +4658,7 @@ $dataJson = json_encode(ykanPublicData($data));
             <h2>Kanban</h2>
             <span style="flex:1"></span>
             <button class="btn btn-primary" onclick="quickAddCard()" title="Aggiungi una card rapidamente">＋ Nuova card</button>
-            <button class="btn" onclick="toggleArchive()" title="Card archiviate">📦 Archive</button>
-            <button class="btn" onclick="toggleGithub()" title="Issues, PR e commit di GitHub">🐙 GitHub</button>
-            <button class="btn" onclick="togglePm()" title="PM — PRD / epic / breakdown">📋 PM</button>
+            <button class="btn" id="archiveBtn" onclick="toggleArchive()" title="Task archiviati">📦 Archive</button>
             <button class="btn" onclick="exportJSON()" title="Export JSON">📥 JSON</button>
             <button class="btn" onclick="exportCSV()" title="Export CSV">📊 CSV</button>
         </div>
@@ -4431,6 +4693,25 @@ $dataJson = json_encode(ykanPublicData($data));
             <div id="board" class="board"></div>
             <button class="add-swimlane-btn" onclick="addSwimlane()">+ Add Swimlane</button>
         </div>
+        <!-- Archivio: stessa pagina del kanban, al posto della board -->
+        <div id="archiveView" class="archive-view">
+            <div class="filters-bar arc-bar">
+                <button class="btn" onclick="toggleArchive()">← Torna al kanban</button>
+                <input type="text" id="arcSearch" class="search-input" placeholder="🔍 Cerca: titolo, descrizione, #ID…" oninput="renderArchive()">
+                <select id="arcProject" class="filter-select" onchange="arcFillVersions();renderArchive()"></select>
+                <select id="arcVersion" class="filter-select" onchange="renderArchive()"></select>
+                <select id="arcLabel" class="filter-select" onchange="renderArchive()"></select>
+                <select id="arcPeriod" class="filter-select" onchange="renderArchive()">
+                    <option value="">Archiviati: sempre</option>
+                    <option value="7">ultimi 7 giorni</option>
+                    <option value="30">ultimi 30 giorni</option>
+                    <option value="90">ultimi 90 giorni</option>
+                    <option value="365">ultimo anno</option>
+                </select>
+                <button class="btn btn-icon" onclick="arcClear()" title="Azzera filtri">✕</button>
+            </div>
+            <div id="archiveList"></div>
+        </div>
     </section>
 
     <!-- Dashboard (scheda: cose non chiuse + attività recente, con sessioni Claude collegate ai task) -->
@@ -4457,6 +4738,8 @@ $dataJson = json_encode(ykanPublicData($data));
             <span class="dash-legend"><i class="st-todo"></i>To Do <i class="st-doing"></i>Claude Do / In corso <i class="st-done"></i>Fatto / archiviato</span>
         </div>
         <div id="dashboardBody"></div>
+        <!-- Pannelli GitHub/PM mostrati nelle pagine Git e PM: fuori da #dashboardBody, che viene riscritto con innerHTML -->
+        <div id="dashHosted"></div>
     </section>
 
     <!-- Gemini Panel -->
@@ -4493,14 +4776,6 @@ $dataJson = json_encode(ykanPublicData($data));
 
     <button type="button" class="ai-edge" id="aiEdge" onclick="toggleGemini()" title="Another AI: apri o chiudi la barra">◂ ✨ Another AI</button>
 
-    <!-- Archive Panel -->
-    <div id="archivePanel" class="archive-panel">
-        <div class="archive-header">
-            <h3>Archive</h3>
-            <button class="btn btn-icon" onclick="toggleArchive()">&times;</button>
-        </div>
-        <div id="archiveList" class="archive-list"></div>
-    </div>
 
     <!-- GitHub Panel -->
     <div id="githubPanel" class="github-panel">
@@ -4510,14 +4785,13 @@ $dataJson = json_encode(ykanPublicData($data));
         </div>
         <div id="githubRepoStats" class="github-repo-stats" style="display:none"></div>
         <div class="github-tabs">
-            <button class="github-tab active" onclick="switchGithubTab('issues')">🐛 Issues</button>
-            <button class="github-tab" onclick="switchGithubTab('prs')">🔀 Pull Requests</button>
-            <button class="github-tab" onclick="switchGithubTab('commits')">📜 Commits</button>
+            <button class="github-tab active" onclick="switchGithubTab('commits')">📜 Commits <span class="gh-badge" data-gh="commits"></span></button>
+            <button class="github-tab" onclick="switchGithubTab('prs')">🔀 Pull Requests <span class="gh-badge" data-gh="prs"></span></button>
+            <button class="github-tab" onclick="switchGithubTab('issues')">🐛 Issues <span class="gh-badge" data-gh="issues"></span></button>
         </div>
         <div id="githubContent" class="github-content">
             <div class="github-empty">
-                <p>Configure GitHub Token and Repository in Settings to see issues, PRs and commits.</p>
-                <button class="btn btn-primary" onclick="openConfigModal()" style="margin-top:12px">⚙️ Settings</button>
+                <p>Scegli un progetto dal filtro in alto.</p>
             </div>
         </div>
     </div>
@@ -4618,6 +4892,11 @@ $dataJson = json_encode(ykanPublicData($data));
                                 <select id="cardLabelInput">
                                     <option value="">None</option>
                                 </select>
+                            </div>
+                            <div class="form-group">
+                                <label>Versione</label>
+                                <select id="cardVersionInput"></select>
+                                <div id="cardVersionHistory" style="font-size:11px;color:var(--text2);margin-top:4px"></div>
                             </div>
                             <div class="cm-grid2">
                                 <div class="form-group">
@@ -5329,9 +5608,9 @@ $dataJson = json_encode(ykanPublicData($data));
     const ykanGithubEnvToken = <?= ykanEnv('GITHUB_TOKEN') !== '' ? 'true' : 'false' ?>;
     const ykanAnthropicEnvKey = <?= ykanEnv('ANTHROPIC_KEY') !== '' ? 'true' : 'false' ?>;
     let draggedCard = null;
-    // Which swimlanes are collapsed, persisted across render() calls so moving/editing
-    // a card doesn't reset every project back to "all collapsed".
-    let collapsedLanes = new Set(boardData.swimlanes.map(l => l.id));
+    // I progetti restano sempre aperti: si aprono/chiudono le loro righe versione (versionOpen).
+    // Il Set resta vuoto per chi lo legge ancora (Home, PM).
+    let collapsedLanes = new Set();
 
     // === API ===
     async function api(action, data = {}) {
@@ -5377,8 +5656,7 @@ $dataJson = json_encode(ykanPublicData($data));
             .sort((a, b) => a.position - b.position)
             .map((lane, index) => `
                 <div class="swimlane${collapsedLanes.has(lane.id) ? ' collapsed' : ''}" data-lane-id="${lane.id}" style="--lane:${laneRgb(lane)}">
-                    <div class="swimlane-header" onclick="toggleSwimlane('${lane.id}', event)">
-                        <span class="swimlane-toggle">▼</span>
+                    <div class="swimlane-header" style="cursor:default">
                         <span class="swimlane-name">${escHtml(lane.name)}</span>
                         <label class="lane-color" title="Colore del progetto" onclick="event.stopPropagation()">
                             <i class="ti ti-pencil" aria-hidden="true"></i>
@@ -5389,23 +5667,7 @@ $dataJson = json_encode(ykanPublicData($data));
                         ${lane.local_path ? `<span title="Sessioni Claude Code locali" onclick="event.stopPropagation();openSessionsModal('${lane.id}')" style="cursor:pointer;font-size:13px">🕒</span>` : ''}
                         ${lane.local_path ? `<span title="Apri terminale locale" onclick="event.stopPropagation();openTerminalModal('${lane.id}')" style="cursor:pointer;font-size:13px">🖥️</span>` : ''}
                         ${(lane.doc_files && lane.doc_files.length) ? `<span title="${lane.doc_files.length} file di documentazione assegnati" style="font-size:12px;cursor:pointer" onclick="event.stopPropagation();openDocsModal('${lane.id}')">📄${lane.doc_files.length}</span>` : ''}
-                        <div class="swimlane-actions" onclick="event.stopPropagation()">
-                            <button class="btn btn-icon" onclick="renameSwimlane('${lane.id}')" title="Rinomina">
-                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
-                            </button>
-                            <button class="btn btn-icon" onclick="openDocsModal('${lane.id}')" title="Documentazione del progetto (file per l'AI)">
-                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 11-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 11-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 11-2.83-2.83l.06-.06a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H3a2 2 0 110-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 112.83-2.83l.06.06a1.65 1.65 0 001.82.33H9a1.65 1.65 0 001-1.51V3a2 2 0 114 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 112.83 2.83l-.06.06a1.65 1.65 0 00-.33 1.82V9a1.65 1.65 0 001.51 1H21a2 2 0 110 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg>
-                            </button>
-                            <button class="btn btn-icon" onclick="moveSwimlane('${lane.id}', -1)" title="Sposta su" ${index === 0 ? 'disabled style="opacity:0.3"' : ''}>
-                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 15l-6-6-6 6"/></svg>
-                            </button>
-                            <button class="btn btn-icon" onclick="moveSwimlane('${lane.id}', 1)" title="Sposta giù" ${index === boardData.swimlanes.length - 1 ? 'disabled style="opacity:0.3"' : ''}>
-                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>
-                            </button>
-                            <button class="btn btn-icon btn-danger" onclick="deleteSwimlane('${lane.id}')" title="Elimina">
-                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>
-                            </button>
-                        </div>
+                        <button type="button" class="ctx-btn" title="Azioni (anche col tasto destro)" onclick="ctxFromButton(event)"><i class="ti ti-tool" aria-hidden="true"></i></button>
                     </div>
                     <div class="column-header-row">
                         ${boardData.columns.sort((a, b) => a.position - b.position).map(col => {
@@ -5424,24 +5686,368 @@ $dataJson = json_encode(ykanPublicData($data));
                         }).join('')}
                         <button class="add-column-btn" onclick="addColumn()">+</button>
                     </div>
-                    <div class="cells-row">
-                        ${boardData.columns.sort((a, b) => a.position - b.position).map(col => `
-                            <div class="cell" data-col-id="${col.id}" data-lane-id="${lane.id}"
-                                ondragover="onDragOver(event)" ondragleave="onDragLeave(event)" ondrop="onDrop(event)">
-                                ${activeCards
-                                    .filter(c => c.column_id === col.id && c.swimlane_id === lane.id)
-                                    .sort((a, b) => a.position - b.position)
-                                    .map(card => renderCard(card)).join('')}
-                                <button class="add-card-btn" onclick="openCardModal(null, '${col.id}', '${lane.id}')">+ Add Card</button>
-                            </div>
-                        `).join('')}
-                    </div>
+                    ${laneVersions(lane).map((ver, vi, vers) => renderVersionRow(lane, ver, vi, vers, activeCards)).join('')}
                 </div>
             `).join('');
 
         renderArchive();
         refreshEpicFilter();
     }
+
+    // === RIGHE VERSIONE ===
+    // lane.versions in ordine, la prima attiva è "l'attuale". Senza versions il progetto ha
+    // una sola riga implicita (id ''), che il server crea davvero alla prima operazione.
+    function laneVersions(lane) {
+        const v = (lane.versions || []).filter(x => !x.archived);
+        return v.length ? v : [{ id: '', name: 'Attuale' }];
+    }
+    function cardVersion(card, lane) {
+        const v = laneVersions(lane);
+        return v.some(x => x.id === card.version_id) ? card.version_id : v[0].id;
+    }
+    // aperta/chiusa: all'avvio solo l'attuale del primo progetto, finché non le tocchi
+    const versionOpen = {};
+    function isVersionOpen(laneId, verId, index) {
+        const k = laneId + '|' + verId;
+        if (k in versionOpen) return versionOpen[k];
+        const first = boardData.swimlanes.slice().sort((a, b) => a.position - b.position)[0];
+        return index === 0 && !!first && first.id === laneId;
+    }
+    function toggleVersionRow(laneId, verId, index) {
+        versionOpen[laneId + '|' + verId] = !isVersionOpen(laneId, verId, index);
+        render();
+    }
+
+    function renderVersionRow(lane, ver, vi, vers, activeCards) {
+        const cols = boardData.columns.slice().sort((a, b) => a.position - b.position);
+        const mine = activeCards.filter(c => c.swimlane_id === lane.id && cardVersion(c, lane) === ver.id);
+        const open = isVersionOpen(lane.id, ver.id, vi);
+        const summary = mine.length
+            ? `${mine.length} task (` + cols.map(col => [col.name, mine.filter(c => c.column_id === col.id).length]).filter(x => x[1]).map(x => `${x[1]} ${escHtml(x[0])}`).join(', ') + ')'
+            : 'vuota';
+        const vid = escHtml(ver.id);
+        return `
+            <div class="ver-row${open ? '' : ' closed'}${vi === 0 ? ' ver-current' : ''}">
+                <div class="ver-head" onclick="toggleVersionRow('${lane.id}', '${vid}', ${vi})">
+                    <span class="ver-toggle">▼</span>
+                    <span class="ver-name">${escHtml(ver.name)}</span>
+                    ${vi === 0 ? '<span class="ver-tag">attuale</span>' : ''}
+                    <span class="ver-count">${summary}</span>
+                    <button type="button" class="ctx-btn" title="Azioni (anche col tasto destro)" onclick="ctxFromButton(event)"><i class="ti ti-tool" aria-hidden="true"></i></button>
+                </div>
+                <div class="cells-row">
+                    ${cols.map(col => `
+                        <div class="cell" data-col-id="${col.id}" data-lane-id="${lane.id}" data-version-id="${vid}"
+                            ondragover="onDragOver(event)" ondragleave="onDragLeave(event)" ondrop="onDrop(event)">
+                            ${mine.filter(c => c.column_id === col.id)
+                                .sort((a, b) => a.position - b.position)
+                                .map(card => renderCard(card)).join('')}
+                            <button class="add-card-btn" onclick="openCardModal(null, '${col.id}', '${lane.id}', '${vid}')">+ Add Card</button>
+                        </div>
+                    `).join('')}
+                </div>
+            </div>`;
+    }
+
+    // Applica la risposta di version_op: progetto aggiornato + tutte le sue card
+    function applyVersionResult(r) {
+        if (!r || !r.success) return false;
+        const i = boardData.swimlanes.findIndex(l => l.id === r.swimlane.id);
+        if (i >= 0) boardData.swimlanes[i] = r.swimlane;
+        boardData.cards = boardData.cards.filter(c => c.swimlane_id !== r.swimlane.id).concat(r.cards || []);
+        render();
+        return true;
+    }
+    async function addVersionRow(laneId) {
+        const name = (prompt('Nome della nuova riga (es. v3, Prossima versione, Altre idee):') || '').trim();
+        if (!name) return;
+        const r = await api('version_op', { op: 'add', lane_id: laneId, name });
+        if (applyVersionResult(r)) {
+            collapsedLanes.delete(laneId);
+            render();
+        }
+    }
+    async function renameVersionRow(laneId, verId) {
+        const lane = boardData.swimlanes.find(l => l.id === laneId);
+        const ver = laneVersions(lane).find(v => v.id === verId);
+        const name = (prompt('Nome riga:', ver ? ver.name : '') || '').trim();
+        if (!name || (ver && name === ver.name)) return;
+        applyVersionResult(await api('version_op', { op: 'rename', lane_id: laneId, version_id: verId, name }));
+    }
+    async function moveVersionRow(laneId, verId, dir) {
+        applyVersionResult(await api('version_op', { op: 'move', lane_id: laneId, version_id: verId, dir }));
+    }
+    async function promoteVersion(laneId, verId, sel) {
+        const to = sel.value;
+        if (!to) return;
+        const lane = boardData.swimlanes.find(l => l.id === laneId);
+        const vers = laneVersions(lane);
+        const from = vers.find(v => v.id === verId), dest = vers.find(v => v.id === to);
+        if (!confirm(`Spostare tutti i task non fatti di "${from.name}" in "${dest.name}"?\nI task in Done restano in "${from.name}".`)) { sel.value = ''; return; }
+        if (applyVersionResult(await api('version_op', { op: 'promote', lane_id: laneId, version_id: verId, to }))) {
+            versionOpen[laneId + '|' + to] = true;
+            render();
+        } else sel.value = '';
+    }
+    function deleteVersionRow(laneId, verId) {
+        const lane = boardData.swimlanes.find(l => l.id === laneId);
+        const vers = laneVersions(lane);
+        const ver = vers.find(v => v.id === verId);
+        const mine = boardData.cards.filter(c => !c.archived && c.swimlane_id === laneId && cardVersion(c, lane) === verId);
+        const done = mine.filter(c => DASH_DONE_RE.test((boardData.columns.find(x => x.id === c.column_id) || {}).name || ''));
+        const open = mine.length - done.length;
+        const others = vers.filter(v => v.id !== verId);
+        const ov = document.createElement('div');
+        ov.className = 'modal-overlay active';
+        ov.innerHTML = `
+            <div class="modal" style="max-width:440px">
+                <h2>Elimina riga "${escHtml(ver.name)}"</h2>
+                <p style="font-size:13px;color:var(--text2);margin:8px 0 14px">
+                    ${open ? `${open} task ancora aperti: dove li sposto?` : 'Nessun task aperto in questa riga.'}
+                    ${done.length ? `<br>${done.length} task in Done verranno archiviati.` : ''}
+                    <br>I task restano legati a "${escHtml(ver.name)}" nello storico.</p>
+                ${open ? `<select id="verDelTo" style="width:100%;margin-bottom:14px">${others.map(v => `<option value="${escHtml(v.id)}">${escHtml(v.name)}</option>`).join('')}</select>` : ''}
+                <div style="display:flex;gap:8px;justify-content:flex-end">
+                    <button type="button" class="btn" data-x="cancel">Annulla</button>
+                    <button type="button" class="btn btn-danger" data-x="ok">Elimina riga</button>
+                </div>
+            </div>`;
+        document.body.appendChild(ov);
+        ov.addEventListener('click', async e => {
+            const x = e.target.dataset && e.target.dataset.x;
+            if (e.target === ov || x === 'cancel') { ov.remove(); return; }
+            if (x !== 'ok') return;
+            const sel = ov.querySelector('#verDelTo');
+            const to = sel ? sel.value : (others[0] || {}).id;
+            ov.remove();
+            applyVersionResult(await api('version_op', { op: 'delete', lane_id: laneId, version_id: verId, to }));
+        });
+    }
+
+    // === MENU DEL TASTO DESTRO ===
+    // ctxMenu(e, voci): voce = { label, icon, action, danger, disabled, checked, sub: [voci] },
+    // '-' per un separatore, { head: 'testo' } per un titoletto. Shift+destro = menu del browser.
+    let ctxEl = null;
+    function ctxClose() { if (ctxEl) { ctxEl.remove(); ctxEl = null; } }
+    function ctxBuild(items, x, y) {
+        const m = document.createElement('div');
+        m.className = 'ctx-menu';
+        items.filter(Boolean).forEach(it => {
+            if (it === '-') { m.insertAdjacentHTML('beforeend', '<div class="ctx-sep"></div>'); return; }
+            if (it.head) { const h = document.createElement('div'); h.className = 'ctx-head'; h.textContent = it.head; m.appendChild(h); return; }
+            const el = document.createElement('div');
+            el.className = 'ctx-item' + (it.danger ? ' danger' : '') + (it.disabled ? ' disabled' : '');
+            el.innerHTML = `<span class="ctx-ico">${it.checked ? '<span class="ctx-check">✓</span>' : (it.icon || '')}</span><span class="ctx-lbl"></span>${it.sub ? '<span class="ctx-arrow">▶</span>' : ''}`;
+            el.querySelector('.ctx-lbl').textContent = it.label;
+            if (it.sub) {
+                let subEl = null;
+                el.addEventListener('mouseenter', () => {
+                    m.querySelectorAll(':scope > .ctx-item.open').forEach(o => { o.classList.remove('open'); o._sub && o._sub.remove(); });
+                    const r = el.getBoundingClientRect();
+                    subEl = ctxBuild(it.sub.length ? it.sub : [{ label: '(nessuna)', disabled: true }], r.right - 4, r.top - 4);
+                    subEl.dataset.sub = '1';
+                    el._sub = subEl;
+                    el.classList.add('open');
+                    // se sfora a destra va a sinistra della voce
+                    const sr = subEl.getBoundingClientRect();
+                    if (sr.right > innerWidth) subEl.style.left = Math.max(4, r.left - sr.width + 4) + 'px';
+                });
+            } else {
+                el.addEventListener('mouseenter', () => m.querySelectorAll(':scope > .ctx-item.open').forEach(o => { o.classList.remove('open'); o._sub && o._sub.remove(); }));
+                el.addEventListener('click', ev => { ev.stopPropagation(); ctxCloseAll(); it.action && it.action(); });
+            }
+            m.appendChild(el);
+        });
+        document.body.appendChild(m);
+        const r = m.getBoundingClientRect();
+        m.style.left = Math.max(4, Math.min(x, innerWidth - r.width - 4)) + 'px';
+        m.style.top = Math.max(4, Math.min(y, innerHeight - r.height - 4)) + 'px';
+        return m;
+    }
+    // La chiave inglese simula un tasto destro sotto di sé: stesso menu, stesso listener
+    function ctxFromButton(e) {
+        e.stopPropagation();
+        e.preventDefault();
+        const r = e.currentTarget.getBoundingClientRect();
+        e.currentTarget.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: r.right - 200, clientY: r.bottom + 2 }));
+    }
+    function ctxCloseAll() { document.querySelectorAll('.ctx-menu').forEach(m => m.remove()); ctxEl = null; }
+    function ctxMenu(e, items) {
+        e.preventDefault();
+        ctxCloseAll();
+        ctxEl = ctxBuild(items, e.clientX, e.clientY);
+    }
+    document.addEventListener('mousedown', e => { if (!e.target.closest('.ctx-menu')) ctxCloseAll(); });
+    document.addEventListener('keydown', e => { if (e.key === 'Escape') ctxCloseAll(); });
+    window.addEventListener('blur', ctxCloseAll);
+    window.addEventListener('resize', ctxCloseAll);
+    // chiude solo se scorre la pagina o la board, non la console o altri pannelli che si aggiornano da soli
+    document.addEventListener('scroll', e => {
+        const t = e.target, board = document.getElementById('board');
+        if (t === document || (t.contains && t.contains(board))) ctxCloseAll();
+    }, true);
+
+    // Appunti interni per copia/taglia/incolla dei task
+    let cardClip = null; // { id, cut }
+    function cardCopyFields(c) {
+        return { title: c.title, description: c.description || '', priority: c.priority || 'medium', label_id: c.label_id || null,
+            files: c.files || [], epic: c.epic || null, estimate: c.estimate || null, parallel: !!c.parallel,
+            acceptance: (c.acceptance || []).map(a => ({ text: a.text, done: false })) };
+    }
+    async function cardPasteAt(colId, laneId, verId) {
+        const src = cardClip && boardData.cards.find(c => c.id === cardClip.id);
+        if (!src) { cardClip = null; return; }
+        if (cardClip.cut) {
+            await cardMoveTo(src, { column_id: colId, swimlane_id: laneId, version_id: verId || '' });
+            cardClip = null;
+        } else {
+            const r = await api('add_card', Object.assign(cardCopyFields(src), { title: src.title + ' (copia)', column_id: colId, swimlane_id: laneId, version_id: verId || '' }));
+            if (r.success) { boardData.cards.push(r.card); render(); }
+        }
+    }
+    async function cardMoveTo(card, to) {
+        const t = Object.assign({ column_id: card.column_id, swimlane_id: card.swimlane_id, version_id: '' }, to);
+        card.column_id = t.column_id; card.swimlane_id = t.swimlane_id;
+        if (t.version_id) card.version_id = t.version_id;
+        render();
+        const r = await api('move_card', { id: card.id, column_id: t.column_id, swimlane_id: t.swimlane_id, version_id: t.version_id });
+        if (r.success && r.swimlane) applyVersionResult(r);
+    }
+    async function cardPatch(card, patch) {
+        Object.assign(card, patch);
+        render();
+        await api('update_card', Object.assign({ id: card.id }, patch));
+    }
+    // Le azioni del popup leggono il task da #cardId: lo imposto e le chiamo (aprendo il popup se mostrano risultati lì)
+    function cardRun(card, fn, showModal) {
+        if (showModal) openCardModal(card.id);
+        else document.getElementById('cardId').value = card.id;
+        fn();
+    }
+    async function cardArchive(card) {
+        card.archived = true;
+        card.archived_at = new Date().toISOString().split('T')[0];
+        render();
+        const r = await api('archive_card', { id: card.id });
+        if (r.regenerated && r.new_card) { boardData.cards.push(r.new_card); render(); }
+    }
+
+    function cardContextItems(card) {
+        const lane = boardData.swimlanes.find(l => l.id === card.swimlane_id);
+        const vers = lane ? laneVersions(lane) : [];
+        const curVer = lane ? cardVersion(card, lane) : '';
+        const cols = boardData.columns.slice().sort((a, b) => a.position - b.position);
+        const files = (card.files || []).length > 0;
+        return [
+            { head: (card.seq ? '#' + card.seq + ' ' : '') + card.title },
+            { label: 'Apri', icon: '📝', action: () => openCardModal(card.id) },
+            { label: 'Copia', icon: '📋', action: () => { cardClip = { id: card.id, cut: false }; toast('Task copiato: tasto destro su una riga o cella → Incolla', 'success'); } },
+            { label: 'Taglia', icon: '✂️', action: () => { cardClip = { id: card.id, cut: true }; toast('Task tagliato: tasto destro su una riga o cella → Incolla', 'success'); } },
+            { label: 'Duplica qui', icon: '⧉', action: () => { cardClip = { id: card.id, cut: false }; cardPasteAt(card.column_id, card.swimlane_id, curVer); } },
+            { label: 'Copia testo (#ID titolo)', icon: '🔗', action: () => navigator.clipboard.writeText(`#${card.seq || ''} ${card.title}`).then(() => toast('Copiato negli appunti', 'success')) },
+            '-',
+            vers.length > 1 ? { label: 'Sposta in versione', icon: '🏷️', sub: vers.map(v => ({ label: v.name, checked: v.id === curVer, action: () => v.id !== curVer && cardMoveTo(card, { version_id: v.id }) })) } : null,
+            { label: 'Sposta in colonna', icon: '➡️', sub: cols.map(c => ({ label: c.name, checked: c.id === card.column_id, action: () => c.id !== card.column_id && cardMoveTo(card, { column_id: c.id, version_id: curVer }) })) },
+            { label: 'Sposta in progetto', icon: '📁', sub: boardData.swimlanes.slice().sort((a, b) => a.position - b.position).map(l => ({ label: l.name, checked: l.id === card.swimlane_id, action: () => l.id !== card.swimlane_id && cardMoveTo(card, { swimlane_id: l.id }) })) },
+            { label: 'Priorità', icon: '🚩', sub: [['high', 'Alta'], ['medium', 'Media'], ['low', 'Bassa']].map(([v, n]) => ({ label: n, checked: card.priority === v, action: () => cardPatch(card, { priority: v }) })) },
+            { label: 'Etichetta', icon: '🔖', sub: [{ label: 'Nessuna', checked: !card.label_id, action: () => cardPatch(card, { label_id: null }) }].concat(boardData.labels.map(l => ({ label: l.name, checked: card.label_id === l.id, action: () => cardPatch(card, { label_id: l.id }) }))) },
+            '-',
+            { label: 'Fai lavorare Claude', icon: '🤖', sub: [
+                lane && lane.local_path ? { label: 'Claude Terminale', icon: '⌨️', action: () => cardRun(card, playCardInTerminal) } : null,
+                lane ? { label: 'Claude Desktop', icon: '🖥️', action: () => cardRun(card, openCardInClaudeDesktop) } : null,
+                { label: 'Claude Web', icon: '🌐', action: () => cardRun(card, openInClaudeApp) },
+                { label: 'Claude Agent API', icon: '🏖️', action: () => cardRun(card, executeWithClaude, true) },
+                files ? { label: 'AI Verify', icon: '✅', action: () => cardRun(card, verifyTaskWithAI, true) } : null
+            ].filter(Boolean) },
+            '-',
+            { label: 'Archivia', icon: '📦', action: () => cardArchive(card) },
+            { label: 'Elimina definitivamente', icon: '🗑️', danger: true, action: () => permanentDeleteCard(card.id) }
+        ];
+    }
+
+    function pasteItem(colId, laneId, verId) {
+        const src = cardClip && boardData.cards.find(c => c.id === cardClip.id);
+        return { label: src ? `Incolla "${src.title.slice(0, 30)}"${cardClip.cut ? ' (sposta)' : ''}` : 'Incolla', icon: '📥', disabled: !src, action: () => cardPasteAt(colId, laneId, verId) };
+    }
+
+    function versionContextItems(lane, ver, vi, vers) {
+        const firstCol = boardData.columns.slice().sort((a, b) => a.position - b.position)[0];
+        const open = isVersionOpen(lane.id, ver.id, vi);
+        return [
+            { head: lane.name + ' · ' + ver.name },
+            { label: open ? 'Chiudi riga' : 'Apri riga', icon: open ? '▲' : '▼', action: () => toggleVersionRow(lane.id, ver.id, vi) },
+            { label: 'Nuovo task qui', icon: '＋', action: () => openCardModal(null, firstCol.id, lane.id, ver.id) },
+            pasteItem(firstCol.id, lane.id, ver.id),
+            '-',
+            vi > 0 ? { label: 'Promuovi tasks a', icon: '⏫', sub: vers.filter(x => x.id !== ver.id).map(x => ({ label: x.name, action: () => { const sel = document.createElement('select'); sel.innerHTML = `<option value="${escHtml(x.id)}" selected></option>`; promoteVersion(lane.id, ver.id, sel); } })) } : null,
+            { label: 'Rinomina riga', icon: '✏️', action: () => renameVersionRow(lane.id, ver.id) },
+            { label: 'Sposta su', icon: '↑', disabled: vi === 0, action: () => moveVersionRow(lane.id, ver.id, -1) },
+            { label: 'Sposta giù', icon: '↓', disabled: vi === vers.length - 1, action: () => moveVersionRow(lane.id, ver.id, 1) },
+            { label: 'Nuova riga versione', icon: '➕', action: () => addVersionRow(lane.id) },
+            '-',
+            { label: 'Elimina riga', icon: '🗑️', danger: true, disabled: vers.length < 2, action: () => deleteVersionRow(lane.id, ver.id) }
+        ];
+    }
+
+    function laneContextItems(lane) {
+        const lanes = boardData.swimlanes.slice().sort((a, b) => a.position - b.position);
+        const idx = lanes.findIndex(l => l.id === lane.id);
+        const vers = laneVersions(lane);
+        const firstCol = boardData.columns.slice().sort((a, b) => a.position - b.position)[0];
+        const setAll = v => { vers.forEach(x => { versionOpen[lane.id + '|' + x.id] = v; }); render(); };
+        return [
+            { head: lane.name },
+            { label: 'Nuovo task (attuale)', icon: '＋', action: () => openCardModal(null, firstCol.id, lane.id, vers[0].id) },
+            pasteItem(firstCol.id, lane.id, vers[0].id),
+            { label: 'Nuova riga versione', icon: '➕', action: () => addVersionRow(lane.id) },
+            { label: 'Apri tutte le righe', icon: '▼', action: () => setAll(true) },
+            { label: 'Chiudi tutte le righe', icon: '▲', action: () => setAll(false) },
+            '-',
+            safeUrl(lane.url) ? { label: 'Apri sito', icon: '🌐', action: () => window.open(safeUrl(lane.url), '_blank', 'noopener') } : null,
+            lane.local_path ? { label: 'Terminale', icon: '🖥️', action: () => openTerminalModal(lane.id) } : null,
+            lane.local_path ? { label: 'Sessioni Claude Code', icon: '🕒', action: () => openSessionsModal(lane.id) } : null,
+            { label: 'Documentazione per l\'AI', icon: '📄', action: () => openDocsModal(lane.id) },
+            { label: 'Collegamenti (cartella, repo, URL)', icon: '🔗', action: () => openProjectsModal(lane.id) },
+            '-',
+            { label: 'Rinomina progetto', icon: '✏️', action: () => renameSwimlane(lane.id) },
+            { label: 'Cambia colore', icon: '🎨', action: () => { const i = document.querySelector(`.swimlane[data-lane-id="${lane.id}"] .lane-color input`); i && i.click(); } },
+            { label: 'Sposta su', icon: '↑', disabled: idx === 0, action: () => moveSwimlane(lane.id, -1) },
+            { label: 'Sposta giù', icon: '↓', disabled: idx === lanes.length - 1, action: () => moveSwimlane(lane.id, 1) },
+            '-',
+            { label: 'Elimina progetto', icon: '🗑️', danger: true, action: () => deleteSwimlane(lane.id) }
+        ];
+    }
+
+    // Un solo listener sulla board: sceglie il menu in base a cosa c'è sotto il mouse
+    document.getElementById('board').addEventListener('contextmenu', e => {
+        if (e.shiftKey || e.target.closest('input, textarea, select')) return;
+        const cardEl = e.target.closest('.card[data-card-id]');
+        if (cardEl) {
+            const card = boardData.cards.find(c => c.id === cardEl.dataset.cardId);
+            if (card) ctxMenu(e, cardContextItems(card));
+            return;
+        }
+        const laneEl = e.target.closest('.swimlane[data-lane-id]');
+        const lane = laneEl && boardData.swimlanes.find(l => l.id === laneEl.dataset.laneId);
+        if (!lane) return;
+        const verHead = e.target.closest('.ver-head');
+        const cell = e.target.closest('.cell');
+        if (verHead) {
+            const vers = laneVersions(lane);
+            const vi = [...laneEl.querySelectorAll('.ver-head')].indexOf(verHead);
+            if (vers[vi]) ctxMenu(e, versionContextItems(lane, vers[vi], vi, vers));
+        } else if (cell) {
+            const verId = cell.dataset.versionId || '';
+            const col = boardData.columns.find(c => c.id === cell.dataset.colId);
+            ctxMenu(e, [
+                { head: lane.name + (col ? ' · ' + col.name : '') },
+                { label: 'Nuovo task qui', icon: '＋', action: () => openCardModal(null, cell.dataset.colId, lane.id, verId) },
+                pasteItem(cell.dataset.colId, lane.id, verId)
+            ]);
+        } else if (e.target.closest('.swimlane-header')) {
+            ctxMenu(e, laneContextItems(lane));
+        }
+    });
 
     function renderCard(card) {
         const label = boardData.labels.find(l => l.id === card.label_id);
@@ -5485,6 +6091,7 @@ $dataJson = json_encode(ykanPublicData($data));
                     ${isRecurring ? '<span title="Task autorigenerante" style="font-size:12px">🔄</span>' : ''}
                     ${runBadge}
                     ${threadBadge(card)}
+                    <button type="button" class="ctx-btn" title="Azioni (anche col tasto destro)" onclick="ctxFromButton(event)"><i class="ti ti-tool" aria-hidden="true"></i></button>
                 </div>
                 ${label ? `<span class="card-label" style="background:${label.color}">${escHtml(label.name)}</span>` : ''}
                 ${pmBadges}
@@ -5499,28 +6106,89 @@ $dataJson = json_encode(ykanPublicData($data));
         `;
     }
 
+    // === ARCHIVIO (pagina) ===
+    function arcFillFilters() {
+        const pr = document.getElementById('arcProject'), keep = pr.value;
+        pr.innerHTML = '<option value="">Tutti i progetti</option>' + boardData.swimlanes.slice().sort((a, b) => a.position - b.position)
+            .map(l => `<option value="${escHtml(l.id)}">${escHtml(l.name)}</option>`).join('');
+        pr.value = keep;
+        const lb = document.getElementById('arcLabel'), keepL = lb.value;
+        lb.innerHTML = '<option value="">Tutte le etichette</option>' + boardData.labels.map(l => `<option value="${escHtml(l.id)}">${escHtml(l.name)}</option>`).join('');
+        lb.value = keepL;
+        arcFillVersions();
+    }
+    // Versioni: quelle (anche eliminate) del progetto scelto, o tutti i nomi usati se "Tutti i progetti"
+    function arcFillVersions() {
+        const sel = document.getElementById('arcVersion'), keep = sel.value;
+        const laneId = document.getElementById('arcProject').value;
+        const names = new Set();
+        boardData.swimlanes.filter(l => !laneId || l.id === laneId).forEach(l => (l.versions || []).forEach(v => names.add(v.name)));
+        boardData.cards.filter(c => c.archived && (!laneId || c.swimlane_id === laneId)).forEach(c => arcVersionNames(c).forEach(n => names.add(n)));
+        sel.innerHTML = '<option value="">Tutte le versioni</option>' + [...names].map(n => `<option value="${escHtml(n)}">${escHtml(n)}</option>`).join('');
+        sel.value = names.has(keep) ? keep : '';
+    }
+    // Tutte le versioni in cui il task è passato (storico + quella attuale)
+    function arcVersionNames(c) {
+        const out = (c.version_history || []).map(h => h.name).filter(Boolean);
+        const lane = boardData.swimlanes.find(l => l.id === c.swimlane_id);
+        const v = lane && (lane.versions || []).find(x => x.id === c.version_id);
+        if (v) out.push(v.name);
+        return [...new Set(out)];
+    }
+    function arcClear() {
+        ['arcSearch', 'arcProject', 'arcVersion', 'arcLabel', 'arcPeriod'].forEach(id => { document.getElementById(id).value = ''; });
+        arcFillVersions();
+        renderArchive();
+    }
+
     function renderArchive() {
-        const archived = boardData.cards
-            .filter(c => c.archived)
+        const list = document.getElementById('archiveList');
+        if (!list || !document.getElementById('kanbanView').classList.contains('archive-mode')) return;
+        const q = document.getElementById('arcSearch').value.trim().toLowerCase();
+        const laneId = document.getElementById('arcProject').value;
+        const ver = document.getElementById('arcVersion').value;
+        const label = document.getElementById('arcLabel').value;
+        const days = parseInt(document.getElementById('arcPeriod').value, 10);
+        const since = days ? Date.now() - days * 86400000 : 0;
+        const archived = boardData.cards.filter(c => c.archived
+            && (!laneId || c.swimlane_id === laneId)
+            && (!label || c.label_id === label)
+            && (!ver || arcVersionNames(c).includes(ver))
+            && (!since || dashTs(c.archived_at || 0) >= since)
+            && (!q || (`#${c.seq || ''} ${c.title} ${c.description || ''}`).toLowerCase().includes(q)))
             .sort((a, b) => (b.archived_at || '').localeCompare(a.archived_at || ''));
-        document.getElementById('archiveList').innerHTML = archived.length
-            ? archived.map(card => `
-                <div class="card archive-card">
-                    <div class="card-header">
-                        <div class="card-priority ${card.priority}"></div>
-                        ${card.seq ? `<span class="card-seq" title="ID task">#${card.seq}</span>` : ''}
-                        <div class="card-title">${escHtml(card.title)}</div>
-                    </div>
-                    <div class="card-meta">
-                        <span>Archiviata: ${card.archived_at || 'N/A'}</span>
-                    </div>
-                    <div style="margin-top:8px;display:flex;gap:4px">
-                        <button class="btn" onclick="restoreCard('${card.id}')">Ripristina</button>
-                        <button class="btn btn-danger" onclick="permanentDeleteCard('${card.id}')">Elimina</button>
-                    </div>
-                </div>
-            `).join('')
-            : '<p style="color:var(--text2);text-align:center">Nessuna card archiviata</p>';
+        const total = boardData.cards.filter(c => c.archived).length;
+        if (!archived.length) {
+            list.innerHTML = `<div class="dash-empty">${total ? 'Nessun task archiviato con questi filtri.' : 'Nessun task archiviato.'}</div>`;
+            return;
+        }
+        const lanes = boardData.swimlanes.slice().sort((a, b) => a.position - b.position);
+        const groups = lanes.map(l => ({ lane: l, cards: archived.filter(c => c.swimlane_id === l.id) })).filter(g => g.cards.length);
+        const orphans = archived.filter(c => !lanes.some(l => l.id === c.swimlane_id));
+        if (orphans.length) groups.push({ lane: { id: '', name: 'Senza progetto' }, cards: orphans });
+        list.innerHTML = `<div class="arc-total">${archived.length} di ${total} task archiviati</div>` + groups.map(g => `
+            <div class="arc-group" style="--tone:${g.lane.id ? laneRgb(g.lane) : '128,128,128'}">
+                <div class="arc-group-head"><span class="wk-dot" style="background:rgb(var(--tone))"></span><b>${escHtml(g.lane.name)}</b><span class="dash-count">${g.cards.length}</span></div>
+                <div class="arc-grid">${g.cards.map(card => {
+                    const lb = boardData.labels.find(l => l.id === card.label_id);
+                    const vers = arcVersionNames(card);
+                    return `<div class="card archive-card" data-card-id="${card.id}" onclick="openCardModal('${card.id}')">
+                        <div class="card-header">
+                            <div class="card-priority ${card.priority}"></div>
+                            ${card.seq ? `<span class="card-seq" title="ID task">#${card.seq}</span>` : ''}
+                            <div class="card-title">${escHtml(card.title)}</div>
+                        </div>
+                        ${lb ? `<span class="card-label" style="background:${lb.color}">${escHtml(lb.name)}</span>` : ''}
+                        ${vers.map(v => `<span class="arc-ver" title="Versione">🏷️ ${escHtml(v)}</span>`).join('')}
+                        ${card.description ? `<div class="card-desc">${escHtml(card.description.slice(0, 160))}</div>` : ''}
+                        <div class="card-meta"><span>📦 ${escHtml(String(card.archived_at || 'N/A').slice(0, 10))}</span></div>
+                        <div style="margin-top:8px;display:flex;gap:4px" onclick="event.stopPropagation()">
+                            <button class="btn" onclick="restoreCard('${card.id}')">Ripristina</button>
+                            <button class="btn btn-danger" onclick="permanentDeleteCard('${card.id}')">Elimina</button>
+                        </div>
+                    </div>`;
+                }).join('')}</div>
+            </div>`).join('');
     }
 
     function renderLabelsManager() {
@@ -5563,13 +6231,17 @@ $dataJson = json_encode(ykanPublicData($data));
         const cardId = draggedCard.dataset.cardId;
         const newColId = e.currentTarget.dataset.colId;
         const newLaneId = e.currentTarget.dataset.laneId;
+        const newVerId = e.currentTarget.dataset.versionId || '';
 
         const card = boardData.cards.find(c => c.id === cardId);
         if (card) {
             card.column_id = newColId;
             card.swimlane_id = newLaneId;
+            if (newVerId) card.version_id = newVerId;
             render();
-            await api('move_card', { id: cardId, column_id: newColId, swimlane_id: newLaneId });
+            const r = await api('move_card', { id: cardId, column_id: newColId, swimlane_id: newLaneId, version_id: newVerId });
+            // il server può aver creato la riga implicita: ricarico progetto + card
+            if (r.success && r.swimlane) applyVersionResult(r);
         }
     }
 
@@ -6156,7 +6828,15 @@ $dataJson = json_encode(ykanPublicData($data));
     });
 
     function dashRender() {
+        dashParkHosted();
         if (dashTabName === 'graphify') return gfyRender();
+        if (dashTabName === 'pm') {
+            document.querySelectorAll('#dashTabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === 'pm'));
+            const body = document.getElementById('dashboardBody');
+            body.innerHTML = '';
+            dashPmMount(body);
+            return;
+        }
         if (!dashData) return;
         const { res, sd } = dashData;
         const counts = {
@@ -6168,13 +6848,13 @@ $dataJson = json_encode(ykanPublicData($data));
         };
         document.querySelectorAll('#dashTabs button').forEach(b => {
             b.classList.toggle('active', b.dataset.tab === dashTabName);
-            b.querySelector('.dash-count').textContent = counts[b.dataset.tab];
+            b.querySelector('.dash-count').textContent = counts[b.dataset.tab] ?? '';
         });
         const body = document.getElementById('dashboardBody');
         if (dashTabName === 'focus') { body.innerHTML = dashFocusHtml(); if (!dashGit) dashGitLoad(); }
         else if (dashTabName === 'week') body.innerHTML = dashWeekHtml(res, sd);
         else if (dashTabName === 'review') body.innerHTML = dashReviewHtml(sd);
-        else if (dashTabName === 'git') { body.innerHTML = dashGitHtml(); if (!dashGit) dashGitLoad(); }
+        else if (dashTabName === 'git') { body.innerHTML = dashGitHtml(); if (!dashGit) dashGitLoad(); dashGithubMount(body); }
         else body.innerHTML = dashResumeHtml(res, sd);
         const busy = dashData.loading || (['focus', 'git'].includes(dashTabName) && dashGit && dashGit.loading);
         if (busy) body.insertAdjacentHTML('afterbegin', `<div class="dash-loading"><span class="dash-spin"></span>${escHtml(busy)}</div>`);
@@ -8086,7 +8766,20 @@ $dataJson = json_encode(ykanPublicData($data));
         openCardModal(null, col.id, lane.id);
     }
 
-    function openCardModal(cardId = null, colId = null, laneId = null) {
+    // Select "Versione" del popup: righe attive del progetto + storico del task
+    function fillCardVersion(lane, card, verId) {
+        const sel = document.getElementById('cardVersionInput');
+        const vers = lane ? laneVersions(lane) : [{ id: '', name: 'Attuale' }];
+        sel.innerHTML = vers.map(v => `<option value="${escHtml(v.id)}">${escHtml(v.name)}</option>`).join('');
+        sel.value = card && lane ? cardVersion(card, lane) : (verId || vers[0].id);
+        sel.dataset.orig = sel.value;
+        const hist = (card && card.version_history) || [];
+        document.getElementById('cardVersionHistory').innerHTML = hist.length > 1
+            ? 'Storico: ' + hist.map(h => `${escHtml(h.name || '?')} <span title="${escHtml(h.from || '')}${h.to ? ' → ' + escHtml(h.to) : ''}">(${escHtml((h.from || '').slice(0, 10))}${h.to ? '→' + escHtml(h.to.slice(0, 10)) : '→'})</span>`).join(' · ')
+            : '';
+    }
+
+    function openCardModal(cardId = null, colId = null, laneId = null, verId = null) {
         const modal = document.getElementById('cardModal');
         const form = document.getElementById('cardForm');
         const deleteBtn = document.getElementById('deleteCardBtn');
@@ -8129,6 +8822,7 @@ $dataJson = json_encode(ykanPublicData($data));
             document.getElementById('cardEpicInput').value = card.epic || '';
             document.getElementById('cardEstimateInput').value = card.estimate || '';
             document.getElementById('cardParallel').checked = !!card.parallel;
+            fillCardVersion(boardData.swimlanes.find(l => l.id === card.swimlane_id), card);
             renderCardPM();
             deleteBtn.style.display = 'block';
             verifyBtn.style.display = cardFiles.length > 0 ? 'block' : 'none';
@@ -8159,6 +8853,7 @@ $dataJson = json_encode(ykanPublicData($data));
             document.getElementById('cardEpicInput').value = '';
             document.getElementById('cardEstimateInput').value = '';
             document.getElementById('cardParallel').checked = false;
+            fillCardVersion(boardData.swimlanes.find(l => l.id === laneId), null, verId);
             renderCardPM();
             deleteBtn.style.display = 'none';
             verifyBtn.style.display = 'none';
@@ -8550,14 +9245,19 @@ $dataJson = json_encode(ykanPublicData($data));
             acceptance: cardAcc.map(a => ({ text: a.text, done: !!a.done }))
         };
 
+        const verSel = document.getElementById('cardVersionInput');
         if (id) {
             cardData.id = id;
+            // versione solo se cambiata, e solo verso una riga vera (il server tiene lo storico)
+            if (verSel.value && verSel.value !== verSel.dataset.orig) cardData.version_id = verSel.value;
             const card = boardData.cards.find(c => c.id === id);
             if (card) Object.assign(card, cardData);
-            await api('update_card', cardData);
+            const r = await api('update_card', cardData);
+            if (r.success && r.card) Object.assign(card, r.card);
         } else {
             cardData.column_id = document.getElementById('cardColumnId').value;
             cardData.swimlane_id = document.getElementById('cardSwimlaneId').value;
+            if (verSel.value) cardData.version_id = verSel.value;
             const result = await api('add_card', cardData);
             if (result.success) boardData.cards.push(result.card);
         }
@@ -8822,7 +9522,7 @@ $dataJson = json_encode(ykanPublicData($data));
         toast('🔎 Verifico connessione GitHub...', 'info');
         const result = await api('github_repo_info');
         if (!result.success) { toast('❌ ' + result.error, 'error'); return; }
-        toast(`✅ Connesso a ${result.repo.full_name}`, 'success');
+        toast(result.repo ? `✅ Connesso a ${result.repo.full_name}` : `✅ Token valido (utente ${result.user}): ogni progetto usa il suo repository`, 'success');
     }
 
     async function testGeminiKey() {
@@ -10261,8 +10961,10 @@ $dataJson = json_encode(ykanPublicData($data));
     const homeCardRow = (c, right) => homeRow(`openCardModal('${c.id}')`, `<span title="${escHtml(c.title)}">#${c.seq || ''} ${escHtml(c.title)}</span>`, right);
     // Dalla Home alla Kanban su un progetto: lo apre (se chiuso), ci scorre e lo evidenzia un attimo
     function homeGoLane(laneId) {
+        // apre la riga attuale del progetto, poi ci scorre
+        const lane = boardData.swimlanes.find(l => l.id === laneId);
+        if (lane) { versionOpen[laneId + '|' + laneVersions(lane)[0].id] = true; render(); }
         showView('kanban');
-        collapsedLanes.delete(laneId);
         const el = document.querySelector(`.swimlane[data-lane-id="${laneId}"]`);
         if (!el) return;
         el.classList.remove('collapsed');
@@ -10657,16 +11359,20 @@ Rules:
 
     // === PANELS ===
     function pmCloseOthers() {
-        ['archivePanel', 'geminiPanel', 'githubPanel', 'pmPanel'].forEach(id =>
+        ['geminiPanel', 'githubPanel', 'pmPanel'].forEach(id =>
             document.getElementById(id).classList.remove('open'));
         document.body.classList.remove('ai-open');
     }
 
-    function toggleArchive() {
-        const p = document.getElementById('archivePanel');
-        const open = !p.classList.contains('open');
-        pmCloseOthers();
-        p.classList.toggle('open', open);
+    // Archive: la pagina del kanban passa dalla board all'elenco degli archiviati e viceversa
+    function toggleArchive(force) {
+        const v = document.getElementById('kanbanView');
+        const on = typeof force === 'boolean' ? force : !v.classList.contains('archive-mode');
+        if (document.body.dataset.view !== 'kanban') showView('kanban');
+        v.classList.toggle('archive-mode', on);
+        v.querySelector('.dash-toolbar h2').textContent = on ? 'Archivio' : 'Kanban';
+        document.getElementById('archiveBtn').textContent = on ? '🗂️ Kanban' : '📦 Archive';
+        if (on) { arcFillFilters(); renderArchive(); }
     }
 
     function toggleGemini() {
@@ -10801,44 +11507,79 @@ Rules:
         project: 'Analizza il progetto: panoramica in 2 frasi, stack, architettura, punti di forza, problemi, e massimo 5 task suggeriti con priorità.'
     };
 
-    function toggleGithub() {
-        const panel = document.getElementById('githubPanel');
-        const isOpening = !panel.classList.contains('open');
-        pmCloseOthers();
-        panel.classList.toggle('open', isOpening);
+    // GitHub ora vive in Progetti → Git, sotto lo stato dei repository
+    function toggleGithub() { dashTab('git'); }
 
-        if (isOpening && (boardData.config.github_token || ykanGithubEnvToken) && boardData.config.github_repo) {
-            loadGithubData('issues');
-            loadGithubRepoInfo();
+    // Pannelli "ospitati" in una pagina della Dashboard: il nodo va in #dashHosted, sotto #dashboardBody
+    // (mai dentro: i render lo riscrivono con innerHTML) e torna in fondo al body sulle altre pagine.
+    function dashHost(id, cls) {
+        const el = document.getElementById(id);
+        el.classList.add(cls);
+        return el;
+    }
+    function dashParkHosted() {
+        ['githubPanel', 'pmPanel'].forEach(id => {
+            const el = document.getElementById(id);
+            if (el && el.closest('#dashHosted')) { document.body.appendChild(el); el.classList.remove('dash-hosted'); }
+        });
+        document.getElementById('dashHosted').innerHTML = '';
+    }
+    // Sezione GitHub della pagina Git: segue il filtro Progetto in alto
+    function dashGithubMount(body) {
+        const el = dashHost('githubPanel', 'dash-hosted');
+        const wrap = document.createElement('div');
+        wrap.className = 'dash-gh-wrap';
+        wrap.innerHTML = '<h3 class="dash-gh-title">🐙 GitHub — issue, pull request e commit</h3>';
+        wrap.appendChild(el);
+        document.getElementById('dashHosted').appendChild(wrap);
+        const lane = boardData.swimlanes.find(l => l.name === dashProject);
+        const repo = lane ? dashGitRepoOf(lane, dashGit && dashGit.byLane[lane.id]) : '';
+        document.getElementById('githubRepoStats').style.display = 'none';
+        if (!lane) {
+            ghRepo = '';
+            document.getElementById('githubContent').innerHTML = '<div class="github-empty">Scegli un progetto dal filtro <b>Progetto</b> in alto per vedere le sue issue, PR e commit.</div>';
+            return;
+        }
+        if (repo !== ghRepo || !githubCache[currentGithubTab]) {
+            ghRepo = repo;
+            githubCache = { issues: null, prs: null, commits: null, repo: null };
+            ghBadges();
+            loadGithubData(currentGithubTab);
+            if (ghRepo && ghConfigured()) { loadGithubRepoInfo(); ghPrefetch(); }
+        } else {
+            ghBadges();
+            renderGithubTab(currentGithubTab, githubCache[currentGithubTab]);
+            if (githubCache.repo) renderGithubRepoStats(githubCache.repo);
         }
     }
 
     // === PM PANEL (spec-driven project manager) ===
     let pmData = null; // last pm_list response
 
-    function togglePm() {
-        const p = document.getElementById('pmPanel');
-        const open = !p.classList.contains('open');
-        pmCloseOthers();
-        p.classList.toggle('open', open);
-        if (open) {
-            const sel = document.getElementById('pmProject');
-            if (!sel.options.length) {
-                sel.innerHTML = [...boardData.swimlanes].sort((a, b) => a.position - b.position)
-                    .map(l => `<option value="${escHtml(l.name)}">${escHtml(l.name)}</option>`).join('');
-            }
-            // default to the first non-collapsed lane
-            const firstOpen = [...boardData.swimlanes].sort((a, b) => a.position - b.position)
-                .find(l => !collapsedLanes.has(l.id));
-            if (firstOpen && !sel.dataset.touched) sel.value = firstOpen.name;
-            pmRefresh();
-        }
+    function togglePm() { dashTab('pm'); }
+
+    // Pagina Progetti → PM: il pannello PM dentro la Dashboard, progetto dal filtro in alto
+    function dashPmMount(body) {
+        const p = dashHost('pmPanel', 'dash-hosted');
+        document.getElementById('dashHosted').appendChild(p);
+        const sel = document.getElementById('pmProject');
+        if (sel.dataset.mounted !== (dashProject || '*')) { sel.dataset.mounted = dashProject || '*'; pmOpenInit(); }
+    }
+
+    function pmOpenInit() {
+        const sel = document.getElementById('pmProject');
+        sel.innerHTML = [...boardData.swimlanes].sort((a, b) => a.position - b.position)
+            .map(l => `<option value="${escHtml(l.name)}">${escHtml(l.name)}</option>`).join('');
+        // progetto dal filtro in alto, altrimenti l'ultimo scelto qui o il primo
+        if (dashProject) sel.value = dashProject;
+        else if (sel.dataset.last) sel.value = sel.dataset.last;
+        pmRefresh();
     }
 
     function pmProject() { return document.getElementById('pmProject').value; }
 
     async function pmRefresh() {
-        document.getElementById('pmProject').dataset.touched = '1';
+        document.getElementById('pmProject').dataset.last = pmProject();
         const body = document.getElementById('pmBody');
         body.innerHTML = '<div class="pm-busy">Carico…</div>';
         const res = await api('pm_list', { project: pmProject() });
@@ -11129,7 +11870,31 @@ ${epicRows}</div>`);
     }
 
     let githubCache = { issues: null, prs: null, commits: null, repo: null };
-    let currentGithubTab = 'issues';
+    let ghRepo = ''; // owner/repo del progetto scelto nella pagina Progetti → Git
+    const ghConfigured = () => !!(boardData.config.github_token || ykanGithubEnvToken);
+    let currentGithubTab = 'commits';
+    // Numeri sulle schede: commit letti, PR e issue aperte (in evidenza se ce ne sono)
+    function ghBadges() {
+        const n = {
+            commits: githubCache.commits ? (githubCache.commits.commits || []).length : null,
+            prs: githubCache.prs ? (githubCache.prs.prs || []).filter(x => x.state === 'open').length : null,
+            issues: githubCache.issues ? (githubCache.issues.issues || []).filter(x => x.state === 'open').length : null
+        };
+        document.querySelectorAll('.gh-badge').forEach(b => {
+            const v = n[b.dataset.gh];
+            b.textContent = v === null ? '' : v;
+            b.classList.toggle('hot', b.dataset.gh !== 'commits' && v > 0);
+        });
+    }
+    // Carica anche le schede non aperte, solo per i numeri
+    async function ghPrefetch() {
+        const repo = ghRepo;
+        await Promise.all(['commits', 'prs', 'issues'].filter(t => !githubCache[t]).map(async t => {
+            const r = await api('github_' + t, { repo });
+            if (repo === ghRepo && r.success && !githubCache[t]) githubCache[t] = r;
+        }));
+        if (repo === ghRepo) ghBadges();
+    }
 
     function switchGithubTab(tab) {
         currentGithubTab = tab;
@@ -11143,8 +11908,8 @@ ${epicRows}</div>`);
             renderGithubRepoStats(githubCache.repo);
             return;
         }
-        const result = await api('github_repo_info');
-        if (result.success) {
+        const result = await api('github_repo_info', { repo: ghRepo });
+        if (result.success && result.repo) {
             githubCache.repo = result.repo;
             renderGithubRepoStats(result.repo);
         }
@@ -11164,11 +11929,16 @@ ${epicRows}</div>`);
     async function loadGithubData(tab) {
         const content = document.getElementById('githubContent');
 
-        if (!(boardData.config.github_token || ykanGithubEnvToken) || !boardData.config.github_repo) {
+        if (!ghConfigured()) {
             content.innerHTML = `<div class="github-empty">
-                <p>Configure GitHub Token and Repository in Settings.</p>
-                <button class="btn btn-primary" onclick="openConfigModal()" style="margin-top:12px">⚙️ Settings</button>
+                <p>Manca il token GitHub.</p>
+                <button class="btn btn-primary" onclick="settingsNav('github')" style="margin-top:12px">⚙️ Settings → GitHub</button>
             </div>`;
+            return;
+        }
+        if (!ghRepo) {
+            content.innerHTML = `<div class="github-empty">Questo progetto non ha un repository GitHub collegato.
+                <br><button class="btn" style="margin-top:12px" onclick="openProjectsModal('${escHtml((boardData.swimlanes.find(l => l.name === dashProject) || {}).id || '')}')">🔗 Collega repository</button></div>`;
             return;
         }
 
@@ -11181,9 +11951,9 @@ ${epicRows}</div>`);
         content.innerHTML = '<div class="github-loading">Loading...</div>';
 
         let result;
-        if (tab === 'issues') result = await api('github_issues');
-        else if (tab === 'prs') result = await api('github_prs');
-        else if (tab === 'commits') result = await api('github_commits');
+        if (tab === 'issues') result = await api('github_issues', { repo: ghRepo });
+        else if (tab === 'prs') result = await api('github_prs', { repo: ghRepo });
+        else if (tab === 'commits') result = await api('github_commits', { repo: ghRepo });
 
         if (!result.success) {
             content.innerHTML = `<div class="github-empty" style="color:var(--high)">${escHtml(result.error)}</div>`;
@@ -11192,6 +11962,7 @@ ${epicRows}</div>`);
 
         githubCache[tab] = result;
         renderGithubTab(tab, result);
+        ghBadges();
     }
 
     function renderGithubTab(tab, data) {
@@ -11272,17 +12043,18 @@ ${epicRows}</div>`);
         document.getElementById('cardDescInput').value = desc;
         document.getElementById('cardPriorityInput').value = priority;
         document.getElementById('cardColumnId').value = boardData.columns[0]?.id || '';
-        document.getElementById('cardSwimlaneId').value = boardData.swimlanes[0]?.id || '';
+        document.getElementById('cardSwimlaneId').value = (boardData.swimlanes.find(l => l.name === dashProject) || boardData.swimlanes[0] || {}).id || '';
         document.getElementById('cardModalTitle').textContent = 'New Card from GitHub Issue';
         document.getElementById('templateGroup').style.display = 'block';
         document.getElementById('cardModal').classList.add('active');
-        toggleGithub();
     }
 
     function refreshGithub() {
         githubCache = { issues: null, prs: null, commits: null, repo: null };
+        ghBadges();
         loadGithubData(currentGithubTab);
         loadGithubRepoInfo();
+        ghPrefetch();
     }
 
     // === GEMINI ===
@@ -11449,6 +12221,11 @@ ${epicRows}</div>`);
 
     // === INIT ===
     render();
+    // Una tantum: le vecchie etichette "stable" / "prossima versione" diventano righe versione
+    if (boardData.labels.some(l => /prossima\s*versione|^\s*stable\s*$/i.test(l.name))
+        && confirm('Le etichette "stable" e "prossima versione" diventano righe versione nei progetti.\nConverto adesso? (backup automatico prima)')) {
+        api('migrate_version_labels').then(r => { if (r.success) { toast(`${r.moved} task spostati in "Prossima versione"`, 'success'); setTimeout(() => location.reload(), 900); } });
+    }
     loadThemes(); // populate the theme switcher (built-ins + custom files)
     setTimeout(() => {
         let v = 'home';
